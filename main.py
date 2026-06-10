@@ -36,8 +36,7 @@ try:
     import sys
     import time
     import numpy
-    import pandas 
-    
+    import pandas
     import logging
 
     from sklearn.utils import shuffle
