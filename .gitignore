@@ -4,6 +4,13 @@ Datasets/raw/AppClassNet
 Datasets/raw/AppClassNet/top200
 Datasets/raw/AppClassNet/README
 Datasets/raw/AppClassNet/LICENSE
+Datasets/converted
+Datasets/converted/train_x.csv
+Datasets/converted/train_y.csv
+Datasets/converted/test_x.csv
+Datasets/converted/test_y.csv
+Datasets/converted/valid_x.csv
+Datasets/converted/valid_y.csv
 
 
 ### exclusão de formatos
