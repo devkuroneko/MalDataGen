@@ -11,7 +11,7 @@ Datasets/converted/test_x.csv
 Datasets/converted/test_y.csv
 Datasets/converted/valid_x.csv
 Datasets/converted/valid_y.csv
-local_documentation
+local_documentation/*.md
 
 *.pyc
 *.npy
