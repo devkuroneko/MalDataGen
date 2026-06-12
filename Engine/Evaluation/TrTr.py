@@ -78,20 +78,23 @@ class TrTr:
             # Add generated samples to the data list
             #data.extend(generated_samples)
 
-        # Train classifiers using the real training data and corresponding labels
-        classifiers = self.get_trained_classifiers(dictionary_data['x_training_real'],
-                                                    numpy.squeeze(dictionary_data['y_training_real'], axis=-1),
-                                                    numpy.float32, self.get_number_columns())
+        if getattr(self, '_labels_are_discrete', True):
+            # Train classifiers using the real training data and corresponding labels
+            classifiers = self.get_trained_classifiers(dictionary_data['x_training_real'],
+                                                        numpy.squeeze(dictionary_data['y_training_real'], axis=-1),
+                                                        numpy.float32, self.get_number_columns())
 
-        # Evaluate the classifiers on synthetic data for each classifier instancevaluation
-        for classifier_name, classifier_instances in zip(self._dictionary_classifiers_name, classifiers):
-            # Predict the labels using the trained classifier on the synthetic data
-            label_predicted = classifier_instances.predict(dictionary_data['x_evaluation_real'])
-            logging.info("")
-            logging.info(f"\t\t\t TR-TR {classifier_name}")
-            # Calculate and log the binary classification metrics (such as accuracy, precision, recall, etc.)
-            self.get_binary_metrics(numpy.array(dictionary_data['y_evaluation_real']), numpy.array(label_predicted),
-                                    "TR-TR", classifier_name, self.fold_number + 1)
+            # Evaluate the classifiers on synthetic data for each classifier instancevaluation
+            for classifier_name, classifier_instances in zip(self._dictionary_classifiers_name, classifiers):
+                # Predict the labels using the trained classifier on the synthetic data
+                label_predicted = classifier_instances.predict(dictionary_data['x_evaluation_real'])
+                logging.info("")
+                logging.info(f"\t\t\t TR-TR {classifier_name}")
+                # Calculate and log metrics selected by data_type.
+                self.get_task_metrics(numpy.array(dictionary_data['y_evaluation_real']), numpy.array(label_predicted),
+                                        "TR-TR", classifier_name, self.fold_number + 1)
+        else:
+            logging.info("\t\tTR-TR predictive evaluation skipped because labels are continuous.")
             
         
         data_real = numpy.array(dictionary_data['x_training_real'])

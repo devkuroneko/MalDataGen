@@ -45,7 +45,7 @@ except ImportError as error:
 
 DEFAULT_COLORS_ROC = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
 DEFAULT_FONT_SIZE = 12
-DEFAULT_TITLE_ROC_PLOT = "Multiclass ROC Curve"
+DEFAULT_TITLE_ROC_PLOT = "Continous ROC Curve"
 
 class PlotROCMulticlass:
 

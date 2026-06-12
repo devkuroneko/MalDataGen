@@ -355,7 +355,8 @@ class AdversarialAlgorithm(Model):
             generated_samples = self._generator.predict([latent_noise, label_samples_generated], verbose=0)
 
             # Round generated sample values to nearest integer (useful if generating binary data, like images with pixel values 0/1)
-            generated_samples = numpy.rint(generated_samples)
+            if number_samples_per_class.get("data_type") != "continuous":
+                generated_samples = numpy.rint(generated_samples)
 
             # Store the generated samples in the dictionary under the corresponding class label
             generated_data[label_class] = generated_samples

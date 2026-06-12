@@ -148,7 +148,7 @@ In order to execute a demo of the tool, utilized the comand listed below. The ex
  
 ```bash
 # Run the basic demo
-python3 run_campaign_sbseg.py -c sf
+python3 run_appclassnet_top200.py -c sf
 ```
 
 Alternatively, you can use the a docker container to execute the demo, by using the following comand:
@@ -164,7 +164,7 @@ In order to reproduce the results from the paper execute the comand below, the e
 
 ```bash
 # Run all experiments from the paper
-python3 run_campaign_sbseg.py 
+python3 run_appclassnet_top200.py 
 ```
 
 Or to execute with docker:

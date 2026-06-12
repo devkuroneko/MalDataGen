@@ -40,6 +40,11 @@ try:
     import pandas as pd 
      
     import time 
+    from sklearn.metrics import accuracy_score
+    from sklearn.metrics import balanced_accuracy_score
+    from sklearn.metrics import f1_score
+    from sklearn.metrics import precision_score
+    from sklearn.metrics import recall_score
 
     from Engine.Metrics.Binary.Recall import Recall
 
@@ -125,6 +130,8 @@ class Metrics:
         Parameters:
             arguments (Namespace): Command-line arguments containing settings for the metrics.
         """
+        self._data_type = getattr(arguments, "data_type", "binary")
+
         # Initialize dictionaries for binary metrics with their corresponding instances
         self._dictionary_binary_metrics = {
             Accuracy.__name__: Accuracy(),
@@ -147,9 +154,13 @@ class Metrics:
             EuclideanDistance.__name__ : EuclideanDistance(),
             HellingerDistance.__name__ : HellingerDistance(),
             ManhattanDistance.__name__ : ManhattanDistance(),
-            HammingDistance.__name__ : HammingDistance(),
-            JaccardDistance.__name__ : JaccardDistance(),
         }
+
+        if self._data_type != "continuous":
+            self._dictionary_distance_metrics.update({
+                HammingDistance.__name__ : HammingDistance(),
+                JaccardDistance.__name__ : JaccardDistance(),
+            })
 
         # Initialize dictionary for area under curve metrics
         self._dictionary_area_under_curve = {"AreaUnderCurve": AreaUnderCurve()}
@@ -172,7 +183,7 @@ class Metrics:
             arguments (Namespace): Command-line arguments containing the number of folds.
         """
 
-        self.list_classifier_metrics = self._dictionary_binary_metrics.keys()
+        self.list_classifier_metrics = self._get_classifier_metric_names()
 
         # # List of distribution metrics
         self.list_distance_metrics = self._dictionary_distance_metrics.keys()
@@ -247,6 +258,46 @@ class Metrics:
                 }
             }
 
+        }
+
+    def _get_classifier_metric_names(self):
+        if self._data_type == "binary":
+            return list(self._dictionary_binary_metrics.keys())
+
+        return [
+            "Accuracy",
+            "BalancedAccuracy",
+            "PrecisionMacro",
+            "RecallMacro",
+            "F1Macro",
+            "F1Weighted",
+        ]
+
+    @staticmethod
+    def _labels_to_vector(labels):
+        return numpy.ravel(numpy.asarray(labels))
+
+    @staticmethod
+    def _numeric_metric_value(value):
+        try:
+            value = float(value)
+            if numpy.isfinite(value):
+                return value
+        except (TypeError, ValueError):
+            pass
+        return 0.0
+
+    def _get_multiclass_metric_values(self, real_labels, predict_labels):
+        real_labels = self._labels_to_vector(real_labels)
+        predict_labels = self._labels_to_vector(predict_labels)
+
+        return {
+            "Accuracy": accuracy_score(real_labels, predict_labels),
+            "BalancedAccuracy": balanced_accuracy_score(real_labels, predict_labels),
+            "PrecisionMacro": precision_score(real_labels, predict_labels, average="macro", zero_division=0),
+            "RecallMacro": recall_score(real_labels, predict_labels, average="macro", zero_division=0),
+            "F1Macro": f1_score(real_labels, predict_labels, average="macro", zero_division=0),
+            "F1Weighted": f1_score(real_labels, predict_labels, average="weighted", zero_division=0),
         }
 
 
@@ -385,8 +436,37 @@ class Metrics:
         logging.info(f"\t\t\t Binary metrics")
         for metric_name, instance in self._dictionary_binary_metrics.items():
             # Calculate the metric and update the dictionary with the result
+            metric_value = instance.get_metric(real_labels, predict_labels)
             self._dictionary_metrics[evaluation_type][classifier][f"{fold}-Fold"][metric_name] = (
-                instance.get_metric(real_labels, predict_labels)
+                self._numeric_metric_value(metric_value)
+            )
+
+    def get_task_metrics(self, real_labels, predict_labels, evaluation_type, classifier, fold):
+        """
+        Calculates predictive metrics according to the configured dataset mode.
+
+        binary:
+            Keeps the original binary metric set for backward compatibility.
+        multiclass:
+            Uses macro/weighted classification metrics that work for two or more classes.
+        continuous:
+            Preserves continuous features and uses multiclass-safe predictive metrics for
+            class-conditioned generation. Distribution fidelity remains handled by distance metrics.
+        """
+        if self._data_type == "binary":
+            self.get_binary_metrics(real_labels, predict_labels, evaluation_type, classifier, fold)
+            return
+
+        logging.info(f"\t\t\t {self._data_type} predictive metrics")
+        try:
+            metric_values = self._get_multiclass_metric_values(real_labels, predict_labels)
+        except Exception as error:
+            logging.error("Error calculating %s predictive metrics: %s", self._data_type, error)
+            metric_values = {metric: 0.0 for metric in self.list_classifier_metrics}
+
+        for metric_name in self.list_classifier_metrics:
+            self._dictionary_metrics[evaluation_type][classifier][f"{fold}-Fold"][metric_name] = (
+                self._numeric_metric_value(metric_values.get(metric_name, 0.0))
             )
 
     
@@ -423,4 +503,3 @@ class Metrics:
             self._dictionary_metrics[evaluation_type][classifier][fold][metric_name] = (
                 instance.get_metric(real_label, synthetic_label_probability)
             )
-

@@ -429,6 +429,63 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
             logging.error("An error occurred during experiment execution: %s", str(e))
             raise
 
+    def _prepare_labels_for_conditional_generation(self, labels):
+        labels = numpy.ravel(labels)
+        if getattr(self, '_labels_are_discrete', True):
+            return labels.astype(int)
+
+        logging.warning("Continuous labels detected; conditional generators will use a single pseudo-class.")
+        return numpy.zeros(labels.shape[0], dtype=int)
+
+    def _get_configured_number_classes(self, labels):
+        """Return the total label-domain width used by conditional one-hot inputs."""
+        candidates = []
+
+        for metadata in (
+                getattr(self, '_number_samples_per_class', None),
+                getattr(self.arguments, 'number_samples_per_class', None)):
+            if isinstance(metadata, dict) and metadata.get('number_classes'):
+                candidates.append(int(metadata['number_classes']))
+
+        model_class_arguments = (
+            'autoencoder_number_classes',
+            'variational_autoencoder_number_classes',
+            'wasserstein_number_classes',
+            'wasserstein_gp_number_classes',
+            'quantized_vae_number_classes',
+        )
+        for argument_name in model_class_arguments:
+            value = getattr(self.arguments, argument_name, None)
+            if value:
+                candidates.append(int(value))
+
+        if labels.size:
+            candidates.append(int(numpy.max(labels)) + 1)
+            candidates.append(int(numpy.unique(labels).shape[0]))
+
+        return max(candidates) if candidates else 1
+
+    def _build_generation_metadata(self, y_real_samples):
+        labels = self._prepare_labels_for_conditional_generation(y_real_samples)
+
+        unique_classes, counts = numpy.unique(labels, return_counts=True)
+        class_counts = {
+            int(label): int(count)
+            for label, count in zip(unique_classes, counts)
+        }
+        number_classes = self._get_configured_number_classes(labels)
+
+        if len(unique_classes) != number_classes:
+            logging.info(
+                "\t\tGeneration fold contains %d/%d configured classes; preserving total class domain.",
+                len(unique_classes), number_classes)
+
+        return {
+            'classes': class_counts,
+            'number_classes': number_classes,
+            'data_type': getattr(self.arguments, 'data_type', 'binary'),
+        }
+
     @import_models
     def train_model(self, x_real_samples, y_real_samples, monitor_path, k_fold):
         """
@@ -472,10 +529,11 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                                     self._data_original_header,
                                     self.arguments.model_type)
             else:
+                y_model_samples = self._prepare_labels_for_conditional_generation(y_real_samples)
                 self.training_model(self.arguments,
                                     self.get_number_columns(),
                                     x_real_samples,
-                                    y_real_samples,
+                                    y_model_samples,
                                     monitor_path,
                                     k_fold)
             
@@ -530,14 +588,8 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
 
             #dictionary_data['y_training_real']
             #labels = dictionary_data['y_evaluation_real']
-            labels = y_real_samples
-            labels = labels.astype(int)
-
-            unique_classes, counts = numpy.unique(labels, return_counts=True)
-            class_counts = dict(zip(unique_classes, counts))
-
-            number_samples_per_class = {'classes': class_counts, 'number_classes': len(unique_classes)}
-            logging.info("\t\tnumber_samples_per_class", number_samples_per_class)
+            number_samples_per_class = self._build_generation_metadata(y_real_samples)
+            logging.info("\t\tnumber_samples_per_class: %s", number_samples_per_class)
 
             if self.arguments.model_type == 'adversarial':
 
@@ -665,4 +717,3 @@ if __name__ == "__main__":
     dataGeneration = SynDataGen()
     dataGeneration.show_all_settings()
     dataGeneration.run_experiments()
-

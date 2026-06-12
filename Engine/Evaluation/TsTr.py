@@ -80,21 +80,24 @@ class TsTr:
             # Add generated samples to the data list
             data.extend(generated_samples)
 
-        shuffled_data, shuffled_labels = shuffle(data, numpy.array(labels), random_state=42)
-        # Train classifiers using the generated synthetic data and corresponding labels
-        classifiers = self.get_trained_classifiers(shuffled_data, shuffled_labels, numpy.float32, self.get_number_columns())
+        if getattr(self, '_labels_are_discrete', True):
+            shuffled_data, shuffled_labels = shuffle(data, numpy.array(labels), random_state=42)
+            # Train classifiers using the generated synthetic data and corresponding labels
+            classifiers = self.get_trained_classifiers(shuffled_data, shuffled_labels, numpy.float32, self.get_number_columns())
 
-        # Evaluate the classifiers on real data for each classifier instance
-        for classifier_name, classifier_instances in zip(self._dictionary_classifiers_name, classifiers):
-            # Predict the labels using the trained classifier on the real evaluation data
-            label_predicted = classifier_instances.predict(dictionary_data['x_evaluation_real'])
+            # Evaluate the classifiers on real data for each classifier instance
+            for classifier_name, classifier_instances in zip(self._dictionary_classifiers_name, classifiers):
+                # Predict the labels using the trained classifier on the real evaluation data
+                label_predicted = classifier_instances.predict(dictionary_data['x_evaluation_real'])
 
-            logging.info("")
-            logging.info(f"\t\tTS-TR {classifier_name}")
-            # Calculate and log the binary classification metrics (such as accuracy, precision, recall, etc.)
-            self.get_binary_metrics(numpy.squeeze(dictionary_data['y_evaluation_real'], axis=-1)[:total_samples],
-                                    numpy.array(label_predicted)[:total_samples],
-                                    "TS-TR", classifier_name, self.fold_number + 1)
+                logging.info("")
+                logging.info(f"\t\tTS-TR {classifier_name}")
+                # Calculate and log metrics selected by data_type.
+                self.get_task_metrics(numpy.squeeze(dictionary_data['y_evaluation_real'], axis=-1)[:total_samples],
+                                        numpy.array(label_predicted)[:total_samples],
+                                        "TS-TR", classifier_name, self.fold_number + 1)
+        else:
+            logging.info("\t\tTS-TR predictive evaluation skipped because labels are continuous.")
             
         
         data_real = numpy.array(dictionary_data['x_training_real'])

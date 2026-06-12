@@ -37,8 +37,6 @@ try:
     import pandas
     import logging
 
-    from sklearn.preprocessing import MinMaxScaler
-
 except ImportError as error:
     print(error)
     sys.exit(-1)
@@ -79,10 +77,10 @@ class CSVDataProcessor:
         Final column headers after all filtering operations.
     data_original_header : list[str] or None
         Original column headers before any processing. Preserved for reference.
-    data_scaler : sklearn.preprocessing.MinMaxScaler
-        Scaler instance for normalization. Configured during normalization.
+    data_scaler : None
+        CSV feature normalization is disabled; raw values are preserved.
     scaler_params : tuple or None
-        (min, max) values used for normalization. Enables reproducible scaling.
+        Unused for CSV loading because normalization was removed.
     list_folds : list
         Contains dataset splits for cross-validation. Populated during fold creation.
 
@@ -149,13 +147,17 @@ class CSVDataProcessor:
         self._data_load_path_file_input = arguments.data_load_path_file_input
         self._data_load_path_file_output = arguments.data_load_path_file_output
         self._data_load_exclude_columns = arguments.data_load_exclude_columns
+        self._data_type = getattr(arguments, 'data_type', 'binary')
         self._number_samples_per_class = arguments.number_samples_per_class
         self._data_loaded = None
         self._data_loaded_labels = None
         self._data_loaded_header = None
         self._data_original_header = None
-        self._data_scaler = MinMaxScaler(feature_range=(0, 1))
-        self._scaler_params = None  # To store scaler parameters
+        self._data_scaler = None
+        self._scaler_params = None
+        self._label_mapping = None
+        self._label_inverse_mapping = None
+        self._labels_are_discrete = True
         self.list_folds = []
 
     def load_csv(self):
@@ -166,7 +168,7 @@ class CSVDataProcessor:
         2. Cleans data (inf values and missing data)
         3. Applies column and row filters
         4. Separates labels from features
-        5. Normalizes the data
+        5. Preserves feature values without normalization
 
         Raises:
             FileNotFoundError: If CSV file doesn't exist
@@ -185,7 +187,7 @@ class CSVDataProcessor:
             data_file = self._apply_column_limits(data_file)
 
             self._store_final_data(data_file)
-            self._normalize_data()
+            logging.info("CSV feature normalization disabled; raw feature values were preserved.")
 
         except Exception as e:
             logging.error(f"Failed to load CSV: {str(e)}")
@@ -291,10 +293,27 @@ class CSVDataProcessor:
 
         logging.info(f"Separating the label column: {self._data_load_label_column}")
         self._data_loaded_labels = numpy.array(data_file[[self._data_load_label_column]].values, dtype=numpy.float32)
+        self._encode_discrete_labels()
         data_file = data_file.drop(columns=[self._data_load_label_column])
         logging.info(f"Labels separated, remaining data shape: {data_file.shape}")
 
         return data_file
+
+    def _encode_discrete_labels(self):
+        """Map discrete labels to a zero-based class index for conditional models."""
+        labels = numpy.ravel(self._data_loaded_labels)
+        self._labels_are_discrete = numpy.allclose(labels, numpy.rint(labels))
+
+        if not self._labels_are_discrete:
+            logging.info("Continuous labels detected; labels were preserved without class encoding.")
+            return
+
+        unique_labels = sorted(numpy.unique(labels).tolist())
+        self._label_mapping = {label: index for index, label in enumerate(unique_labels)}
+        self._label_inverse_mapping = {index: label for label, index in self._label_mapping.items()}
+        encoded_labels = [self._label_mapping[label] for label in labels.tolist()]
+        self._data_loaded_labels = numpy.array(encoded_labels, dtype=numpy.float32).reshape(-1, 1)
+        logging.info("Discrete labels encoded to zero-based classes: %s", self._label_mapping)
 
     def _apply_column_limits(self, data_file):
         """Limit number of columns if specified."""
@@ -351,15 +370,22 @@ class CSVDataProcessor:
 
     def _normalize_data(self):
         """
-        Normalizes the data between 0 and 1 using MinMaxScaler.
+        Normalization was intentionally disabled for CSV input.
         """
-        self._data_loaded = numpy.array(self._data_scaler.fit_transform(self._data_loaded), dtype=numpy.float32)
+        logging.info("CSV normalization is disabled; no transformation was applied.")
 
-        # Store the scaler parameters for later use
-        self._scaler_params = (self._data_scaler.data_min_, self._data_scaler.data_max_)
+    def _decode_label(self, label):
+        """Return the original label value when a discrete-label mapping exists."""
+        if self._label_inverse_mapping is None:
+            return label
 
-        # Logging to inform that the data has been normalized
-        logging.info("Data normalized between 0 and 1.")
+        try:
+            decoded_label = self._label_inverse_mapping.get(int(label), label)
+            if isinstance(decoded_label, float) and decoded_label.is_integer():
+                return int(decoded_label)
+            return decoded_label
+        except (TypeError, ValueError):
+            return label
 
     def save_csv(self, generated_data, fold_number, directory_name, generator_name):
         """
@@ -375,7 +401,7 @@ class CSVDataProcessor:
         for label_class, generated_samples in generated_data.items():
 
             logging.info(f"Processing {len(generated_samples)} samples for label class {label_class}.")
-            labels.extend([label_class] * len(generated_samples))
+            labels.extend([self._decode_label(label_class)] * len(generated_samples))
             data.extend(generated_samples)
 
         logging.info("Combining labels and data into a DataFrame.")
@@ -389,23 +415,7 @@ class CSVDataProcessor:
             logging.error(f"Error creating DataFrame: {str(e)}")
             raise
 
-        # Revert normalization if scaler_params are available
-        if self._scaler_params:
-
-            logging.info("Reverting normalization using stored scaler parameters.")
-
-            try:
-                data_min, data_max = self._scaler_params
-                # Applying inverse transform to revert normalization
-                data_file_output.iloc[:, :-1] = self._data_scaler.inverse_transform(data_file_output.iloc[:, :-1])
-                logging.info("Normalization successfully reverted.")
-
-            except Exception as e:
-                logging.error(f"Error during normalization reversion: {str(e)}")
-                raise
-
-        else:
-            logging.info("No normalization reversion needed as scaler_params are not provided.")
+        logging.info("No normalization reversion applied; CSV loader preserves raw feature values.")
 
         # Save the DataFrame to a CSV file
         try:

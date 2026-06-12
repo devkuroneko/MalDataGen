@@ -45,6 +45,7 @@ try:
 
     from Engine.DataIO.CSVLoader import autoload
 
+    from sklearn.model_selection import KFold
     from sklearn.model_selection import StratifiedKFold
     from sklearn.model_selection import train_test_split
 
@@ -65,6 +66,15 @@ def _save_data_to_csv(directory_output_data, data, labels, filename_prefix, fold
         data_frame = pandas.DataFrame(data_with_labels, columns=columns)
         csv_filename = f"{directory_output_data}/{filename_prefix}_fold_{fold + 1}.csv"
         data_frame.to_csv(csv_filename, index=False)
+
+def _build_class_metadata(labels):
+        """Build class counts using zero-based labels already prepared by the loader."""
+        flat_labels = numpy.ravel(labels)
+        unique_classes, counts = numpy.unique(flat_labels.astype(int), return_counts=True)
+        return {
+            "classes": {int(label): int(count) for label, count in zip(unique_classes, counts)},
+            "number_classes": int(len(unique_classes)),
+        }
 
 def StratifiedData(function):
 
@@ -91,24 +101,48 @@ def StratifiedData(function):
         # Track the start time of the entire stratified K-fold process
         start_time = time.time()
 
+        data_type = getattr(self.arguments, 'data_type', 'binary')
+        labels_are_discrete = getattr(self, '_labels_are_discrete', True)
+        use_stratified_split = labels_are_discrete
+        split_name = "StratifiedKFold" if use_stratified_split else "KFold"
+
         logging.info(
-            "StratifiedKFold initialization started. Number of splits: %d, Shuffle: True, Random state: 42.",
-            self.arguments.number_k_folds)
+            "%s initialization started. Data type: %s. Number of splits: %d, Shuffle: True, Random state: 42.",
+            split_name, data_type, self.arguments.number_k_folds)
 
         try:
             # Shuffle the data before performing stratified splitting
             shuffled_data, shuffled_labels = shuffle(self._data_loaded, self._data_loaded_labels, random_state=42)
 
-            # Initialize the StratifiedKFold instance with the specified number of folds
-            stratified_instance = StratifiedKFold(n_splits=self.arguments.number_k_folds,
-                                                  shuffle=True,
-                                                  random_state=42)  # RM TODO: Add parameter for random seed
+            if labels_are_discrete:
+                self.arguments.number_samples_per_class = _build_class_metadata(shuffled_labels)
+                self.arguments.number_samples_per_class["data_type"] = data_type
+                self._number_samples_per_class = self.arguments.number_samples_per_class
+                logging.info("Class metadata inferred from CSV labels: %s", self._number_samples_per_class)
+            else:
+                self.arguments.number_samples_per_class = {
+                    "classes": {0: int(len(shuffled_labels))},
+                    "number_classes": 1,
+                    "data_type": data_type,
+                }
+                self._number_samples_per_class = self.arguments.number_samples_per_class
+                logging.info("Non-discrete labels detected; class metadata was not inferred.")
+
+            if use_stratified_split:
+                splitter = StratifiedKFold(n_splits=self.arguments.number_k_folds,
+                                           shuffle=True,
+                                           random_state=42)
+                split_iterator = splitter.split(shuffled_data, numpy.ravel(shuffled_labels))
+            else:
+                splitter = KFold(n_splits=self.arguments.number_k_folds,
+                                 shuffle=True,
+                                 random_state=42)
+                split_iterator = splitter.split(shuffled_data)
 
             logging.info("Data loaded for stratification. Total samples: %d", len(self._data_loaded))
 
             # Loop through each fold and process the stratified splits
-            for fold, (train_index, val_index) in enumerate(
-                    stratified_instance.split(shuffled_data, shuffled_labels)):
+            for fold, (train_index, val_index) in enumerate(split_iterator):
                 # Track the start time of processing a specific fold
                 fold_start_time = time.time()
 
@@ -187,14 +221,14 @@ def StratifiedData(function):
             # Track the end time for the entire K-Fold process
             end_time = time.time()
 
-            logging.info("All %d folds successfully created in %.2f seconds.", self.arguments.number_k_folds,
-                         end_time - start_time)
+            logging.info("All %d folds successfully created using %s in %.2f seconds.",
+                         self.arguments.number_k_folds, split_name, end_time - start_time)
 
             # Call the original function passed as a decorator argument
             return function(self, *args, **kwargs)
 
         except Exception as e:
-            logging.error("An error occurred during StratifiedKFold processing: %s", str(e))
+            logging.error("An error occurred during fold processing: %s", str(e))
             raise  # Re-raise the exception after logging the error
 
     return wrapper

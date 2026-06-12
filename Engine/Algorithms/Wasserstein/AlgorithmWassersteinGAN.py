@@ -217,7 +217,8 @@ class WassersteinAlgorithm(Model):
 
             # Round the generated samples to integer values
             # (if samples are intended to be binary, e.g., images with pixel values 0 or 1).
-            generated_samples = numpy.rint(generated_samples)
+            if number_samples_per_class.get("data_type") != "continuous":
+                generated_samples = numpy.rint(generated_samples)
 
             # Store generated samples for the current class.
             generated_data[label_class] = generated_samples

@@ -109,7 +109,8 @@ class RandomForest:
             instance_model_classifier = RandomForestClassifier(
                 n_estimators=self._random_forest_number_estimators,
                 max_depth=self._random_forest_max_depth,
-                max_leaf_nodes=self._max_leaf_nodes
+                max_leaf_nodes=self._max_leaf_nodes,
+                n_jobs=1,
             )
 
             logging.info("Fitting the Random Forest model to the training data.")

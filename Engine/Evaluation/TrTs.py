@@ -80,6 +80,10 @@ class TrTs:
             # Add generated samples to the data list
             data.extend(generated_samples)
 
+        if not getattr(self, '_labels_are_discrete', True):
+            logging.info("\t\tTR-TS predictive evaluation skipped because labels are continuous.")
+            return
+
         # Train classifiers using the real training data and corresponding labels
         classifiers = self.get_trained_classifiers(dictionary_data['x_evaluation_real'],
                                                     numpy.squeeze(dictionary_data['y_evaluation_real'], axis=-1),
@@ -92,7 +96,7 @@ class TrTs:
             logging.info("")
             logging.info(f"\t\tTR-TS {classifier_name}")
             # Calculate and log the binary classification metrics (such as accuracy, precision, recall, etc.)
-            self.get_binary_metrics(numpy.array(labels), numpy.array(label_predicted),
+            self.get_task_metrics(numpy.array(labels), numpy.array(label_predicted),
                                     "TR-TS", classifier_name, self.fold_number + 1)
         
         

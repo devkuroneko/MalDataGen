@@ -299,7 +299,8 @@ class VAELatentDiffusionAlgorithm(Model):
 
             # Round the generated samples to the nearest integer
             # This is useful for discrete data, like binary features (0/1) or integer values
-            generated_samples = numpy.rint(generated_samples)
+            if number_samples_per_class.get("data_type") != "continuous":
+                generated_samples = numpy.rint(generated_samples)
 
             # Store the generated samples in the dictionary under the corresponding class label
             generated_data[label_class] = generated_samples

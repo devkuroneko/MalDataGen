@@ -441,7 +441,9 @@ class DenoisingDiffusionAlgorithm(tensorflow.keras.Model):
             generated_samples = self.generate_data(numpy.array(label_samples_generated, dtype=numpy.float32), batch_size=64)
 
             # Round the generated samples to ensure valid output format (e.g., pixel values)
-            generated_samples = numpy.rint(numpy.squeeze(generated_samples, axis=-1))
+            generated_samples = numpy.squeeze(generated_samples, axis=-1)
+            if number_samples_per_class.get("data_type") != "continuous":
+                generated_samples = numpy.rint(generated_samples)
 
             # Store the generated samples for the current class
             generated_data[label_class] = generated_samples

@@ -275,7 +275,8 @@ class QuantizedVAEAlgorithm(Model):
             generated_samples = self._decoder.predict([quantized_vectors, label_samples_generated], verbose=0)
 
             # Round to nearest integer (for discrete data like images)
-            generated_samples = numpy.rint(generated_samples)
+            if number_samples_per_class.get("data_type") != "continuous":
+                generated_samples = numpy.rint(generated_samples)
 
             generated_data[label_class] = generated_samples
 

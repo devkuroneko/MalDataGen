@@ -305,7 +305,8 @@ class AutoencoderAlgorithm(Model):
 
             # Round the output values to the nearest integer
             # This is useful if the output is binary (like 0/1) or for discrete data types
-            generated_samples = numpy.rint(generated_samples)
+            if number_samples_per_class.get("data_type") != "continuous":
+                generated_samples = numpy.rint(generated_samples)
 
             # Store the generated samples in the dictionary under the corresponding class label
             generated_data[label_class] = generated_samples

@@ -35,9 +35,10 @@ DEFAULT_DATA_LOAD_MAX_SAMPLES = -1
 DEFAULT_DATA_LOAD_MAX_COLUMNS = -1
 DEFAULT_DATA_LOAD_START_COLUMN = 0
 DEFAULT_DATA_LOAD_END_COLUMN = -1
-DEFAULT_DATA_LOAD_PATH_FILE_INPUT = 'Datasets/binaries/kronodroid_emulador-balanced.csv'
+DEFAULT_DATA_LOAD_PATH_FILE_INPUT = 'Datasets/converted/train_x.csv'
 DEFAULT_DATA_LOAD_PATH_FILE_OUTPUT = 'OutputDir'
 DEFAULT_DATA_LOAD_EXCLUDE_COLUMNS = -1
+DEFAULT_DATA_TYPE = 'binary'
 
 def add_argument_data_load(parser):
 
@@ -65,5 +66,9 @@ def add_argument_data_load(parser):
 
     parser.add_argument('--data_load_exclude_columns', type=int, default=DEFAULT_DATA_LOAD_EXCLUDE_COLUMNS,
                         help='Columns to exclude from processing.')
+
+    parser.add_argument('--data_type', type=str, default=DEFAULT_DATA_TYPE,
+                        choices=['binary', 'multiclass', 'continuous'],
+                        help='Dataset mode used by loading, generation post-processing and metrics.')
 
     return parser
