@@ -82,6 +82,8 @@ except ImportError as error:
     print(error)
     sys.exit(-1)
 
+NOT_APPLICABLE = "not_applicable"
+
 def import_metrics(function):
     """
     Decorator to create an instance of the Metrics class
@@ -131,6 +133,7 @@ class Metrics:
             arguments (Namespace): Command-line arguments containing settings for the metrics.
         """
         self._data_type = getattr(arguments, "data_type", "binary")
+        self._target_type = getattr(arguments, "target_type", "auto")
 
         # Initialize dictionaries for binary metrics with their corresponding instances
         self._dictionary_binary_metrics = {
@@ -195,33 +198,33 @@ class Metrics:
             "TS-TR": {
                 classifier: {
                     **{
-                        f'{fold}-Fold': {metric: 0 for metric in self.list_classifier_metrics}
+                        f'{fold}-Fold': {metric: NOT_APPLICABLE for metric in self.list_classifier_metrics}
                         for fold in range(1, arguments.number_k_folds + 1)
                     },
                     'Summary': {
-                        metric: {'mean': 0, 'std': 0} for metric in self.list_classifier_metrics
+                        metric: {'mean': NOT_APPLICABLE, 'std': NOT_APPLICABLE} for metric in self.list_classifier_metrics
                     }
                 } for classifier in self._classifier_list
             },
             "TR-TS": {
                 classifier: {
                     **{
-                        f"{fold}-Fold": {metric: 0 for metric in self.list_classifier_metrics}
+                        f"{fold}-Fold": {metric: NOT_APPLICABLE for metric in self.list_classifier_metrics}
                         for fold in range(1, arguments.number_k_folds + 1)
                     },
                     "Summary": {
-                        metric: {'mean': 0, 'std': 0} for metric in self.list_classifier_metrics
+                        metric: {'mean': NOT_APPLICABLE, 'std': NOT_APPLICABLE} for metric in self.list_classifier_metrics
                     }
                 } for classifier in self._classifier_list
             },
            "TR-TR": {
                classifier: {
                    **{
-                       f'{fold}-Fold': {metric: 0 for metric in self.list_classifier_metrics}
+                       f'{fold}-Fold': {metric: NOT_APPLICABLE for metric in self.list_classifier_metrics}
                        for fold in range(1, arguments.number_k_folds + 1)
                    },
                    'Summary': {
-                       metric: {'mean': 0, 'std': 0} for metric in self.list_classifier_metrics
+                       metric: {'mean': NOT_APPLICABLE, 'std': NOT_APPLICABLE} for metric in self.list_classifier_metrics
                    }
                } for classifier in self._classifier_list
            },
@@ -229,11 +232,11 @@ class Metrics:
             "DistanceMetrics": {
                 methodology: {
                 **{
-                    f'{fold}-Fold': {metric: 0 for metric in self.list_distance_metrics}
+                    f'{fold}-Fold': {metric: NOT_APPLICABLE for metric in self.list_distance_metrics}
                     for fold in range(1, arguments.number_k_folds + 1)
                 },
                 'Summary': {
-                    metric: {'mean': 0, 'std': 0} for metric in self.list_distance_metrics
+                    metric: {'mean': NOT_APPLICABLE, 'std': NOT_APPLICABLE} for metric in self.list_distance_metrics
                 }
                 } for methodology in [ "R-S", "R-R"]
             },
@@ -250,32 +253,50 @@ class Metrics:
 
             "SDVMetrics": {
                 **{
-                    f'{fold}-Fold': {metric: 0 for metric in self.list_sdv_metrics}
+                    f'{fold}-Fold': {metric: NOT_APPLICABLE for metric in self.list_sdv_metrics}
                     for fold in range(1, arguments.number_k_folds + 1)
                 },
                 'Summary': {
-                    metric: {'mean': 0, 'std': 0} for metric in self.list_sdv_metrics
+                    metric: {'mean': NOT_APPLICABLE, 'std': NOT_APPLICABLE} for metric in self.list_sdv_metrics
                 }
             }
 
         }
 
     def _get_classifier_metric_names(self):
-        if self._data_type == "binary":
+        if self._is_binary_task():
             return list(self._dictionary_binary_metrics.keys())
 
         return [
             "Accuracy",
+            "MacroPrecision",
+            "MacroRecall",
+            "MacroF1",
+            "WeightedPrecision",
+            "WeightedRecall",
+            "WeightedF1",
             "BalancedAccuracy",
-            "PrecisionMacro",
-            "RecallMacro",
-            "F1Macro",
-            "F1Weighted",
         ]
 
     @staticmethod
     def _labels_to_vector(labels):
-        return numpy.ravel(numpy.asarray(labels))
+        labels = numpy.ravel(numpy.asarray(labels))
+        try:
+            return labels.astype(numpy.int64)
+        except (TypeError, ValueError):
+            return labels
+
+    def _is_binary_task(self):
+        if self._target_type == "binary":
+            return True
+        if self._target_type == "multiclass":
+            return False
+        if self._target_type in ("regression", "none"):
+            return False
+        return self._data_type == "binary"
+
+    def _is_classification_applicable(self):
+        return self._target_type not in ("regression", "none")
 
     @staticmethod
     def _numeric_metric_value(value):
@@ -285,7 +306,23 @@ class Metrics:
                 return value
         except (TypeError, ValueError):
             pass
-        return 0.0
+        return NOT_APPLICABLE
+
+    @staticmethod
+    def _numeric_summary(values):
+        numeric_values = []
+        for value in values:
+            try:
+                numeric_value = float(value)
+                if numpy.isfinite(numeric_value):
+                    numeric_values.append(numeric_value)
+            except (TypeError, ValueError):
+                continue
+
+        if not numeric_values:
+            return NOT_APPLICABLE, NOT_APPLICABLE
+
+        return numpy.mean(numeric_values), numpy.std(numeric_values)
 
     def _get_multiclass_metric_values(self, real_labels, predict_labels):
         real_labels = self._labels_to_vector(real_labels)
@@ -293,11 +330,13 @@ class Metrics:
 
         return {
             "Accuracy": accuracy_score(real_labels, predict_labels),
+            "MacroPrecision": precision_score(real_labels, predict_labels, average="macro", zero_division=0),
+            "MacroRecall": recall_score(real_labels, predict_labels, average="macro", zero_division=0),
+            "MacroF1": f1_score(real_labels, predict_labels, average="macro", zero_division=0),
+            "WeightedPrecision": precision_score(real_labels, predict_labels, average="weighted", zero_division=0),
+            "WeightedRecall": recall_score(real_labels, predict_labels, average="weighted", zero_division=0),
+            "WeightedF1": f1_score(real_labels, predict_labels, average="weighted", zero_division=0),
             "BalancedAccuracy": balanced_accuracy_score(real_labels, predict_labels),
-            "PrecisionMacro": precision_score(real_labels, predict_labels, average="macro", zero_division=0),
-            "RecallMacro": recall_score(real_labels, predict_labels, average="macro", zero_division=0),
-            "F1Macro": f1_score(real_labels, predict_labels, average="macro", zero_division=0),
-            "F1Weighted": f1_score(real_labels, predict_labels, average="weighted", zero_division=0),
         }
 
 
@@ -398,8 +437,7 @@ class Metrics:
                     values = [data[fold][metric] for fold in folds]
 
                     # Compute statistics
-                    mean_value = numpy.mean(values)
-                    std_value = numpy.std(values)
+                    mean_value, std_value = self._numeric_summary(values)
 
                     # Store results in Mean-Fold structure
                     self._dictionary_metrics[methodology][classifier]["Summary"][metric]["mean"] = mean_value
@@ -411,15 +449,59 @@ class Metrics:
         for methodology in ["R-S", "R-R"]:
             for metric in data[methodology]["Summary"].keys():
                 values = [data[methodology][fold][metric] for fold in folds]
-                data[methodology]["Summary"][metric]["mean"] = numpy.mean(values)
-                data[methodology]["Summary"][metric]["std"] = numpy.std(values)
+                mean_value, std_value = self._numeric_summary(values)
+                data[methodology]["Summary"][metric]["mean"] = mean_value
+                data[methodology]["Summary"][metric]["std"] = std_value
 
         data = self._dictionary_metrics["EfficiencyMetrics"]
         folds = [key for key in data if key.endswith("-Fold")]
         for metric in data["Summary"].keys():
             values = [data[fold][metric] for fold in folds]
-            data["Summary"][metric]["mean"] = numpy.mean(values)
-            data["Summary"][metric]["std"] = numpy.std(values)
+            mean_value, std_value = self._numeric_summary(values)
+            data["Summary"][metric]["mean"] = mean_value
+            data["Summary"][metric]["std"] = std_value
+
+    def mark_fold_not_applicable(self, fold, reason):
+        """Mark unsupported evaluations explicitly instead of leaving fake zero metrics."""
+        for methodology in ["TS-TR", "TR-TS", "TR-TR"]:
+            for classifier in self._dictionary_classifiers_name:
+                fold_key = f"{fold}-Fold"
+                if fold_key in self._dictionary_metrics[methodology][classifier]:
+                    for metric in self._dictionary_metrics[methodology][classifier][fold_key]:
+                        self._dictionary_metrics[methodology][classifier][fold_key][metric] = NOT_APPLICABLE
+
+        for methodology in ["R-S", "R-R"]:
+            fold_key = f"{fold}-Fold"
+            if fold_key in self._dictionary_metrics["DistanceMetrics"][methodology]:
+                for metric in self._dictionary_metrics["DistanceMetrics"][methodology][fold_key]:
+                    self._dictionary_metrics["DistanceMetrics"][methodology][fold_key][metric] = NOT_APPLICABLE
+
+        self._dictionary_metrics.setdefault("NotApplicable", {})[f"{fold}-Fold"] = reason
+
+    def mark_classifier_metrics_not_applicable(self, evaluation_type, classifier, fold, reason):
+        fold_key = f"{fold}-Fold"
+        metric_block = self._dictionary_metrics.get(evaluation_type, {}).get(classifier, {})
+        if fold_key in metric_block:
+            for metric in metric_block[fold_key]:
+                metric_block[fold_key][metric] = NOT_APPLICABLE
+        self._dictionary_metrics.setdefault("NotApplicable", {}).setdefault(fold_key, {})[
+            f"{evaluation_type}:{classifier}"
+        ] = reason
+
+    def mark_evaluation_classifiers_not_applicable(self, evaluation_type, fold, reason):
+        logging.warning("%s Marking %s classifier metrics for fold %s as %s.", reason, evaluation_type, fold, NOT_APPLICABLE)
+        for classifier in self._dictionary_classifiers_name:
+            self.mark_classifier_metrics_not_applicable(evaluation_type, classifier, fold, reason)
+
+    def mark_distance_metrics_not_applicable(self, evaluation_type, fold, reason):
+        fold_key = f"{fold}-Fold"
+        distance_block = self._dictionary_metrics.get("DistanceMetrics", {}).get(evaluation_type, {})
+        if fold_key in distance_block:
+            for metric in distance_block[fold_key]:
+                distance_block[fold_key][metric] = NOT_APPLICABLE
+        self._dictionary_metrics.setdefault("NotApplicable", {}).setdefault(fold_key, {})[
+            f"DistanceMetrics:{evaluation_type}"
+        ] = reason
 
     def get_binary_metrics(self, real_labels, predict_labels, evaluation_type, classifier, fold):
         """
@@ -436,7 +518,11 @@ class Metrics:
         logging.info(f"\t\t\t Binary metrics")
         for metric_name, instance in self._dictionary_binary_metrics.items():
             # Calculate the metric and update the dictionary with the result
-            metric_value = instance.get_metric(real_labels, predict_labels)
+            try:
+                metric_value = instance.get_metric(real_labels, predict_labels)
+            except Exception as error:
+                logging.warning("Binary metric %s is %s: %s", metric_name, NOT_APPLICABLE, error)
+                metric_value = NOT_APPLICABLE
             self._dictionary_metrics[evaluation_type][classifier][f"{fold}-Fold"][metric_name] = (
                 self._numeric_metric_value(metric_value)
             )
@@ -453,20 +539,31 @@ class Metrics:
             Preserves continuous features and uses multiclass-safe predictive metrics for
             class-conditioned generation. Distribution fidelity remains handled by distance metrics.
         """
-        if self._data_type == "binary":
+        if not self._is_classification_applicable():
+            reason = f"target_type={self._target_type} has no classification metrics in this evaluator."
+            logging.warning("%s Marking %s/%s fold %s as %s.", reason, evaluation_type, classifier, fold, NOT_APPLICABLE)
+            self.mark_classifier_metrics_not_applicable(evaluation_type, classifier, fold, reason)
+            return
+
+        if self._is_binary_task():
             self.get_binary_metrics(real_labels, predict_labels, evaluation_type, classifier, fold)
             return
 
-        logging.info(f"\t\t\t {self._data_type} predictive metrics")
+        logging.info(f"\t\t\t {self._target_type} predictive metrics")
         try:
             metric_values = self._get_multiclass_metric_values(real_labels, predict_labels)
         except Exception as error:
-            logging.error("Error calculating %s predictive metrics: %s", self._data_type, error)
-            metric_values = {metric: 0.0 for metric in self.list_classifier_metrics}
+            logging.warning(
+                "Error calculating %s predictive metrics. Marking as %s: %s",
+                self._target_type,
+                NOT_APPLICABLE,
+                error,
+            )
+            metric_values = {metric: NOT_APPLICABLE for metric in self.list_classifier_metrics}
 
         for metric_name in self.list_classifier_metrics:
             self._dictionary_metrics[evaluation_type][classifier][f"{fold}-Fold"][metric_name] = (
-                self._numeric_metric_value(metric_values.get(metric_name, 0.0))
+                self._numeric_metric_value(metric_values.get(metric_name, NOT_APPLICABLE))
             )
 
     
@@ -483,8 +580,13 @@ class Metrics:
         logging.info(f"\t\t\t Distance metrics")
         for metric_name, instance in self._dictionary_distance_metrics.items():
             # Calculate the distance metric and update the dictionary with the result
+            try:
+                metric_value = instance.get_metric(x_evaluation_real, x_evaluation_synthetic)
+            except Exception as error:
+                logging.warning("Distance metric %s is %s: %s", metric_name, NOT_APPLICABLE, error)
+                metric_value = NOT_APPLICABLE
             self._dictionary_metrics["DistanceMetrics"][evaluation_type][f"{fold}-Fold"][metric_name] = (  
-                instance.get_metric(x_evaluation_real, x_evaluation_synthetic)
+                self._numeric_metric_value(metric_value)
             )
 
     def get_AUC_metric(self, real_label, synthetic_label_probability, evaluation_type, classifier, fold):

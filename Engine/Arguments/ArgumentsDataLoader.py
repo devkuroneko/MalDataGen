@@ -39,6 +39,97 @@ DEFAULT_DATA_LOAD_PATH_FILE_INPUT = 'Datasets/converted/train_x.csv'
 DEFAULT_DATA_LOAD_PATH_FILE_OUTPUT = 'OutputDir'
 DEFAULT_DATA_LOAD_EXCLUDE_COLUMNS = -1
 DEFAULT_DATA_TYPE = 'binary'
+DEFAULT_DATA_FORMAT = 'csv'
+DEFAULT_SPLIT_MODE = 'cross_validation'
+DEFAULT_TARGET_TYPE = 'auto'
+DEFAULT_FEATURE_TYPE = 'auto'
+DEFAULT_NUM_CLASSES = None
+DEFAULT_LEGACY_NUMBER_SAMPLES_PER_CLASS = "1:256,2:256"
+MODEL_CLASS_COUNT_ARGUMENTS = (
+    'autoencoder_number_classes',
+    'variational_autoencoder_number_classes',
+    'quantized_vae_number_classes',
+    'wasserstein_number_classes',
+    'wasserstein_gp_number_classes',
+)
+
+
+def validate_data_load_arguments(arguments):
+    arguments._legacy_number_samples_per_class_explicit = bool(
+        getattr(arguments, '_legacy_number_samples_per_class_explicit', False)
+    )
+
+    if arguments.data_format == 'csv':
+        return arguments
+
+    missing_paths = []
+    if not arguments.train_x_path:
+        missing_paths.append('--train_x_path')
+    if not arguments.train_y_path:
+        missing_paths.append('--train_y_path')
+
+    if missing_paths:
+        raise ValueError(
+            "data_format=npy_xy requires {}.".format(" and ".join(missing_paths))
+        )
+
+    if (arguments.valid_x_path is None) != (arguments.valid_y_path is None):
+        raise ValueError("--valid_x_path and --valid_y_path must be provided together.")
+
+    if (arguments.test_x_path is None) != (arguments.test_y_path is None):
+        raise ValueError("--test_x_path and --test_y_path must be provided together.")
+
+    if arguments.split_mode == 'provided':
+        if getattr(arguments, 'number_k_folds', 1) != 1:
+            import logging
+            logging.warning(
+                "split_mode=provided uses the provided train/valid/test split contract and ignores "
+                "cross-validation folds. Setting number_k_folds=1 for this run."
+            )
+            arguments.number_k_folds = 1
+
+        has_valid_split = arguments.valid_x_path and arguments.valid_y_path
+        has_test_split = arguments.test_x_path and arguments.test_y_path
+        if not has_valid_split and not has_test_split:
+            import logging
+            logging.warning(
+                "split_mode=provided was selected for data_format=npy_xy, but no valid/test split was "
+                "provided. The loader will continue with the train split only."
+            )
+
+    if arguments.target_type == 'multiclass' and arguments.num_classes is not None:
+        import logging
+        for class_count_argument in MODEL_CLASS_COUNT_ARGUMENTS:
+            if hasattr(arguments, class_count_argument):
+                current_value = getattr(arguments, class_count_argument)
+                if current_value != arguments.num_classes:
+                    logging.info(
+                        "target_type=multiclass uses --num_classes=%s for %s instead of legacy value %s.",
+                        arguments.num_classes,
+                        class_count_argument,
+                        current_value,
+                    )
+                    setattr(arguments, class_count_argument, arguments.num_classes)
+
+    sample_plan = getattr(arguments, 'sample_plan', 'legacy')
+    has_explicit_legacy_counts = getattr(arguments, '_legacy_number_samples_per_class_explicit', False)
+    if sample_plan == 'legacy' and not has_explicit_legacy_counts:
+        raise ValueError(
+            "data_format=npy_xy requires an explicit sampling plan. Use --sample_plan balanced_per_class "
+            "with --samples_per_class, --sample_plan match_train_distribution or total_rows with "
+            "--total_synthetic_rows, or pass --number_samples_per_class explicitly."
+        )
+
+    if sample_plan == 'balanced_per_class' and getattr(arguments, 'samples_per_class', None) is None:
+        raise ValueError("--sample_plan balanced_per_class requires --samples_per_class.")
+
+    if sample_plan == 'total_rows' and getattr(arguments, 'total_synthetic_rows', None) is None:
+        raise ValueError("--sample_plan total_rows requires --total_synthetic_rows.")
+
+    if sample_plan == 'class_counts' and not has_explicit_legacy_counts:
+        raise ValueError("--sample_plan class_counts requires --number_samples_per_class.")
+
+    return arguments
 
 def add_argument_data_load(parser):
 
@@ -70,5 +161,55 @@ def add_argument_data_load(parser):
     parser.add_argument('--data_type', type=str, default=DEFAULT_DATA_TYPE,
                         choices=['binary', 'multiclass', 'continuous'],
                         help='Dataset mode used by loading, generation post-processing and metrics.')
+
+    parser.add_argument('--data_format', type=str, default=DEFAULT_DATA_FORMAT,
+                        choices=['csv', 'npy_xy'],
+                        help=("Input data format. Default 'csv' preserves the legacy single-CSV flow. "
+                              "Use 'npy_xy' only for explicit X/y NumPy files, for example: "
+                              "--data_format npy_xy --train_x_path train_x.npy --train_y_path train_y.npy."))
+
+    parser.add_argument('--train_x_path', type=str, default=None,
+                        help='Path to train_x.npy when --data_format npy_xy is selected.')
+
+    parser.add_argument('--train_y_path', type=str, default=None,
+                        help='Path to train_y.npy when --data_format npy_xy is selected.')
+
+    parser.add_argument('--valid_x_path', type=str, default=None,
+                        help='Optional path to valid_x.npy for --data_format npy_xy --split_mode provided.')
+
+    parser.add_argument('--valid_y_path', type=str, default=None,
+                        help='Optional path to valid_y.npy for --data_format npy_xy --split_mode provided.')
+
+    parser.add_argument('--test_x_path', type=str, default=None,
+                        help='Optional path to test_x.npy for --data_format npy_xy --split_mode provided.')
+
+    parser.add_argument('--test_y_path', type=str, default=None,
+                        help='Optional path to test_y.npy for --data_format npy_xy --split_mode provided.')
+
+    parser.add_argument('--split_mode', type=str, default=DEFAULT_SPLIT_MODE,
+                        choices=['cross_validation', 'provided'],
+                        help=("Split strategy. Default 'cross_validation' preserves the current K-fold behavior. "
+                              "Use 'provided' with npy_xy to consume train/valid/test files when supplied."))
+
+    parser.add_argument('--target_type', type=str, default=DEFAULT_TARGET_TYPE,
+                        choices=['auto', 'binary', 'multiclass', 'regression', 'none'],
+                        help=("Target semantics for new loaders. Default 'auto' preserves existing behavior. "
+                              "Example for AppClassNet: --target_type multiclass."))
+
+    parser.add_argument('--feature_type', type=str, default=DEFAULT_FEATURE_TYPE,
+                        choices=['auto', 'binary', 'continuous', 'mixed'],
+                        help=("Feature semantics for new loaders. Default 'auto' preserves existing behavior. "
+                              "Example for AppClassNet: --feature_type continuous."))
+
+    parser.add_argument('--num_classes', type=int, default=DEFAULT_NUM_CLASSES,
+                        help='Optional class-domain size for new loaders, for example --num_classes 200.')
+
+    parser.add_argument('--remap_labels_to_zero_based', action='store_true', default=False,
+                        help=("Explicitly remap 1-based labels to zero-based labels in new loaders. "
+                              "Disabled by default to avoid silent label changes."))
+
+    parser.add_argument('--mmap_npy', action='store_true', default=False,
+                        help=("Use numpy memory mapping for npy_xy files. Default is False at CLI level to keep "
+                              "new behavior opt-in; CSV mode ignores this flag."))
 
     return parser

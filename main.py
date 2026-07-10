@@ -45,6 +45,8 @@ try:
 
     from Engine.DataIO.CSVLoader import autosave
     from Engine.DataIO.CSVLoader import autoload
+    from Engine.DataIO.SamplePlanner import build_sample_plan_from_args
+    from Engine.DataIO.SamplePlanner import sample_plan_to_legacy_metadata
 
     from Engine.Arguments.Arguments import Arguments
     from Engine.Arguments.Arguments import arguments
@@ -404,8 +406,16 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                 logging.info(" starting evaluation for fold %d.", fold + 1)
 
                 # Perform the evaluations using synthetic and real data
-                self.evaluation_TR_TS(dictionary_data, evaluation_synthetic)  
-                self.evaluation_TS_TR(dictionary_data, evaluation_synthetic)  
+                if dictionary_data.get('evaluation_not_applicable'):
+                    reason = (
+                        "split_mode=provided has no valid/test evaluation split; "
+                        "TR-TS, TS-TR and distance evaluations are not_applicable."
+                    )
+                    logging.warning(reason)
+                    self.mark_fold_not_applicable(self.fold_number + 1, reason)
+                else:
+                    self.evaluation_TR_TS(dictionary_data, evaluation_synthetic)  
+                    self.evaluation_TS_TR(dictionary_data, evaluation_synthetic)  
                 
                 #self.evaluation_TR_TR(dictionary_data)
                 # self.calculate_sdv_metrics(dictionary_data, fold)
@@ -467,24 +477,25 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
 
     def _build_generation_metadata(self, y_real_samples):
         labels = self._prepare_labels_for_conditional_generation(y_real_samples)
-
-        unique_classes, counts = numpy.unique(labels, return_counts=True)
-        class_counts = {
-            int(label): int(count)
-            for label, count in zip(unique_classes, counts)
-        }
         number_classes = self._get_configured_number_classes(labels)
+        sample_plan = build_sample_plan_from_args(
+            self.arguments,
+            labels,
+            number_classes=number_classes,
+            data_type=getattr(self, '_data_type', getattr(self.arguments, 'data_type', 'binary')),
+        )
+        self._sample_plan = sample_plan
+        generation_metadata = sample_plan_to_legacy_metadata(
+            sample_plan,
+            data_type=getattr(self, '_data_type', getattr(self.arguments, 'data_type', 'binary')),
+        )
 
-        if len(unique_classes) != number_classes:
+        if len(generation_metadata["classes"]) != number_classes:
             logging.info(
                 "\t\tGeneration fold contains %d/%d configured classes; preserving total class domain.",
-                len(unique_classes), number_classes)
+                len(generation_metadata["classes"]), number_classes)
 
-        return {
-            'classes': class_counts,
-            'number_classes': number_classes,
-            'data_type': getattr(self.arguments, 'data_type', 'binary'),
-        }
+        return generation_metadata
 
     @import_models
     def train_model(self, x_real_samples, y_real_samples, monitor_path, k_fold):

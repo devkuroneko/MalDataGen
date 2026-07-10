@@ -72,7 +72,88 @@ Impacto no sistema:
 - Mantem a contagem por fold para definir quantas amostras sintetizar por classe presente.
 - Nao altera o CSV nem o runner; a correcao fica no nucleo de treino/sintese.
 
+### `Tools/PlotClasssificationMetrics.py`
+
+O erro abaixo ocorria ao executar a campanha sem `--skip_plots`:
+
+```text
+KeyError: 'Precision'
+```
+
+Causa:
+
+- O `Results.json` do modo `continuous` usa metricas preditivas multiclasses, como `BalancedAccuracy`, `PrecisionMacro`, `RecallMacro`, `F1Macro` e `F1Weighted`.
+- O plot de metricas ainda percorria a lista fixa de `Tools/config.py`, que inclui `Precision`, `Recall` e `Specificity`, metricas do fluxo binario.
+- Ao acessar diretamente `data[dataset][group][clf]['Precision']`, o plot encerrava o subprocesso com erro.
+
+Correcoes aplicadas:
+
+- O plot agora extrai todas as metricas presentes no `Summary` do `Results.json`.
+- A lista efetiva de metricas e resolvida dinamicamente.
+- Metricas configuradas mas ausentes sao ignoradas.
+- Metricas multiclasses presentes no JSON sao adicionadas ao grafico.
+- A leitura de `mean` e `std` agora e defensiva para datasets, grupos, classificadores ou metricas ausentes.
+
+Impacto no sistema:
+
+- Mantem compatibilidade com resultados binarios.
+- Permite plotar resultados `continuous` e multiclasse sem exigir `Precision` binaria.
+- Evita que uma metrica ausente derrube toda a campanha.
+
+### `Tools/PlotDistanceMetrics.py`
+
+Causa adicional corrigida:
+
+- Para `continuous`, as metricas de distancia geradas nao incluem `HammingDistance` e `JaccardDistance`.
+- O plot de distancias ainda tentaria acessar essas metricas pela lista padrao.
+
+Correcoes aplicadas:
+
+- O plot de distancias agora resolve as metricas presentes no JSON antes de desenhar barras.
+- Metricas de distancia ausentes sao ignoradas.
+
+Impacto no sistema:
+
+- Plots de distancia funcionam para dados continuos sem reintroduzir metricas discretas.
+
+### `Tools/PlotConfusionMatrix.py`
+
+Causa adicional corrigida:
+
+- Resultados `continuous` e multiclasse nao possuem as chaves binarias `TruePositive`, `TrueNegative`, `FalsePositive` e `FalseNegative`.
+
+Correcoes aplicadas:
+
+- A matriz de confusao passa a validar se essas chaves existem antes de plotar.
+- Quando nao existem, o plot e ignorado com warning, sem erro fatal.
+
+Impacto no sistema:
+
+- Fluxos binarios continuam podendo gerar matriz de confusao.
+- Fluxos `continuous` e multiclasse nao falham por nao terem matriz binaria.
+
+### `plots.py`
+
+Correcoes aplicadas:
+
+- O carregamento de CSV nos plots usa a ultima coluna como label (`data_load_label_column=-1`), compativel com CSVs AppClassNet que usam `label`.
+- Heatmaps agora selecionam labels disponiveis no dataset, em vez de assumir fixamente `0` e `1`.
+- Comparacoes de heatmap alinham o numero de linhas e colunas entre real e sintetico antes de calcular diferenca.
+- Visualizacoes opcionais agora sao isoladas; se uma visualizacao nao se aplica ao modo atual, ela e ignorada com warning.
+
+Impacto no sistema:
+
+- O comando sem `--skip_plots` passa a funcionar para AppClassNet top200 continuous.
+- Plots validos continuam sendo gerados.
+- Visualizacoes binarias ou especificas que nao encontram dados aplicaveis nao encerram a execucao.
+
 ## Como executar
+
+### Demo com plots, com 1000 amostras balanceadas
+
+```bash
+python3 run_appclassnet_top200.py --campaign sf --dataset_split train --prepare_max_samples 1000
+```
 
 ### Demo sem plots, com 1000 amostras balanceadas
 
@@ -111,7 +192,7 @@ python3 run_experiments.py --campaign sf --dataset_split train --prepare_max_sam
 - Para as campanhas completas com `number_k_folds=5`, o minimo recomendado e `1000` amostras.
 - Para os demos `sf`, que usam `number_k_folds=2`, o minimo recomendado e `400` amostras.
 - O split `train` completo tem 4.347.270 linhas; `test` tem 4.830.012 linhas. Converter splits completos para CSV pode gerar arquivos grandes.
-- `plots.py` ainda possui visualizacoes orientadas a labels 0/1 em algumas funcoes de heatmap. Por isso, `--skip_plots` e recomendado para validacoes iniciais no AppClassNet top200 multiclasses.
+- `plots.py` gera os plots aplicaveis ao tipo de resultado. Visualizacoes binarias ou especificas que nao encontram dados compativeis sao ignoradas com warning.
 
 ## Validacoes executadas
 
@@ -127,6 +208,8 @@ python3 run_appclassnet_top200.py --prepare_only --dataset_split train --prepare
 python3 run_experiments.py --dryrun --campaign adversarial_demo --dataset_split train --prepare_max_samples 10 --skip_plots --verbosity 20
 python3 -m py_compile main.py run_appclassnet_top200.py
 python3 run_appclassnet_top200.py --campaign sf --dataset_split train --prepare_max_samples 1000 --skip_plots --verbosity 20
+python3 -m py_compile plots.py Tools/PlotClasssificationMetrics.py Tools/PlotDistanceMetrics.py Tools/PlotConfusionMatrix.py
+python3 run_appclassnet_top200.py --campaign sf --dataset_split train --prepare_max_samples 1000
 ```
 
 Resultado das validacoes:
@@ -142,9 +225,13 @@ Resultado das validacoes:
 - O treinamento real `sf` com 1000 amostras foi concluido com codigo `0`.
 - Durante a validacao real, um fold continha menos classes que o dominio total e o log confirmou a preservacao do dominio configurado: `Generation fold contains 191/200 configured classes; preserving total class domain.`
 - O erro `expected shape=(None, 200), found shape=(2, 193)` nao reapareceu.
+- O treinamento real `sf` sem `--skip_plots` foi concluido com codigo `0`.
+- Os plots de metricas preditivas, distancias e curvas de treino foram gerados para `variational_demo` e `adversarial_demo`.
+- A matriz de confusao binaria foi corretamente ignorada para `continuous` com warning, sem falha fatal.
+- O erro `KeyError: 'Precision'` nao reapareceu.
 
 ## Limitacoes nao resolvidas nesta tarefa
 
-- `plots.py` ainda tem pressupostos binarios em algumas visualizacoes, principalmente heatmaps por labels 0 e 1.
+- `plot_heatmap_svm` ainda pode informar `No valid model data found to plot` quando os caminhos de resultados nao seguem o padrao esperado por essa visualizacao. O aviso nao encerra a campanha.
 - O projeto ainda usa validacao cruzada interna do `main.py`; os splits originais `train/valid/test` do AppClassNet sao centralizados para selecao/conversao, mas nao substituem a logica de folds do `main.py`.
 - O teste real executado foi a campanha demo `sf`; campanhas completas com mais epocas ainda podem exigir validacao separada por custo computacional.

@@ -192,7 +192,32 @@ class PlotDistanceMetrics(Plot):
                                     input_files=input_files)
 
         data = self._read_data(input_files=input_files)
+        self.metrics = self._resolve_metrics(data)
         self._plot_distance_metrics(data=data, datasets=input_files)
+
+    @staticmethod
+    def _extract_present_metrics(data):
+        metrics = []
+        for dataset_data in data.values():
+            distance_metrics = dataset_data.get("DistanceMetrics", {})
+            for group_data in distance_metrics.values():
+                for metric in group_data.keys():
+                    if metric not in metrics:
+                        metrics.append(metric)
+        return metrics
+
+    def _resolve_metrics(self, data):
+        present_metrics = self._extract_present_metrics(data)
+        resolved_metrics = [metric for metric in self.metrics if metric in present_metrics]
+
+        if not resolved_metrics:
+            resolved_metrics = present_metrics
+
+        missing_metrics = [metric for metric in self.metrics if metric not in present_metrics]
+        if missing_metrics:
+            logging.info("Skipping unavailable distance metrics in plot: %s", missing_metrics)
+
+        return resolved_metrics
 
     @staticmethod
     def _validate_inputs(groups, option, color_map):
@@ -272,6 +297,10 @@ class PlotDistanceMetrics(Plot):
             This method coordinates the entire plotting process by calling helper methods.
         """
         fig, ax = self._setup_plot()
+        if not self.metrics:
+            logging.warning("No distance metrics available for plotting.")
+            return
+
         colors_metrics = self._create_colors_metrics_mapping()
         x = self._calculate_x_positions(datasets)
 
@@ -305,7 +334,10 @@ class PlotDistanceMetrics(Plot):
         for i, metric in enumerate(self.metrics):
 
             for group in self.groups:
-                colors_metrics[f"{metric} {group}"] = self.color_map[group][i]
+                palette = self.color_map[group]
+                if i >= len(palette):
+                    palette = seaborn.color_palette("tab20", n_colors=len(self.metrics))
+                colors_metrics[f"{metric} {group}"] = palette[i]
 
         return colors_metrics
 
@@ -351,9 +383,23 @@ class PlotDistanceMetrics(Plot):
         Returns:
             tuple: (mean_values, std_values) for the specified group and metric.
         """
-        mean = [data[dataset]["DistanceMetrics"][group][metric]['mean'] for dataset in datasets]
-        std = [data[dataset]["DistanceMetrics"][group][metric]['std'] for dataset in datasets]
+        mean = []
+        std = []
+        for dataset in datasets:
+            metric_data = data.get(dataset, {}).get("DistanceMetrics", {}).get(group, {}).get(metric, {})
+            mean.append(PlotDistanceMetrics._safe_numeric(metric_data.get('mean')))
+            std.append(PlotDistanceMetrics._safe_numeric(metric_data.get('std')))
         return mean, std
+
+    @staticmethod
+    def _safe_numeric(value):
+        try:
+            numeric_value = float(value)
+            if numpy.isfinite(numeric_value):
+                return numeric_value
+        except (TypeError, ValueError):
+            pass
+        return 0.0
 
     def _plot_single_bar(self, ax, x, i, mean, std, colors_metrics, metric, group):
         """

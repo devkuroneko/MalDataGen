@@ -36,6 +36,8 @@ try:
     import numpy
     import logging
 
+    from Engine.DataIO.LabelUtils import labels_to_1d_integer
+
 except ImportError as error:
     print(error)
     sys.exit(-1)
@@ -81,7 +83,9 @@ class TrTr:
         if getattr(self, '_labels_are_discrete', True):
             # Train classifiers using the real training data and corresponding labels
             classifiers = self.get_trained_classifiers(dictionary_data['x_training_real'],
-                                                        numpy.squeeze(dictionary_data['y_training_real'], axis=-1),
+                                                        labels_to_1d_integer(
+                                                            dictionary_data['y_training_real'],
+                                                            context="TR-TR training labels"),
                                                         numpy.float32, self.get_number_columns())
 
             # Evaluate the classifiers on synthetic data for each classifier instancevaluation
@@ -91,10 +95,15 @@ class TrTr:
                 logging.info("")
                 logging.info(f"\t\t\t TR-TR {classifier_name}")
                 # Calculate and log metrics selected by data_type.
-                self.get_task_metrics(numpy.array(dictionary_data['y_evaluation_real']), numpy.array(label_predicted),
+                self.get_task_metrics(labels_to_1d_integer(
+                                            dictionary_data['y_evaluation_real'],
+                                            context="TR-TR evaluation labels"),
+                                        numpy.array(label_predicted),
                                         "TR-TR", classifier_name, self.fold_number + 1)
         else:
-            logging.info("\t\tTR-TR predictive evaluation skipped because labels are continuous.")
+            reason = "TR-TR predictive evaluation skipped because labels are not discrete."
+            logging.warning("\t\t%s", reason)
+            self.mark_evaluation_classifiers_not_applicable("TR-TR", self.fold_number + 1, reason)
             
         
         data_real = numpy.array(dictionary_data['x_training_real'])

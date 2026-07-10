@@ -52,6 +52,7 @@ except ImportError as error:
     sys.exit(-1)
 
 DEFAULT_CONFUSION_MATRIX_DIRECTORY ='confusion_matrices'
+CONFUSION_KEYS = ("TruePositive", "TrueNegative", "FalsePositive", "FalseNegative")
 
 DEFAULT_TITLE=''
 DEFAULT_X_LABEL = 'Predicted Label'
@@ -190,8 +191,12 @@ class PlotConfusionMatrix(Plot):
         self.save_path = os.path.dirname(input_file)
 
         data = self._read_data(input_files=[input_file])
+        values = data.get(input_file, {})
+        if not values:
+            logging.warning("No binary confusion matrix metrics available for plotting.")
+            return
 
-        self._plot_confusion_matrix(data=data[input_file])
+        self._plot_confusion_matrix(data=values)
 
     def _plot_confusion_matrix(self, data):
         """
@@ -212,7 +217,15 @@ class PlotConfusionMatrix(Plot):
                             }
                         }
         """
+        if not data:
+            logging.warning("No binary confusion matrix metrics available for plotting.")
+            return
+
         max_number_folds = self._get_max_number_folds(data)
+        if max_number_folds == 0:
+            logging.warning("No binary confusion matrix folds available for plotting.")
+            return
+
         colormaps = self._generate_colormaps(max_number_folds)
 
         for classifier_name, groups_data in data.items():
@@ -231,7 +244,12 @@ class PlotConfusionMatrix(Plot):
         Returns:
             int: Maximum number of folds found in the data.
         """
-        return max(len(folds) for classifier_data in data.values() for folds in classifier_data.values())
+        fold_counts = [
+            len(folds)
+            for classifier_data in data.values()
+            for folds in classifier_data.values()
+        ]
+        return max(fold_counts) if fold_counts else 0
 
     @staticmethod
     def _generate_colormaps(num_colors):
@@ -284,6 +302,11 @@ class PlotConfusionMatrix(Plot):
         """
         rows, cols = self._determine_subplot_layout(groups_data)
         fig, axes = plt.subplots(rows, cols, figsize=(12, 6))
+        axes = numpy.asarray(axes)
+        if axes.ndim == 0:
+            axes = axes.reshape(1, 1)
+        elif axes.ndim == 1:
+            axes = axes.reshape(1, cols) if rows == 1 else axes.reshape(rows, 1)
 
         for row_idx, (group_name, fold_data) in enumerate(groups_data.items()):
             self._plot_group_matrices(row_idx, group_name, fold_data, axes,
@@ -486,13 +509,31 @@ class PlotConfusionMatrix(Plot):
 
                             if fold in data[group][clf]:
 
-                                values[clf][group][fold] = {}
                                 data_fold = data[group][clf].get(fold, {})
-                                values[clf][group][fold]["TruePositive"] = data_fold.get("TruePositive")
-                                values[clf][group][fold]["TrueNegative"] = data_fold.get("TrueNegative")
-                                values[clf][group][fold]["FalsePositive"] = data_fold.get("FalsePositive")
-                                values[clf][group][fold]["FalseNegative"] = data_fold.get("FalseNegative")
+                                if not self._has_valid_confusion_values(data_fold):
+                                    continue
+
+                                values[clf][group][fold] = {
+                                    metric: data_fold.get(metric)
+                                    for metric in CONFUSION_KEYS
+                                }
+
+                        if not values[clf][group]:
+                            del values[clf][group]
+
+                        if not values[clf]:
+                            del values[clf]
         return values
+
+    @staticmethod
+    def _has_valid_confusion_values(data_fold):
+        for metric in CONFUSION_KEYS:
+            value = data_fold.get(metric)
+            try:
+                float(value)
+            except (TypeError, ValueError):
+                return False
+        return True
 
     @property
     def groups(self) -> List[str]:

@@ -43,7 +43,7 @@ try:
 
     from tensorflow.keras.models import Model
 
-    from tensorflow.keras.utils import to_categorical
+    from Engine.DataIO.LabelUtils import one_hot_encode_labels
     from tensorflow.keras.models import model_from_json
 
     from tensorflow.keras.losses import BinaryCrossentropy
@@ -336,9 +336,10 @@ class AdversarialAlgorithm(Model):
             # Create one-hot encoded labels for all generated samples in this class
             # Example: if label_class = 2 and number_instances = 5, this will generate:
             # [[0, 0, 1], [0, 0, 1], [0, 0, 1], [0, 0, 1], [0, 0, 1]]
-            label_samples_generated = to_categorical(
+            label_samples_generated = one_hot_encode_labels(
                 [label_class] * number_instances,
-                num_classes=number_samples_per_class["number_classes"]
+                num_classes=number_samples_per_class["number_classes"],
+                context="adversarial generated labels",
             )
 
             # Generate random noise vectors (latent vectors) for each sample
@@ -476,4 +477,3 @@ class AdversarialAlgorithm(Model):
 
     def set_loss_discriminator(self, loss_discriminator):
         self._loss_discriminator = loss_discriminator
-

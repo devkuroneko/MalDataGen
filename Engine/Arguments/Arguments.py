@@ -48,6 +48,7 @@ try:
     from Engine.Arguments.ArgumentsFramework import add_argument_framework
     from Engine.Arguments.Classifiers.ArgumentsKNN import add_argument_knn
     from Engine.Arguments.ArgumentsDataLoader import add_argument_data_load
+    from Engine.Arguments.ArgumentsDataLoader import validate_data_load_arguments
     from Engine.Arguments.ArgumentsEarlyStop import add_argument_early_stop
     from Engine.Arguments.ArgumentsOptimizer import add_argument_optimizers
 
@@ -173,7 +174,9 @@ class Arguments(DirectoryManager):
         self.arguments = add_argument_support_vector_machine(self.arguments)
 
         self.arguments = self.arguments.parse_args()
+        self.arguments = validate_data_load_arguments(self.arguments)
         self._create_directories(base_directory=self.arguments.output_dir)
+        self.arguments.output_dir = self.current_subdir
 
         # view_splash_screen = View()
         # view_splash_screen.print_view()

@@ -47,7 +47,6 @@ try:
 
     from tensorflow.keras import Model
 
-    from tensorflow.keras.utils import to_categorical
     from tensorflow.keras.losses import BinaryCrossentropy
 
 except ImportError as error:

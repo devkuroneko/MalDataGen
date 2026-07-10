@@ -43,12 +43,11 @@ try:
 
     from tensorflow.keras.optimizers import Adam
 
-    from tensorflow.keras.utils import to_categorical
-
     from tensorflow.python.keras.losses import MeanSquaredError
     from Engine.Callbacks.CallbackEarlyStop import EarlyStopping
 
     from tensorflow.python.keras.losses import BinaryCrossentropy
+    from Engine.DataIO.LabelUtils import one_hot_encode_labels
 
     from Engine.Algorithms.Copy.CopyAlgorithm import CopyAlgorithm
 
@@ -92,6 +91,14 @@ try:
 except ImportError as error:
     logging.error(error)
     sys.exit(-1)
+
+
+def _labels_to_one_hot(labels, number_samples_per_class, context="labels"):
+    return one_hot_encode_labels(
+        labels,
+        num_classes=int(number_samples_per_class["number_classes"]),
+        context=context,
+    )
 
 
 
@@ -261,7 +268,7 @@ class AdversarialInstance:
         # Fit the model with real samples and the corresponding labels
         self._adversarial_algorithm.fit(
             x_real_samples,
-            to_categorical(y_real_samples, num_classes=self._number_samples_per_class["number_classes"]),
+            _labels_to_one_hot(y_real_samples, self._number_samples_per_class, "adversarial y"),
             epochs=self._adversarial_number_epochs, batch_size=self._adversarial_batch_size,
             callbacks=callbacks_list)
 
@@ -580,8 +587,7 @@ class AutoencoderInstance:
 
         # Fit the autoencoder model
         self._autoencoder_algorithm.fit((
-            x_real_samples, to_categorical(y_real_samples,
-                                           num_classes=self._number_samples_per_class["number_classes"])),
+            x_real_samples, _labels_to_one_hot(y_real_samples, self._number_samples_per_class, "autoencoder y")),
             x_real_samples, epochs=self._autoencoder_number_epochs, batch_size=self._autoencoder_batch_size,
             callbacks=callbacks_list)
 
@@ -907,7 +913,7 @@ class QuantizedVAEInstance:
         # Fit the variational autoencoder model
         self._quantized_vae_algorithm.fit((
             x_real_samples,
-            to_categorical(y_real_samples, num_classes=self._number_samples_per_class["number_classes"])),
+            _labels_to_one_hot(y_real_samples, self._number_samples_per_class, "quantized_vae y")),
             x_real_samples, epochs=self._quantized_vae_number_epochs, batch_size=self._quantized_vae_batch_size,
             callbacks=callbacks_list)
 
@@ -1371,7 +1377,7 @@ class LatentDiffusionInstance:
         # Fit the diffusion model with the training data
         self._latent_variational_algorithm_diffusion.fit((
             x_real_samples,
-            to_categorical(y_real_samples, num_classes=self._number_samples_per_class["number_classes"])),
+            _labels_to_one_hot(y_real_samples, self._number_samples_per_class, "latent_diffusion VAE y")),
             x_real_samples, epochs=self._latent_diffusion_VAE_epochs,
             batch_size=self._latent_diffusion_VAE_batch_size_training,
             callbacks=callbacks_list)
@@ -1403,7 +1409,7 @@ class LatentDiffusionInstance:
         # Prepare the data embedding and train the diffusion model
         data_embedding = self._latent_variational_algorithm_diffusion.create_embedding([
             x_real_samples,
-            to_categorical(y_real_samples, num_classes=self._number_samples_per_class["number_classes"])])
+            _labels_to_one_hot(y_real_samples, self._number_samples_per_class, "latent_diffusion embedding y")])
 
         data_embedding = numpy.array(data_embedding)
         data_embedding = tensorflow.expand_dims(data_embedding, axis=-1)
@@ -1416,7 +1422,7 @@ class LatentDiffusionInstance:
 
         self._latent_diffusion_algorithm.fit(
             data_embedding,
-            to_categorical(y_real_samples, num_classes=self._number_samples_per_class["number_classes"]),
+            _labels_to_one_hot(y_real_samples, self._number_samples_per_class, "latent_diffusion unet y"),
             epochs=self._latent_diffusion_unet_epochs, batch_size=self._latent_diffusion_unet_batch_size,
             callbacks=callbacks_list, verbose=2)
 
@@ -2008,7 +2014,7 @@ class WassersteinInstance:
         # Fit the WassersteinGP GAN model
         self._wasserstein_algorithm.fit(
             x_real_samples,
-            to_categorical(y_real_samples, num_classes=self._number_samples_per_class["number_classes"]),
+            _labels_to_one_hot(y_real_samples, self._number_samples_per_class, "wasserstein y"),
             epochs=self._wasserstein_number_epochs, batch_size=self._wasserstein_batch_size,
             callbacks=callbacks_list)
 
@@ -2442,7 +2448,7 @@ class WassersteinGPInstance:
         # Fit the WassersteinGP GAN model
         self._wasserstein_gp_algorithm.fit(
             x_real_samples,
-            to_categorical(y_real_samples, num_classes=self._number_samples_per_class["number_classes"]),
+            _labels_to_one_hot(y_real_samples, self._number_samples_per_class, "wasserstein_gp y"),
             epochs=self._wasserstein_gp_number_epochs, batch_size=self._wasserstein_gp_batch_size,
             callbacks=callbacks_list)
 
@@ -2843,8 +2849,8 @@ class VariationalAutoencoderInstance:
             callbacks_list.append(self._callback_early_stop)
 
         # Fit the variational autoencoder model
-        self._variational_algorithm.fit((x_real_samples, to_categorical(y_real_samples,
-                                           num_classes=self._number_samples_per_class["number_classes"])),
+        self._variational_algorithm.fit((x_real_samples, _labels_to_one_hot(
+                                           y_real_samples, self._number_samples_per_class, "variational_autoencoder y")),
                                         x_real_samples, epochs=self._variational_autoencoder_number_epochs,
                                         batch_size=self._variational_autoencoder_batch_size,
                                         callbacks=callbacks_list)
@@ -3239,7 +3245,7 @@ class DenoisingDiffusionInstance:
 
         self._denoising_diffusion_algorithm.fit(
             x_real_samples,
-            to_categorical(y_real_samples, num_classes=self._number_samples_per_class["number_classes"]),
+            _labels_to_one_hot(y_real_samples, self._number_samples_per_class, "denoising_diffusion y"),
             epochs=self._denoising_diffusion_unet_epochs, batch_size=self._denoising_diffusion_unet_batch_size,
             callbacks=callbacks_list)
 
@@ -3594,8 +3600,7 @@ class SmoteInstance:
 
         # Fit the autoencoder model
         self._smote_algorithm.fit(x_real_samples,
-                                  to_categorical(y_real_samples,
-                                                 num_classes=self._number_samples_per_class["number_classes"]))
+                                  _labels_to_one_hot(y_real_samples, self._number_samples_per_class, "smote y"))
 
     @property
     def smote_sampling_strategy(self):
@@ -3896,8 +3901,10 @@ class GenerativeModels(AdversarialInstance,
 
             # Fit the autoencoder model
             self._random_noise_algorithm.fit(x_real_samples,
-                                             to_categorical(y_real_samples,
-                                                            num_classes=self._number_samples_per_class["number_classes"]))
+                                             _labels_to_one_hot(
+                                                 y_real_samples,
+                                                 self._number_samples_per_class,
+                                                 "random_noise y"))
 
         # Smote model training
         elif arguments.model_type == 'smote':
@@ -3907,8 +3914,8 @@ class GenerativeModels(AdversarialInstance,
 
             # Fit the autoencoder model
             self._smote_algorithm.fit(
-                x_real_samples, to_categorical(y_real_samples,
-                                               num_classes=self._number_samples_per_class["number_classes"]))
+                x_real_samples,
+                _labels_to_one_hot(y_real_samples, self._number_samples_per_class, "mixed smote y"))
 
         # Variational Autoencoder (VAE) model training
         elif arguments.model_type == 'variational':
@@ -4050,6 +4057,5 @@ def import_models(function):
         return function(self, *args, **kwargs)
 
     return wrapper
-
 
 

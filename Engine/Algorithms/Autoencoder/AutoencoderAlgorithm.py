@@ -41,7 +41,7 @@ try:
     from tensorflow.keras.metrics import Mean
     from tensorflow.keras.models import Model
 
-    from tensorflow.keras.utils import to_categorical
+    from Engine.DataIO.LabelUtils import one_hot_encode_labels
 
 except ImportError as error:
     print(error)
@@ -285,9 +285,10 @@ class AutoencoderAlgorithm(Model):
             # Create a batch of one-hot encoded class labels, all set to the current class
             # Example: if label_class = 1 and number_instances = 3, this creates:
             # [[0, 1], [0, 1], [0, 1]]
-            label_samples_generated = to_categorical(
+            label_samples_generated = one_hot_encode_labels(
                 [label_class] * number_instances,
-                num_classes=number_samples_per_class["number_classes"]
+                num_classes=number_samples_per_class["number_classes"],
+                context="autoencoder generated labels",
             )
 
             # Generate random noise vectors (latent space vectors) for each sample

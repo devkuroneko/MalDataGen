@@ -45,7 +45,7 @@ try:
 
     from tensorflow.keras.metrics import Mean
 
-    from tensorflow.keras.utils import to_categorical
+    from Engine.DataIO.LabelUtils import one_hot_encode_labels
 
     from tensorflow.keras.losses import BinaryCrossentropy
 
@@ -285,8 +285,11 @@ class VAELatentDiffusionAlgorithm(Model):
             # Create a one-hot encoded label array for all samples in the current class
             # Example: if label_class = 1 and number_instances = 3, this generates:
             # [[0, 1], [0, 1], [0, 1]]
-            label_samples_generated = to_categorical([label_class] * number_instances,
-                                                     num_classes=number_samples_per_class["number_classes"])
+            label_samples_generated = one_hot_encode_labels(
+                [label_class] * number_instances,
+                num_classes=number_samples_per_class["number_classes"],
+                context="vae_latent_diffusion generated labels",
+            )
 
             # Sample random latent vectors from a standard normal distribution
             # Shape: (number_instances, decoder_latent_dimension)

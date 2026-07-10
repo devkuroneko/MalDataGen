@@ -76,6 +76,10 @@ MalDataGen is a modular and extensible synthetic data generation library for tab
 - Provide publication-ready metrics and visualizations
 
 It supports GPU acceleration, CSV/XLS ingestion, custom CLI scripts, and integration with academic pipelines.
+
+### Optional AppClassNet npy_xy Support
+
+The default input mode remains the original single-CSV workflow. For AppClassNet top-200 and other datasets stored as separate NumPy `X/y` arrays, MalDataGen also supports an explicit `npy_xy` mode. See [docs/APPCLASSNET_NPY_XY.md](docs/APPCLASSNET_NPY_XY.md) for file layout, smoke tests, `split_mode=provided`, multiclass settings, sample plans, and known limitations.
 ---
 ### Model architecure overivew
 WWe provide a visual overview of the internal architecture of each model's building blocks through five detailed figures, highlighting the main structural changes across the models. These diagrams are documented and explained in the Overview.md [Overview.md ] file.(https://github.com/SBSeg25/MalDataGen/blob/2dd9eaad74da7726c130e50dbc35f95a463cbd00/Docs/Overview.md)

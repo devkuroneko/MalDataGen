@@ -103,7 +103,7 @@ class PlotClassificationMetrics(Plot):
     def __init__(self,
                  input_files: List[str],
                  groups=config.GROUPS,
-                 metrics=config.METRICS,
+                 metrics=None,
                  classifiers=config.CLASSIFIERS,
                  color_map=None,
                  title=DEFAULT_TITLE,
@@ -134,23 +134,15 @@ class PlotClassificationMetrics(Plot):
                 option="mean_std"
             )
         """
-        if color_map is None:
-
-            if len(groups) > len(DEFAULT_AVAILABLE_PALETTES):
-                raise ValueError(f"Not enough color palettes for the number of groups ({len(groups)} groups, "
-                                 f"but only {len(DEFAULT_AVAILABLE_PALETTES)} palettes available). "
-                                 f"Consider reducing the number of groups or defining a custom color_map.")
-
-            color_map = {group: seaborn.color_palette(DEFAULT_AVAILABLE_PALETTES[i], n_colors=len(metrics))
-                         for i, group in enumerate(groups)}
         if option not in DEFAULT_OPTIONS:
             raise ValueError(f"Invalid option: {option}. Must be one of {DEFAULT_OPTIONS}.")
 
         self.groups = groups
-        self.metrics = metrics
+        requested_metrics = list(metrics) if metrics is not None else list(config.METRICS)
+        self.metrics = requested_metrics
         self.classifiers = classifiers
 
-        self.color_map = color_map
+        self.color_map = {}
         self.width_bars = width_bars
         self.option = option
         self.gap = gap
@@ -167,6 +159,20 @@ class PlotClassificationMetrics(Plot):
 
         self.save_path = Path(input_files[0]).parent
         data = self._read_data(input_files=input_files)
+        self.metrics = self._resolve_metrics(data, requested_metrics)
+        data = self._filter_metrics(data, self.metrics)
+
+        if color_map is None:
+
+            if len(groups) > len(DEFAULT_AVAILABLE_PALETTES):
+                raise ValueError(f"Not enough color palettes for the number of groups ({len(groups)} groups, "
+                                 f"but only {len(DEFAULT_AVAILABLE_PALETTES)} palettes available). "
+                                 f"Consider reducing the number of groups or defining a custom color_map.")
+
+            color_map = {group: seaborn.color_palette(DEFAULT_AVAILABLE_PALETTES[i], n_colors=len(self.metrics))
+                         for i, group in enumerate(groups)}
+
+        self.color_map = color_map
 
         self._plot_classification_metrics(data=data, datasets=input_files)
 
@@ -197,6 +203,10 @@ class PlotClassificationMetrics(Plot):
         """
         colors_metrics = self._generate_colors_by_metric_group()
         classifiers = self._extract_present_classifiers(data)
+
+        if not classifiers or not self.metrics:
+            logging.warning("No predictive metrics available for plotting.")
+            return
 
         for clf in classifiers:
             fig, ax = self._create_figure()
@@ -251,6 +261,65 @@ class PlotClassificationMetrics(Plot):
         return {clf for values in data.values() for values in values.values() for clf in values.keys()}
 
     @staticmethod
+    def _extract_present_metrics(data):
+        metrics = []
+        for dataset_data in data.values():
+            for group_data in dataset_data.values():
+                for classifier_data in group_data.values():
+                    for metric in classifier_data.keys():
+                        if metric not in metrics:
+                            metrics.append(metric)
+        return metrics
+
+    def _resolve_metrics(self, data, requested_metrics):
+        present_metrics = self._extract_present_metrics(data)
+        preferred_additional_metrics = [
+            "BalancedAccuracy",
+            "MacroPrecision",
+            "MacroRecall",
+            "MacroF1",
+            "WeightedPrecision",
+            "WeightedRecall",
+            "WeightedF1",
+            "PrecisionMacro",
+            "RecallMacro",
+            "F1Macro",
+            "F1Weighted",
+        ]
+        ordered_metrics = [metric for metric in requested_metrics if metric in present_metrics]
+        ordered_metrics.extend(
+            metric
+            for metric in preferred_additional_metrics
+            if metric in present_metrics and metric not in ordered_metrics
+        )
+
+        if not ordered_metrics:
+            ordered_metrics = present_metrics
+
+        missing_metrics = [metric for metric in requested_metrics if metric not in present_metrics]
+        if missing_metrics:
+            logging.info("Skipping unavailable predictive metrics in plot: %s", missing_metrics)
+
+        return ordered_metrics
+
+    @staticmethod
+    def _filter_metrics(data, metrics):
+        filtered_data = {}
+        for dataset, dataset_data in data.items():
+            filtered_data[dataset] = {}
+            for group, group_data in dataset_data.items():
+                filtered_data[dataset][group] = {}
+                for classifier, classifier_data in group_data.items():
+                    selected_metrics = {
+                        metric: classifier_data[metric]
+                        for metric in metrics
+                        if metric in classifier_data
+                    }
+                    if selected_metrics:
+                        filtered_data[dataset][group][classifier] = selected_metrics
+        return filtered_data
+
+    @staticmethod
     def _create_figure():
         """
         Create a new matplotlib figure and axes.
@@ -301,18 +370,15 @@ class PlotClassificationMetrics(Plot):
         # Iterate through all metric-group combinations
         for i, (metric, group) in enumerate([(m, k) for m in self.metrics for k in self.groups]):
             # Extract mean values (handle missing data with 0)
-            mean = [
-                data[dataset][group][clf][metric]['mean']
-                if clf in data[dataset][group] else 0
-                for dataset in datasets
-            ]
+            mean = []
+            std = []
+            for dataset in datasets:
+                metric_mean, metric_std = self._get_metric_stats(data, dataset, group, clf, metric)
+                mean.append(metric_mean)
+                std.append(metric_std)
 
-            # Extract standard deviations
-            std = [
-                data[dataset][group][clf][metric]['std']
-                if clf in data[dataset][group] else 0
-                for dataset in datasets
-            ]
+            if not any(value != 0 for value in mean + std):
+                continue
 
             # Plot bars with optional error bars
             bars = ax.bar(
@@ -334,6 +400,26 @@ class PlotClassificationMetrics(Plot):
 
             if self.option in ['std', 'mean_std']:
                 self._draw_std(ax, bars, std)
+
+    @staticmethod
+    def _safe_numeric(value):
+        try:
+            numeric_value = float(value)
+            if numpy.isfinite(numeric_value):
+                return numeric_value
+        except (TypeError, ValueError):
+            pass
+        return 0.0
+
+    def _get_metric_stats(self, data, dataset, group, clf, metric):
+        metric_data = data.get(dataset, {}).get(group, {}).get(clf, {}).get(metric)
+        if not metric_data:
+            return 0.0, 0.0
+
+        return (
+            self._safe_numeric(metric_data.get('mean')),
+            self._safe_numeric(metric_data.get('std')),
+        )
 
     def _format_axes(self, ax: plt.Axes, clf: str, x: numpy.ndarray) -> None:
         """
@@ -357,8 +443,9 @@ class PlotClassificationMetrics(Plot):
         # Use empty labels (datasets typically identified by other means)
         ax.set_xticklabels([""] * len(x), fontsize=self.ticks_labels_font_size)
 
-        # Standardize y-axis for metric comparison
-        ax.set_ylim(0, 1.01)  # Slightly above 1 for annotation space
+        # Keep the old 0-1 scale for normalized metrics, but allow larger values when present.
+        _, current_top = ax.get_ylim()
+        ax.set_ylim(0, max(1.01, current_top))
 
         # Configure legend (placed outside plot area)
         ax.legend(
@@ -478,12 +565,12 @@ class PlotClassificationMetrics(Plot):
                         fold_metrics = data[group][clf].get('Summary', {})
 
                         if fold_metrics:
-                            # Extract each configured metric
-                            for metric in self.metrics:
-                                if metric in fold_metrics:
+                            # Extract all summary metrics. The effective metric list is resolved later.
+                            for metric, metric_values in fold_metrics.items():
+                                if isinstance(metric_values, dict):
                                     values[group][clf][metric] = {
-                                        'mean': fold_metrics[metric].get('mean'),
-                                        'std': fold_metrics[metric].get("std")
+                                        'mean': metric_values.get('mean'),
+                                        'std': metric_values.get("std")
                                     }
         return values
 

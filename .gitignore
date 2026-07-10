@@ -11,6 +11,12 @@ Datasets/converted/test_x.csv
 Datasets/converted/test_y.csv
 Datasets/converted/valid_x.csv
 Datasets/converted/valid_y.csv
+Datasets/converted/AppClassNet
+Datasets/converted/AppClassNet/top200
+Datasets/converted/AppClassNet/top200/train.csv
+Datasets/converted/AppClassNet/top200/train_balanced_max1000.csv
+Datasets/converted/AppClassNet/top200/train_balanced_max10000.csv
+
 local_documentation/*.md
 
 *.pyc
@@ -19,6 +25,8 @@ local_documentation/*.md
 *.lock
 *.ideia
 .idea
+*.pdf
+*.json
 
 
 ### JetBrains template
@@ -347,3 +355,4 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
+outputs/

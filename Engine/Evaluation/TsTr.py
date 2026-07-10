@@ -36,6 +36,8 @@ try:
     import numpy
     import logging
 
+    from Engine.DataIO.LabelUtils import labels_to_1d_integer
+
     from sklearn.utils import shuffle   
 except ImportError as error:
     print(error)
@@ -80,7 +82,7 @@ class TsTr:
             # Add generated samples to the data list
             data.extend(generated_samples)
 
-        if getattr(self, '_labels_are_discrete', True):
+        if getattr(self, '_labels_are_discrete', True) and data:
             shuffled_data, shuffled_labels = shuffle(data, numpy.array(labels), random_state=42)
             # Train classifiers using the generated synthetic data and corresponding labels
             classifiers = self.get_trained_classifiers(shuffled_data, shuffled_labels, numpy.float32, self.get_number_columns())
@@ -93,11 +95,18 @@ class TsTr:
                 logging.info("")
                 logging.info(f"\t\tTS-TR {classifier_name}")
                 # Calculate and log metrics selected by data_type.
-                self.get_task_metrics(numpy.squeeze(dictionary_data['y_evaluation_real'], axis=-1)[:total_samples],
+                self.get_task_metrics(labels_to_1d_integer(
+                                            dictionary_data['y_evaluation_real'],
+                                            context="TS-TR evaluation labels")[:total_samples],
                                         numpy.array(label_predicted)[:total_samples],
                                         "TS-TR", classifier_name, self.fold_number + 1)
         else:
-            logging.info("\t\tTS-TR predictive evaluation skipped because labels are continuous.")
+            if not getattr(self, '_labels_are_discrete', True):
+                reason = "TS-TR predictive evaluation skipped because labels are not discrete."
+            else:
+                reason = "TS-TR predictive evaluation skipped because no synthetic samples were generated."
+            logging.warning("\t\t%s", reason)
+            self.mark_evaluation_classifiers_not_applicable("TS-TR", self.fold_number + 1, reason)
             
         
         data_real = numpy.array(dictionary_data['x_training_real'])
@@ -105,6 +114,11 @@ class TsTr:
         logging.info(f"x_real_eva size:{data_real.size} shape: {n_real}, {m_real}")
 
         data_synthetic = numpy.array(data)
+        if data_synthetic.size == 0:
+            reason = "R-S distance evaluation skipped because no synthetic samples were generated."
+            logging.warning("\t\t%s", reason)
+            self.mark_distance_metrics_not_applicable("R-S", self.fold_number + 1, reason)
+            return
         n_synt, m_synt = data_synthetic.shape
         logging.info(f"x_synt size:{data_synthetic.size} shape: {n_synt}, {m_synt}")
 

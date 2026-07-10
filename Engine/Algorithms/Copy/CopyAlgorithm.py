@@ -43,7 +43,6 @@ try:
 
     from tensorflow.keras.models import Model
 
-    from tensorflow.keras.utils import to_categorical
     from tensorflow.keras.models import model_from_json
 
     from tensorflow.keras.losses import BinaryCrossentropy

@@ -41,7 +41,7 @@ try:
     import tensorflow
     from typing import Any
 
-    from tensorflow.keras.utils import to_categorical
+    from Engine.DataIO.LabelUtils import one_hot_encode_labels
 
 except ImportError as error:
     print(error)
@@ -426,8 +426,11 @@ class LatentDiffusionAlgorithm(tensorflow.keras.Model):
         # Iterate over each class and generate the specified number of samples
         for label_class, number_instances in number_samples_per_class["classes"].items():
             # Create one-hot encoded labels for the current class and number of instances
-            label_samples_generated = to_categorical([label_class] * number_instances,
-                                                     num_classes=number_samples_per_class["number_classes"])
+            label_samples_generated = one_hot_encode_labels(
+                [label_class] * number_instances,
+                num_classes=number_samples_per_class["number_classes"],
+                context="latent_diffusion generated labels",
+            )
 
             # Generate synthetic data using the diffusion model (or another generation method)
             generated_samples = self.generate_data(numpy.array(label_samples_generated, dtype=numpy.float32), batch_size=64)
@@ -720,6 +723,5 @@ class LatentDiffusionAlgorithm(tensorflow.keras.Model):
             value: The optimizer instance to set.
         """
         self._optimizer_autoencoder = value
-
 
 

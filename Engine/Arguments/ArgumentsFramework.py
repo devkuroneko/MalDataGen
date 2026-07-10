@@ -66,6 +66,7 @@ DEFAULT_OUTPUT_PATH_CONFUSION_MATRIX = "confusion_matrix"
 DEFAULT_OUTPUT_PATH_TRAINING_CURVE = "training_curve"
 DEFAULT_CLASSIFIER_LIST = ["RandomForest", "KNN", "DecisionTree"]
 DEFAULT_EVALUATION_METHOD = ["TrAs", "TsAr"]
+DEFAULT_SAMPLE_PLAN = "legacy"
 
 DEFAULT_VERBOSE_LIST = {logging.INFO: 2, logging.DEBUG: 1, logging.WARNING: 2,
                         logging.FATAL: 0, logging.ERROR: 0}
@@ -87,13 +88,35 @@ def parse_number_samples(samples_str):
     return {"classes": parsed_samples,
             "number_classes": len(parsed_samples)}
 
+
+class NumberSamplesPerClassAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, parse_number_samples(values))
+        setattr(namespace, "_legacy_number_samples_per_class_explicit", True)
+
 def add_argument_framework():
 
     parser = argparse.ArgumentParser(description='SynDataGen Data Generator')
 
     
-    parser.add_argument('--number_samples_per_class', type=parse_number_samples, default="1:256,2:256",
+    parser.set_defaults(_legacy_number_samples_per_class_explicit=False)
+
+    parser.add_argument('--number_samples_per_class', action=NumberSamplesPerClassAction,
+                        default="1:256,2:256",
                         help="Class and number of samples in the format class1:num1,class2:num2,...")
+
+    parser.add_argument('--sample_plan', type=str, default=DEFAULT_SAMPLE_PLAN,
+                        choices=['legacy', 'class_counts', 'total_rows', 'match_train_distribution',
+                                 'balanced_per_class'],
+                        help=("Synthetic sampling plan. Default 'legacy' preserves number_samples_per_class behavior. "
+                              "Use balanced_per_class with --samples_per_class or match_train_distribution/total_rows "
+                              "with --total_synthetic_rows for provided X/y datasets."))
+
+    parser.add_argument('--samples_per_class', type=int, default=None,
+                        help='Number of synthetic samples per class for --sample_plan balanced_per_class.')
+
+    parser.add_argument('--total_synthetic_rows', type=int, default=None,
+                        help='Total synthetic rows for --sample_plan total_rows or match_train_distribution.')
 
     parser.add_argument('-c', '--classifier', type=str, default=DEFAULT_CLASSIFIER_LIST, nargs="+",
                         choices=Classifiers.dictionary_classifiers_name,
@@ -104,8 +127,8 @@ def add_argument_framework():
                         help="List Evaluation Methods ['TrAs', 'TsAr'}")
 
     parser.add_argument('-o', '--output_dir', type=str,
-                        default=f'Results/out_{datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}',
-                        help='Directory for saving output files.')
+                        default=f'outputs/out_{datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}',
+                        help='Directory for saving output files. The final experiment directory is kept under outputs/.')
 
     parser.add_argument('--number_k_folds', type=int,
                         default=DEFAULT_NUMBER_STRATIFICATION_FOLD,

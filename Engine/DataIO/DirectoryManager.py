@@ -39,10 +39,15 @@ try:
     import logging
 
     from datetime import datetime
+    from pathlib import Path
+    import re
 
 except ImportError as error:
     print(error)
     sys.exit(-1)
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+OUTPUTS_ROOT = PROJECT_ROOT / "outputs"
 
 
 class DirectoryManager:
@@ -56,7 +61,7 @@ class DirectoryManager:
     - Compressing the current directory into a ZIP file and cleaning up the original directory.
 
     Attributes:
-        @base_directory (str): The base directory where all subdirectories will be stored (default is "Results").
+        @base_directory (str): The base directory where all subdirectories will be stored (default is "outputs").
         @current_subdir (str): The path to the current subdirectory, which is timestamped when created.
 
     Methods:
@@ -80,25 +85,26 @@ class DirectoryManager:
         """
         Initializes the DirectoryManager instance.
 
-        The constructor sets the base directory to "Results" and prepares for subdirectory creation.
+        The constructor sets the base directory to the project "outputs" folder and prepares for subdirectory creation.
         The current_subdir attribute is set to None initially, and will be assigned a timestamped value
         when directories are created.
 
         Attributes:
-            @base_directory (str): Default base directory "Results".
+            @base_directory (str): Default base directory "outputs".
             @current_subdir (str): Placeholder for the current subdirectory path.
         """
-        self.base_directory = "Results"
+        self.base_directory = str(OUTPUTS_ROOT)
         self.current_subdir = None
 
     def _create_directories(self, base_directory=None):
         """
         Creates the main and subdirectories under the specified base directory.
 
-        If no base directory is provided, a timestamped subdirectory will be created inside the "Results" directory.
+        If no base directory is provided, a timestamped subdirectory will be created inside the project "outputs" directory.
 
         Args:
-            base_directory (str, optional): The base directory to use. If None, it defaults to "Results".
+            base_directory (str, optional): Requested output directory. The final experiment directory is always
+                                           normalized under the project "outputs" directory.
 
         This method ensures the creation of the following subdirectories:
             - ModelsSaved
@@ -112,34 +118,67 @@ class DirectoryManager:
         Raises:
             OSError: If there is an error during directory creation.
         """
-        if base_directory is None:
-            current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            self.current_subdir = os.path.join(self.base_directory, current_time)
-        else:
-            self.base_directory = base_directory
-            self.current_subdir = self.base_directory
+        experiment_directory = self._resolve_experiment_directory(base_directory)
+        self.base_directory = str(OUTPUTS_ROOT)
+        self.current_subdir = str(experiment_directory)
 
         try:
             # Ensure the base directory exists
-            if not os.path.exists(self.base_directory):
-                os.makedirs(self.base_directory)
-                logging.info(f"Created base directory: {self.base_directory}")
-            else:
-                logging.info(f"Base directory already exists: {self.base_directory}")
+            os.makedirs(self.base_directory, exist_ok=True)
+            logging.info(f"Ensured base output directory exists: {self.base_directory}")
 
             # Create the timestamped subdirectory
-            if not os.path.exists(self.current_subdir):
-                os.makedirs(self.current_subdir)
+            os.makedirs(self.current_subdir, exist_ok=True)
+            logging.info(f"Ensured experiment directory exists: {self.current_subdir}")
 
             # Define and create necessary subdirectories
             sub_directories = ['ModelsSaved', 'Logs', 'DataGenerated', 'EvaluationResults', 'Monitor']
             for subdir in sub_directories:
-                os.makedirs(os.path.join(self.current_subdir, subdir))
-                logging.info(f"Created subdirectory: {os.path.join(self.current_subdir, subdir)}")
+                subdir_path = os.path.join(self.current_subdir, subdir)
+                os.makedirs(subdir_path, exist_ok=True)
+                logging.info(f"Ensured subdirectory exists: {subdir_path}")
 
         except OSError as e:
             logging.error(f"Failed to create directories: {e}")
             print(f"An error occurred while creating directories: {e}")
+
+    def _resolve_experiment_directory(self, requested_directory=None):
+        current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+        if requested_directory is None:
+            return OUTPUTS_ROOT / f"out_{current_time}"
+
+        requested_path = Path(str(requested_directory)).expanduser()
+        if not requested_path.is_absolute():
+            requested_path = PROJECT_ROOT / requested_path
+        requested_path = requested_path.resolve(strict=False)
+
+        try:
+            requested_path.relative_to(OUTPUTS_ROOT)
+            experiment_path = requested_path
+        except ValueError:
+            safe_name = requested_path.name or "experiment"
+            logging.warning(
+                "Output directory %s is outside the project outputs folder. "
+                "Using outputs/%s_%s instead.",
+                requested_path,
+                safe_name,
+                current_time,
+            )
+            experiment_path = OUTPUTS_ROOT / f"{safe_name}_{current_time}"
+
+        if experiment_path == OUTPUTS_ROOT:
+            return OUTPUTS_ROOT / f"out_{current_time}"
+
+        if not self._path_contains_execution_date(experiment_path):
+            experiment_path = experiment_path.parent / f"{experiment_path.name}_{current_time}"
+
+        return experiment_path
+
+    @staticmethod
+    def _path_contains_execution_date(path):
+        date_pattern = re.compile(r"\d{4}-\d{2}-\d{2}")
+        return any(date_pattern.search(part) for part in Path(path).parts)
 
     def get_logs_path(self):
         """
@@ -281,4 +320,3 @@ class DirectoryManager:
 
         except Exception as e:
             logging.error(f"Unexpected error: {e}")
-

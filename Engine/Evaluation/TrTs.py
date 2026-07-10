@@ -36,6 +36,8 @@ try:
     import numpy
     import logging
 
+    from Engine.DataIO.LabelUtils import labels_to_1d_integer
+
     from sklearn.metrics.pairwise import euclidean_distances
 
 except ImportError as error:
@@ -81,12 +83,22 @@ class TrTs:
             data.extend(generated_samples)
 
         if not getattr(self, '_labels_are_discrete', True):
-            logging.info("\t\tTR-TS predictive evaluation skipped because labels are continuous.")
+            reason = "TR-TS predictive evaluation skipped because labels are not discrete."
+            logging.warning("\t\t%s", reason)
+            self.mark_evaluation_classifiers_not_applicable("TR-TS", self.fold_number + 1, reason)
+            return
+
+        if not data:
+            reason = "TR-TS predictive evaluation skipped because no synthetic samples were generated."
+            logging.warning("\t\t%s", reason)
+            self.mark_evaluation_classifiers_not_applicable("TR-TS", self.fold_number + 1, reason)
             return
 
         # Train classifiers using the real training data and corresponding labels
         classifiers = self.get_trained_classifiers(dictionary_data['x_evaluation_real'],
-                                                    numpy.squeeze(dictionary_data['y_evaluation_real'], axis=-1),
+                                                    labels_to_1d_integer(
+                                                        dictionary_data['y_evaluation_real'],
+                                                        context="TR-TS evaluation labels"),
                                                     numpy.float32, self.get_number_columns())
 
         # Evaluate the classifiers on synthetic data for each classifier instance

@@ -48,7 +48,7 @@ try:
 
     from tensorflow.keras import Model
 
-    from tensorflow.keras.utils import to_categorical
+    from Engine.DataIO.LabelUtils import one_hot_encode_labels
     from tensorflow.keras.losses import BinaryCrossentropy
 
 except ImportError as error:
@@ -204,8 +204,11 @@ class WassersteinAlgorithm(Model):
         # Loop through each class and the desired number of samples for that class.
         for label_class, number_instances in number_samples_per_class["classes"].items():
             # Create one-hot encoded labels for all samples of the current class.
-            label_samples_generated = to_categorical([label_class] * number_instances,
-                                                     num_classes=number_samples_per_class["number_classes"])
+            label_samples_generated = one_hot_encode_labels(
+                [label_class] * number_instances,
+                num_classes=number_samples_per_class["number_classes"],
+                context="wasserstein generated labels",
+            )
 
             # Sample random noise vectors from a normal distribution.
             latent_noise = numpy.random.normal(loc=self._latent_mean_distribution,
