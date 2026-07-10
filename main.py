@@ -33,11 +33,13 @@ __credits__ = ['Kayuã Oleques']
 
 
 try:
+    import gc
     import sys
     import time
     import numpy
     import pandas
     import logging
+    import tensorflow
 
     from sklearn.utils import shuffle
 
@@ -57,6 +59,11 @@ try:
     from sklearn.model_selection import StratifiedKFold
 
     from Engine.DataIO.CSVLoader import CSVDataProcessor
+    from Engine.DataIO.SyntheticBatchIO import SyntheticBatchWriter
+    from Engine.DataIO.SyntheticLabelAudit import SyntheticLabelGenerationAudit
+    from Engine.DataIO.SyntheticLabelAudit import audit_synthetic_label_generation
+    from Engine.DataIO.SyntheticSanityChecks import run_synthetic_sanity_checks
+    from Engine.Utils.ResourceMonitor import get_current_memory_mb
 
     from Engine.Classifiers.Classifiers import Classifiers
 
@@ -86,6 +93,15 @@ except ImportError as error:
 DEFAULT_VERBOSITY = logging.INFO
 TIME_FORMAT = '%Y-%m-%d,%H:%M:%S'
 DEFAULT_DATA_TYPE = "float32"
+PARTITIONED_GENERATION_SUPPORTED_MODELS = {
+    "adversarial",
+    "autoencoder",
+    "variational",
+    "wasserstein",
+    "wasserstein_gp",
+    "quantized",
+    "denoising_diffusion",
+}
 
 
 
@@ -385,17 +401,37 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                 # print("number_samples_per_class", number_samples_per_class)
                 
             
-                # Create the model and make predictions using the training data
-                self.train_model(dictionary_data['x_training_real'], 
-                                 dictionary_data['y_training_real'],
-                                 monitor_path, fold)
+                if self._uses_partitioned_generation():
+                    logging.info(
+                        "Skipping global generator training because generation_strategy=%s trains sub-generators.",
+                        self.arguments.generation_strategy,
+                    )
+                    self._record_generation_strategy_metadata(
+                        fold + 1,
+                        {
+                            "generation_strategy": self.arguments.generation_strategy,
+                            "classes_per_group": int(getattr(self.arguments, "classes_per_group", 10)),
+                            "status": "pending_partitioned_generation",
+                        },
+                    )
+                else:
+                    # Create the model and make predictions using the training data
+                    with self.resource_timer("training"):
+                        self.train_model(dictionary_data['x_training_real'],
+                                         dictionary_data['y_training_real'],
+                                         monitor_path, fold)
                 
                 self.monitoring_start_generating()
 
-                evaluation_synthetic = self.synthesize_data(
-                                              dictionary_data['x_evaluation_real'], 
-                                              dictionary_data['y_evaluation_real'],
-                                              )
+                with self.resource_timer("generation"):
+                    evaluation_synthetic = self.synthesize_data(
+                                                  dictionary_data['x_evaluation_real'],
+                                                  dictionary_data['y_evaluation_real'],
+                                                  dictionary_data['x_training_real'],
+                                                  dictionary_data['y_training_real'],
+                                                  monitor_path,
+                                                  fold,
+                                                  )
                 
                 self.monitoring_stop_generating(fold)
                 logging.info("\t\tModel creation and prediction completed for fold %d.", fold + 1)
@@ -406,16 +442,17 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                 logging.info(" starting evaluation for fold %d.", fold + 1)
 
                 # Perform the evaluations using synthetic and real data
-                if dictionary_data.get('evaluation_not_applicable'):
-                    reason = (
-                        "split_mode=provided has no valid/test evaluation split; "
-                        "TR-TS, TS-TR and distance evaluations are not_applicable."
-                    )
-                    logging.warning(reason)
-                    self.mark_fold_not_applicable(self.fold_number + 1, reason)
-                else:
-                    self.evaluation_TR_TS(dictionary_data, evaluation_synthetic)  
-                    self.evaluation_TS_TR(dictionary_data, evaluation_synthetic)  
+                with self.resource_timer("evaluation"):
+                    if dictionary_data.get('evaluation_not_applicable'):
+                        reason = (
+                            "split_mode=provided has no valid/test evaluation split; "
+                            "TR-TS, TS-TR and distance evaluations are not_applicable."
+                        )
+                        logging.warning(reason)
+                        self.mark_fold_not_applicable(self.fold_number + 1, reason)
+                    else:
+                        self.evaluation_TR_TS(dictionary_data, evaluation_synthetic)
+                        self.evaluation_TS_TR(dictionary_data, evaluation_synthetic)
                 
                 #self.evaluation_TR_TR(dictionary_data)
                 # self.calculate_sdv_metrics(dictionary_data, fold)
@@ -489,6 +526,7 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
             sample_plan,
             data_type=getattr(self, '_data_type', getattr(self.arguments, 'data_type', 'binary')),
         )
+        generation_metadata["generation_batch_size"] = int(getattr(self.arguments, "generation_batch_size", 8192))
 
         if len(generation_metadata["classes"]) != number_classes:
             logging.info(
@@ -496,6 +534,96 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                 len(generation_metadata["classes"]), number_classes)
 
         return generation_metadata
+
+    def _get_label_mapping_for_audit(self):
+        label_mapping = getattr(self, '_label_mapping', None)
+        if label_mapping:
+            return label_mapping
+
+        dataset_bundle = getattr(self, '_dataset_bundle', None)
+        metadata = getattr(dataset_bundle, 'metadata', None)
+        if isinstance(metadata, dict):
+            return metadata.get("label_mapping_original_to_zero_based")
+
+        return None
+
+    def _uses_partitioned_generation(self):
+        return (
+            getattr(self.arguments, "execution_mode", "normal") == "batches"
+            and getattr(self.arguments, "generation_strategy", "single_conditional")
+            in {"per_class", "grouped_classes"}
+        )
+
+    def _record_generation_strategy_metadata(self, fold, metadata):
+        fold_key = f"{fold}-Fold"
+        block = self._dictionary_metrics.setdefault("GenerationStrategy", {})
+        block[fold_key] = {
+            "generation_strategy": getattr(self.arguments, "generation_strategy", "single_conditional"),
+            "classes_per_group": int(getattr(self.arguments, "classes_per_group", 10)),
+            **metadata,
+        }
+
+    def _raise_generation_strategy_not_supported(self, fold, reason):
+        self._record_generation_strategy_metadata(
+            fold + 1,
+            {
+                "status": "not_supported",
+                "model_type": self.arguments.model_type,
+                "reason": reason,
+            },
+        )
+        try:
+            self.save_dictionary_to_json(self.get_evaluation_results_path() + "/Results.json")
+        except Exception as error:
+            logging.warning("Could not save not_supported generation metadata before raising: %s", error)
+        raise NotImplementedError(reason)
+
+    def _partition_generation_units(self, class_counts):
+        classes = sorted(int(class_id) for class_id, count in class_counts.items() if int(count) > 0)
+        strategy = getattr(self.arguments, "generation_strategy", "single_conditional")
+        if strategy == "per_class":
+            return [{"unit_type": "class", "classes": [class_id]} for class_id in classes]
+
+        classes_per_group = int(getattr(self.arguments, "classes_per_group", 10))
+        if classes_per_group <= 0:
+            raise ValueError("--classes_per_group must be a positive integer.")
+        return [
+            {"unit_type": "group", "classes": classes[start:start + classes_per_group]}
+            for start in range(0, len(classes), classes_per_group)
+        ]
+
+    @staticmethod
+    def _subset_by_classes(x_values, y_values, classes):
+        labels = numpy.ravel(numpy.asarray(y_values)).astype(int)
+        mask = numpy.isin(labels, numpy.asarray(classes, dtype=int))
+        return numpy.asarray(x_values[mask], dtype=numpy.float32), labels[mask]
+
+    def _release_current_generator(self):
+        model_type = self.arguments.model_type
+        if model_type == "adversarial":
+            self._adversarial_algorithm = None
+            self._adversarial_model = None
+        elif model_type == "autoencoder":
+            self._autoencoder_algorithm = None
+            self._autoencoder_model = None
+        elif model_type == "variational":
+            self._variational_algorithm = None
+            self._variational_model = None
+        elif model_type == "wasserstein":
+            self._wasserstein_algorithm = None
+            self._wasserstein_model = None
+        elif model_type == "wasserstein_gp":
+            self._wasserstein_gp_algorithm = None
+            self._wasserstein_gp_model = None
+        elif model_type == "denoising_diffusion":
+            self._denoising_diffusion_algorithm = None
+            self._denoising_diffusion_model = None
+        elif model_type == "quantized":
+            self._quantized_vae_algorithm = None
+            self._quantized_vae_model = None
+
+        tensorflow.keras.backend.clear_session()
+        gc.collect()
 
     @import_models
     def train_model(self, x_real_samples, y_real_samples, monitor_path, k_fold):
@@ -592,7 +720,14 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
             raise  # Reraise the exception for further handling or termination
             
 
-    def synthesize_data(self, x_real_samples, y_real_samples):
+    def synthesize_data(
+            self,
+            x_real_samples,
+            y_real_samples,
+            x_training_real=None,
+            y_training_real=None,
+            monitor_path=None,
+            fold=None):
 
             # Generate synthetic data based on the specified model type
             # Depending on the selected model, we use the corresponding algorithm for data generation
@@ -601,6 +736,37 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
             #labels = dictionary_data['y_evaluation_real']
             number_samples_per_class = self._build_generation_metadata(y_real_samples)
             logging.info("\t\tnumber_samples_per_class: %s", number_samples_per_class)
+
+            if self._uses_partitioned_generation():
+                if x_training_real is None or y_training_real is None:
+                    raise ValueError("Partitioned generation requires real training X/y.")
+                self.data_generated = self._synthesize_data_partitioned(
+                    number_samples_per_class,
+                    x_training_real,
+                    y_training_real,
+                    x_real_samples,
+                    y_real_samples,
+                    monitor_path,
+                    self.fold_number if fold is None else fold,
+                )
+                return self.data_generated
+
+            if (
+                getattr(self.arguments, "execution_mode", "normal") == "batches"
+                and not getattr(self.arguments, "materialize_synthetic", False)
+            ):
+                self.data_generated = self._synthesize_data_incremental(
+                    number_samples_per_class,
+                    x_real_samples,
+                    y_real_samples,
+                )
+                return self.data_generated
+
+            if (
+                getattr(self.arguments, "execution_mode", "normal") == "batches"
+                and getattr(self.arguments, "materialize_synthetic", False)
+            ):
+                logging.warning("materialize_synthetic=True in batches mode can use high memory.")
 
             if self.arguments.model_type == 'adversarial':
 
@@ -698,11 +864,315 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
             # Completion log for data generation process
             logging.info("Data generation completed successfully for model type: %s", self.arguments.model_type)
 
+            audit_path, _ = audit_synthetic_label_generation(
+                self.data_generated,
+                number_samples_per_class,
+                execution_mode=getattr(self.arguments, "execution_mode", "normal"),
+                label_mapping=self._get_label_mapping_for_audit(),
+                fold_number=self.fold_number + 1,
+                model_type=self.arguments.model_type,
+                experiment_directory=self.current_subdir,
+            )
+            logging.info("Synthetic label generation audit passed: %s", audit_path)
+
+            sanity_path, _ = run_synthetic_sanity_checks(
+                x_real_samples,
+                y_real_samples,
+                self.data_generated,
+                number_classes=number_samples_per_class["number_classes"],
+                execution_mode=getattr(self.arguments, "execution_mode", "normal"),
+                arguments=self.arguments,
+                fold_number=self.fold_number + 1,
+                model_type=self.arguments.model_type,
+                experiment_directory=self.current_subdir,
+            )
+            logging.info("Synthetic sanity checks completed: %s", sanity_path)
+            self._record_generation_strategy_metadata(
+                self.fold_number + 1,
+                {
+                    "status": "completed",
+                    "model_type": self.arguments.model_type,
+                    "total_generated_rows": int(sum(len(samples) for samples in self.data_generated.values())),
+                    "units": [],
+                },
+            )
+
             # If specified, save the generated synthetic data
             if self.arguments.save_data:
                 self.save_data_generated()
             
             return self.data_generated
+
+    def _synthesize_data_partitioned(
+            self,
+            number_samples_per_class,
+            x_training_real,
+            y_training_real,
+            x_evaluation_real,
+            y_evaluation_real,
+            monitor_path,
+            fold):
+            strategy = getattr(self.arguments, "generation_strategy", "single_conditional")
+            if self.arguments.model_type not in PARTITIONED_GENERATION_SUPPORTED_MODELS:
+                reason = (
+                    f"generation_strategy={strategy} is not supported for "
+                    f"model_type={self.arguments.model_type}. No synthetic data was generated."
+                )
+                logging.error(reason)
+                self._raise_generation_strategy_not_supported(fold, reason)
+
+            output_format = getattr(self.arguments, "save_synthetic_format", "npy_batches")
+            if output_format == "legacy":
+                output_format = "npy_batches"
+
+            writer = SyntheticBatchWriter(
+                root_dir=self.directory_output_data,
+                num_classes=number_samples_per_class["number_classes"],
+                num_features=self.get_number_columns(),
+                seed=42,
+                model_name=self.arguments.model_type,
+                execution_mode=getattr(self.arguments, "execution_mode", "normal"),
+                output_format=output_format,
+            )
+            if output_format == "single_npy":
+                writer.initialize_single_npy(sum(number_samples_per_class["classes"].values()))
+
+            audit = SyntheticLabelGenerationAudit(
+                execution_mode=getattr(self.arguments, "execution_mode", "normal"),
+                number_classes=number_samples_per_class["number_classes"],
+                label_mapping=self._get_label_mapping_for_audit(),
+                fold_number=self.fold_number + 1,
+                model_type=self.arguments.model_type,
+                experiment_directory=self.current_subdir,
+            )
+
+            original_number_samples_per_class = getattr(self, "_number_samples_per_class", None)
+            original_arguments_number_samples_per_class = getattr(self.arguments, "number_samples_per_class", None)
+            generation_batch_size = int(getattr(self.arguments, "generation_batch_size", 8192))
+            unit_records = []
+            total_rows = 0
+
+            try:
+                for unit_index, unit in enumerate(self._partition_generation_units(number_samples_per_class["classes"])):
+                    unit_start_time = time.perf_counter()
+                    memory_before = get_current_memory_mb()
+                    unit_classes = [int(class_id) for class_id in unit["classes"]]
+                    unit_x, unit_y = self._subset_by_classes(x_training_real, y_training_real, unit_classes)
+                    observed_unit_classes = set(numpy.unique(unit_y).astype(int).tolist()) if unit_y.size else set()
+                    missing_training_classes = sorted(set(unit_classes) - observed_unit_classes)
+                    if missing_training_classes:
+                        raise ValueError(
+                            f"Cannot train {strategy} generator for classes {unit_classes}; "
+                            f"missing real training classes: {missing_training_classes}."
+                        )
+
+                    sub_plan = {
+                        **number_samples_per_class,
+                        "classes": {
+                            int(class_id): int(number_samples_per_class["classes"][int(class_id)])
+                            for class_id in unit_classes
+                        },
+                        "generation_strategy": strategy,
+                    }
+                    self._number_samples_per_class = sub_plan
+                    self.arguments.number_samples_per_class = sub_plan
+
+                    logging.info(
+                        "Training partitioned generator: strategy=%s unit=%d classes=%s train_rows=%d",
+                        strategy,
+                        unit_index,
+                        unit_classes,
+                        int(unit_x.shape[0]),
+                    )
+                    self.training_model(
+                        self.arguments,
+                        self.get_number_columns(),
+                        unit_x,
+                        unit_y,
+                        monitor_path,
+                        fold,
+                    )
+                    generator = self._get_active_generator()
+
+                    unit_generated_rows = 0
+                    for label_class in unit_classes:
+                        number_instances = int(number_samples_per_class["classes"][int(label_class)])
+                        batch_index = 0
+                        for start in range(0, number_instances, generation_batch_size):
+                            batch_count = min(generation_batch_size, number_instances - start)
+                            batch_plan = {
+                                **sub_plan,
+                                "classes": {int(label_class): int(batch_count)},
+                                "generation_batch_size": int(generation_batch_size),
+                            }
+                            generated_batch = generator.get_samples(batch_plan)[int(label_class)]
+                            writer.write_batch(int(label_class), batch_index, generated_batch)
+                            audit.record(
+                                requested_class=int(label_class),
+                                saved_label=int(label_class),
+                                generated_features=generated_batch,
+                                batch_index=batch_index,
+                            )
+                            self.record_batch_processed(generated_batch.shape[0])
+                            unit_generated_rows += int(generated_batch.shape[0])
+                            total_rows += int(generated_batch.shape[0])
+                            batch_index += 1
+
+                    elapsed_seconds = time.perf_counter() - unit_start_time
+                    unit_record = {
+                        "unit_index": int(unit_index),
+                        "unit_type": unit["unit_type"],
+                        "classes": unit_classes,
+                        "training_rows": int(unit_x.shape[0]),
+                        "generated_rows": int(unit_generated_rows),
+                        "elapsed_seconds": float(elapsed_seconds),
+                        "memory_mb_before": memory_before,
+                        "memory_mb_after": get_current_memory_mb(),
+                    }
+                    unit_records.append(unit_record)
+                    logging.info("Partitioned generation unit completed: %s", unit_record)
+                    self._release_current_generator()
+            finally:
+                self._number_samples_per_class = original_number_samples_per_class
+                self.arguments.number_samples_per_class = original_arguments_number_samples_per_class
+
+            reader = writer.close()
+            audit_path, _ = audit.finalize()
+            logging.info("Synthetic label generation audit passed: %s", audit_path)
+            sanity_path, _ = run_synthetic_sanity_checks(
+                x_evaluation_real,
+                y_evaluation_real,
+                reader,
+                number_classes=number_samples_per_class["number_classes"],
+                execution_mode=getattr(self.arguments, "execution_mode", "normal"),
+                arguments=self.arguments,
+                fold_number=self.fold_number + 1,
+                model_type=self.arguments.model_type,
+                experiment_directory=self.current_subdir,
+            )
+            logging.info("Synthetic sanity checks completed: %s", sanity_path)
+            self._record_generation_strategy_metadata(
+                self.fold_number + 1,
+                {
+                    "status": "completed",
+                    "model_type": self.arguments.model_type,
+                    "total_generated_rows": int(total_rows),
+                    "units": unit_records,
+                },
+            )
+            return reader
+
+    def _get_active_generator(self):
+            if self.arguments.model_type == 'adversarial':
+                self.generator_name = 'adversarial'
+                return self._adversarial_algorithm
+            if self.arguments.model_type == 'autoencoder':
+                self.generator_name = 'autoencoder'
+                return self._autoencoder_algorithm
+            if self.arguments.model_type == "variational":
+                self.generator_name = 'variational'
+                return self._variational_algorithm
+            if self.arguments.model_type == "wasserstein":
+                self.generator_name = 'wasserstein'
+                return self._wasserstein_algorithm
+            if self.arguments.model_type == "wasserstein_gp":
+                self.generator_name = 'wasserstein_gp'
+                return self._wasserstein_gp_algorithm
+            if self.arguments.model_type == "latent_diffusion":
+                self.generator_name = 'latent_diffusion'
+                return self._latent_diffusion_algorithm
+            if self.arguments.model_type == "denoising_diffusion":
+                self.generator_name = 'denoising_diffusion'
+                return self._denoising_diffusion_algorithm
+            if self.arguments.model_type == "quantized":
+                self.generator_name = 'quantized'
+                return self._quantized_vae_algorithm
+            raise NotImplementedError(
+                f"Incremental synthetic generation is not implemented for model_type={self.arguments.model_type!r}."
+            )
+
+    def _synthesize_data_incremental(self, number_samples_per_class, x_real_samples, y_real_samples):
+            generator = self._get_active_generator()
+            output_format = getattr(self.arguments, "save_synthetic_format", "npy_batches")
+            if output_format == "legacy":
+                output_format = "npy_batches"
+            if output_format == "single_npy":
+                logging.warning("save_synthetic_format=single_npy writes one large on-disk array; avoid on low disk/RAM systems.")
+
+            writer = SyntheticBatchWriter(
+                root_dir=self.directory_output_data,
+                num_classes=number_samples_per_class["number_classes"],
+                num_features=self.get_number_columns(),
+                seed=42,
+                model_name=self.arguments.model_type,
+                execution_mode=getattr(self.arguments, "execution_mode", "normal"),
+                output_format=output_format,
+            )
+            if output_format == "single_npy":
+                writer.initialize_single_npy(sum(number_samples_per_class["classes"].values()))
+
+            audit = SyntheticLabelGenerationAudit(
+                execution_mode=getattr(self.arguments, "execution_mode", "normal"),
+                number_classes=number_samples_per_class["number_classes"],
+                label_mapping=self._get_label_mapping_for_audit(),
+                fold_number=self.fold_number + 1,
+                model_type=self.arguments.model_type,
+                experiment_directory=self.current_subdir,
+            )
+            generation_batch_size = int(getattr(self.arguments, "generation_batch_size", 8192))
+            total_rows = 0
+            for label_class, number_instances in number_samples_per_class["classes"].items():
+                batch_index = 0
+                for start in range(0, int(number_instances), generation_batch_size):
+                    batch_count = min(generation_batch_size, int(number_instances) - start)
+                    batch_plan = dict(number_samples_per_class)
+                    batch_plan["classes"] = {int(label_class): int(batch_count)}
+                    batch_plan["generation_batch_size"] = int(generation_batch_size)
+                    generated_batch = generator.get_samples(batch_plan)[int(label_class)]
+                    writer.write_batch(int(label_class), batch_index, generated_batch)
+                    audit.record(
+                        requested_class=int(label_class),
+                        saved_label=int(label_class),
+                        generated_features=generated_batch,
+                        batch_index=batch_index,
+                    )
+                    self.record_batch_processed(generated_batch.shape[0])
+                    total_rows += int(generated_batch.shape[0])
+                    logging.info(
+                        "Saved synthetic batch: class=%s batch=%d shape=%s total_rows=%d",
+                        label_class,
+                        batch_index,
+                        generated_batch.shape,
+                        total_rows,
+                    )
+                    batch_index += 1
+
+            reader = writer.close()
+            audit_path, _ = audit.finalize()
+            logging.info("Synthetic label generation audit passed: %s", audit_path)
+            sanity_path, _ = run_synthetic_sanity_checks(
+                x_real_samples,
+                y_real_samples,
+                reader,
+                number_classes=number_samples_per_class["number_classes"],
+                execution_mode=getattr(self.arguments, "execution_mode", "normal"),
+                arguments=self.arguments,
+                fold_number=self.fold_number + 1,
+                model_type=self.arguments.model_type,
+                experiment_directory=self.current_subdir,
+            )
+            logging.info("Synthetic sanity checks completed: %s", sanity_path)
+            self._record_generation_strategy_metadata(
+                self.fold_number + 1,
+                {
+                    "status": "completed",
+                    "model_type": self.arguments.model_type,
+                    "total_generated_rows": int(reader.total_rows),
+                    "units": [],
+                },
+            )
+            logging.info("Incremental synthetic generation completed: manifest=%s", reader.manifest_path)
+            return reader
 
 
     @autosave

@@ -44,6 +44,13 @@ DEFAULT_SPLIT_MODE = 'cross_validation'
 DEFAULT_TARGET_TYPE = 'auto'
 DEFAULT_FEATURE_TYPE = 'auto'
 DEFAULT_NUM_CLASSES = None
+DEFAULT_EXECUTION_MODE = 'normal'
+DEFAULT_BATCH_SIZE = 8192
+DEFAULT_EVAL_BATCH_SIZE = 16384
+DEFAULT_GENERATION_BATCH_SIZE = 8192
+DEFAULT_SAVE_SYNTHETIC_FORMAT = 'legacy'
+DEFAULT_SCALER = 'none'
+DEFAULT_MIN_SAMPLES_PER_CLASS_REQUIRED = 1
 DEFAULT_LEGACY_NUMBER_SAMPLES_PER_CLASS = "1:256,2:256"
 MODEL_CLASS_COUNT_ARGUMENTS = (
     'autoencoder_number_classes',
@@ -58,6 +65,8 @@ def validate_data_load_arguments(arguments):
     arguments._legacy_number_samples_per_class_explicit = bool(
         getattr(arguments, '_legacy_number_samples_per_class_explicit', False)
     )
+    if getattr(arguments, 'min_samples_per_class_required', 1) < 0:
+        raise ValueError("--min_samples_per_class_required must be non-negative.")
 
     if arguments.data_format == 'csv':
         return arguments
@@ -201,6 +210,11 @@ def add_argument_data_load(parser):
                         help=("Feature semantics for new loaders. Default 'auto' preserves existing behavior. "
                               "Example for AppClassNet: --feature_type continuous."))
 
+    parser.add_argument('--scaler', type=str, default=DEFAULT_SCALER,
+                        choices=['none', 'minmax', 'standard'],
+                        help=("Feature scaler. Default 'none' preserves the legacy CSV behavior; AppClassNet "
+                              "runner defaults to minmax and passes preprocessed arrays to the pipeline."))
+
     parser.add_argument('--num_classes', type=int, default=DEFAULT_NUM_CLASSES,
                         help='Optional class-domain size for new loaders, for example --num_classes 200.')
 
@@ -211,5 +225,44 @@ def add_argument_data_load(parser):
     parser.add_argument('--mmap_npy', action='store_true', default=False,
                         help=("Use numpy memory mapping for npy_xy files. Default is False at CLI level to keep "
                               "new behavior opt-in; CSV mode ignores this flag."))
+
+    parser.add_argument('--execution_mode', type=str, default=DEFAULT_EXECUTION_MODE,
+                        choices=['normal', 'batches'],
+                        help=("Execution mode. Default 'normal' preserves the current full-matrix flow. "
+                              "'batches' enables the lower-memory npy_xy path used by AppClassNet."))
+
+    parser.add_argument('--batch_size', type=int, default=DEFAULT_BATCH_SIZE,
+                        help='Generic training batch size used by batches mode.')
+
+    parser.add_argument('--eval_batch_size', type=int, default=DEFAULT_EVAL_BATCH_SIZE,
+                        help='Generic evaluation batch size used by batches mode.')
+
+    parser.add_argument('--generation_batch_size', type=int, default=DEFAULT_GENERATION_BATCH_SIZE,
+                        help='Generic generation batch size used by batches mode.')
+
+    parser.add_argument('--max_train_samples', type=int, default=None,
+                        help='Optional maximum number of training rows used by batches mode.')
+
+    parser.add_argument('--max_samples_per_class', type=int, default=None,
+                        help='Optional maximum number of training rows per class used by batches mode.')
+
+    parser.add_argument('--min_samples_per_class_required', type=int,
+                        default=DEFAULT_MIN_SAMPLES_PER_CLASS_REQUIRED,
+                        help=('Minimum rows required per class after batches stratified selection. '
+                              'Default 1 is intended for debug; use 500 or 1000 for AppClassNet experiments.'))
+
+    parser.add_argument('--strict_min_samples_per_class', action='store_true', default=False,
+                        help='Raise an error instead of warning when batches stratified selection is below the minimum.')
+
+    parser.add_argument('--dry_run_memory', action='store_true', default=False,
+                        help='Load metadata, log shapes/memory estimates, and skip experiment execution.')
+
+    parser.add_argument('--save_synthetic_format', type=str, default=DEFAULT_SAVE_SYNTHETIC_FORMAT,
+                        choices=['legacy', 'npy_batches', 'csv_batches', 'single_npy'],
+                        help=("Synthetic persistence format. Default 'legacy' preserves existing behavior. "
+                              "Batches mode should use npy_batches unless explicit materialization is required."))
+
+    parser.add_argument('--materialize_synthetic', action='store_true', default=False,
+                        help='Materialize synthetic data in memory in batches mode. This can use substantial RAM.')
 
     return parser

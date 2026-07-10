@@ -48,6 +48,7 @@ try:
 
     from tensorflow.python.keras.losses import BinaryCrossentropy
     from Engine.DataIO.LabelUtils import one_hot_encode_labels
+    from Engine.DataIO.LabelUtils import to_one_hot_batch
 
     from Engine.Algorithms.Copy.CopyAlgorithm import CopyAlgorithm
 
@@ -98,6 +99,99 @@ def _labels_to_one_hot(labels, number_samples_per_class, context="labels"):
         labels,
         num_classes=int(number_samples_per_class["number_classes"]),
         context=context,
+    )
+
+
+def _is_batch_execution(arguments):
+    return getattr(arguments, "execution_mode", "normal") == "batches"
+
+
+def _one_hot_batch_generator(x_real_samples, y_real_samples, num_classes, batch_size, target_mode="features"):
+    x_values = numpy.asarray(x_real_samples, dtype=numpy.float32)
+    y_values = numpy.ravel(numpy.asarray(y_real_samples))
+
+    for start in range(0, y_values.shape[0], batch_size):
+        end = min(start + batch_size, y_values.shape[0])
+        x_batch = x_values[start:end]
+        y_one_hot = to_one_hot_batch(y_values[start:end], num_classes, dtype=numpy.float32)
+        if target_mode == "autoencode":
+            yield (x_batch, y_one_hot), x_batch
+        else:
+            yield x_batch, y_one_hot
+
+
+def _batch_one_hot_dataset(x_real_samples, y_real_samples, number_samples_per_class, batch_size, target_mode="features"):
+    num_classes = int(number_samples_per_class["number_classes"])
+    x_shape = tuple(numpy.asarray(x_real_samples).shape[1:])
+    output_signature = (
+        (
+            tensorflow.TensorSpec(shape=(None, *x_shape), dtype=tensorflow.float32),
+            tensorflow.TensorSpec(shape=(None, num_classes), dtype=tensorflow.float32),
+        ),
+        tensorflow.TensorSpec(shape=(None, *x_shape), dtype=tensorflow.float32),
+    ) if target_mode == "autoencode" else (
+        tensorflow.TensorSpec(shape=(None, *x_shape), dtype=tensorflow.float32),
+        tensorflow.TensorSpec(shape=(None, num_classes), dtype=tensorflow.float32),
+    )
+
+    logging.info(
+        "Using batch-wise one-hot encoding for training: x_shape=%s y_shape=%s batch_size=%d num_classes=%d",
+        numpy.asarray(x_real_samples).shape,
+        numpy.asarray(y_real_samples).shape,
+        batch_size,
+        num_classes,
+    )
+    return tensorflow.data.Dataset.from_generator(
+        lambda: _one_hot_batch_generator(
+            x_real_samples,
+            y_real_samples,
+            num_classes,
+            batch_size,
+            target_mode=target_mode,
+        ),
+        output_signature=output_signature,
+    )
+
+
+def _fit_features_and_one_hot(model, arguments, x_real_samples, y_real_samples, number_samples_per_class,
+                              context, epochs, batch_size, callbacks):
+    if _is_batch_execution(arguments):
+        dataset = _batch_one_hot_dataset(
+            x_real_samples,
+            y_real_samples,
+            number_samples_per_class,
+            batch_size,
+            target_mode="features",
+        )
+        return model.fit(dataset, epochs=epochs, callbacks=callbacks)
+
+    return model.fit(
+        x_real_samples,
+        _labels_to_one_hot(y_real_samples, number_samples_per_class, context),
+        epochs=epochs,
+        batch_size=batch_size,
+        callbacks=callbacks,
+    )
+
+
+def _fit_autoencode_with_one_hot(model, arguments, x_real_samples, y_real_samples, number_samples_per_class,
+                                 context, epochs, batch_size, callbacks):
+    if _is_batch_execution(arguments):
+        dataset = _batch_one_hot_dataset(
+            x_real_samples,
+            y_real_samples,
+            number_samples_per_class,
+            batch_size,
+            target_mode="autoencode",
+        )
+        return model.fit(dataset, epochs=epochs, callbacks=callbacks)
+
+    return model.fit(
+        (x_real_samples, _labels_to_one_hot(y_real_samples, number_samples_per_class, context)),
+        x_real_samples,
+        epochs=epochs,
+        batch_size=batch_size,
+        callbacks=callbacks,
     )
 
 
@@ -266,10 +360,15 @@ class AdversarialInstance:
             callbacks_list.append(self._callback_early_stop)
 
         # Fit the model with real samples and the corresponding labels
-        self._adversarial_algorithm.fit(
+        _fit_features_and_one_hot(
+            self._adversarial_algorithm,
+            arguments,
             x_real_samples,
-            _labels_to_one_hot(y_real_samples, self._number_samples_per_class, "adversarial y"),
-            epochs=self._adversarial_number_epochs, batch_size=self._adversarial_batch_size,
+            y_real_samples,
+            self._number_samples_per_class,
+            "adversarial y",
+            epochs=self._adversarial_number_epochs,
+            batch_size=self._adversarial_batch_size,
             callbacks=callbacks_list)
 
 
@@ -586,9 +685,15 @@ class AutoencoderInstance:
             callbacks_list.append(self._callback_early_stop)
 
         # Fit the autoencoder model
-        self._autoencoder_algorithm.fit((
-            x_real_samples, _labels_to_one_hot(y_real_samples, self._number_samples_per_class, "autoencoder y")),
-            x_real_samples, epochs=self._autoencoder_number_epochs, batch_size=self._autoencoder_batch_size,
+        _fit_autoencode_with_one_hot(
+            self._autoencoder_algorithm,
+            arguments,
+            x_real_samples,
+            y_real_samples,
+            self._number_samples_per_class,
+            "autoencoder y",
+            epochs=self._autoencoder_number_epochs,
+            batch_size=self._autoencoder_batch_size,
             callbacks=callbacks_list)
 
     # Getter and setter for autoencoder_latent_dimension
@@ -911,10 +1016,15 @@ class QuantizedVAEInstance:
             callbacks_list.append(self._callback_early_stop)
 
         # Fit the variational autoencoder model
-        self._quantized_vae_algorithm.fit((
+        _fit_autoencode_with_one_hot(
+            self._quantized_vae_algorithm,
+            arguments,
             x_real_samples,
-            _labels_to_one_hot(y_real_samples, self._number_samples_per_class, "quantized_vae y")),
-            x_real_samples, epochs=self._quantized_vae_number_epochs, batch_size=self._quantized_vae_batch_size,
+            y_real_samples,
+            self._number_samples_per_class,
+            "quantized_vae y",
+            epochs=self._quantized_vae_number_epochs,
+            batch_size=self._quantized_vae_batch_size,
             callbacks=callbacks_list)
 
 
@@ -1352,6 +1462,12 @@ class LatentDiffusionInstance:
             x_real_samples (ndarray): Training samples
             y_real_samples (ndarray): Corresponding labels
         """
+        if _is_batch_execution(arguments):
+            raise NotImplementedError(
+                "latent_diffusion in execution_mode=batches is not implemented without global one-hot. "
+                "Use execution_mode=normal or choose a batch-adapted model."
+            )
+
         # Initialize the diffusion model
         self._get_latent_diffusion(input_shape)
 
@@ -2012,10 +2128,15 @@ class WassersteinInstance:
             callbacks_list.append(self._callback_early_stop)
 
         # Fit the WassersteinGP GAN model
-        self._wasserstein_algorithm.fit(
+        _fit_features_and_one_hot(
+            self._wasserstein_algorithm,
+            arguments,
             x_real_samples,
-            _labels_to_one_hot(y_real_samples, self._number_samples_per_class, "wasserstein y"),
-            epochs=self._wasserstein_number_epochs, batch_size=self._wasserstein_batch_size,
+            y_real_samples,
+            self._number_samples_per_class,
+            "wasserstein y",
+            epochs=self._wasserstein_number_epochs,
+            batch_size=self._wasserstein_batch_size,
             callbacks=callbacks_list)
 
     # Getter and setter for wasserstein_latent_dimension
@@ -2446,10 +2567,15 @@ class WassersteinGPInstance:
             callbacks_list.append(self._callback_early_stop)
 
         # Fit the WassersteinGP GAN model
-        self._wasserstein_gp_algorithm.fit(
+        _fit_features_and_one_hot(
+            self._wasserstein_gp_algorithm,
+            arguments,
             x_real_samples,
-            _labels_to_one_hot(y_real_samples, self._number_samples_per_class, "wasserstein_gp y"),
-            epochs=self._wasserstein_gp_number_epochs, batch_size=self._wasserstein_gp_batch_size,
+            y_real_samples,
+            self._number_samples_per_class,
+            "wasserstein_gp y",
+            epochs=self._wasserstein_gp_number_epochs,
+            batch_size=self._wasserstein_gp_batch_size,
             callbacks=callbacks_list)
 
 
@@ -2849,11 +2975,16 @@ class VariationalAutoencoderInstance:
             callbacks_list.append(self._callback_early_stop)
 
         # Fit the variational autoencoder model
-        self._variational_algorithm.fit((x_real_samples, _labels_to_one_hot(
-                                           y_real_samples, self._number_samples_per_class, "variational_autoencoder y")),
-                                        x_real_samples, epochs=self._variational_autoencoder_number_epochs,
-                                        batch_size=self._variational_autoencoder_batch_size,
-                                        callbacks=callbacks_list)
+        _fit_autoencode_with_one_hot(
+            self._variational_algorithm,
+            arguments,
+            x_real_samples,
+            y_real_samples,
+            self._number_samples_per_class,
+            "variational_autoencoder y",
+            epochs=self._variational_autoencoder_number_epochs,
+            batch_size=self._variational_autoencoder_batch_size,
+            callbacks=callbacks_list)
 
 
     # Getter and setter for variational_autoencoder_latent_dimension
@@ -3243,10 +3374,15 @@ class DenoisingDiffusionInstance:
         x_real_samples = numpy.array(x_real_samples)
         x_real_samples = tensorflow.expand_dims(x_real_samples, axis=-1)
 
-        self._denoising_diffusion_algorithm.fit(
+        _fit_features_and_one_hot(
+            self._denoising_diffusion_algorithm,
+            arguments,
             x_real_samples,
-            _labels_to_one_hot(y_real_samples, self._number_samples_per_class, "denoising_diffusion y"),
-            epochs=self._denoising_diffusion_unet_epochs, batch_size=self._denoising_diffusion_unet_batch_size,
+            y_real_samples,
+            self._number_samples_per_class,
+            "denoising_diffusion y",
+            epochs=self._denoising_diffusion_unet_epochs,
+            batch_size=self._denoising_diffusion_unet_batch_size,
             callbacks=callbacks_list)
 
     # Getter and setter for diffusion_unet_last_layer_activation
@@ -3595,6 +3731,12 @@ class SmoteInstance:
         Note:
             The method converts labels to categorical format internally to handle multi-class scenarios.
         """
+        if _is_batch_execution(arguments):
+            raise NotImplementedError(
+                "smote in execution_mode=batches is not implemented without global one-hot. "
+                "Use execution_mode=normal or choose a batch-adapted model."
+            )
+
         # Initialize the autoencoder model
         self._get_smote(input_shape)
 
@@ -3895,6 +4037,11 @@ class GenerativeModels(AdversarialInstance,
 
         # Autoencoder model training
         elif arguments.model_type == 'random':
+            if _is_batch_execution(arguments):
+                raise NotImplementedError(
+                    "random_noise in execution_mode=batches is not implemented without global one-hot. "
+                    "Use execution_mode=normal or choose a batch-adapted model."
+                )
 
             # Initialize the autoencoder model
             self._get_random_noise(input_shape)
@@ -3908,6 +4055,11 @@ class GenerativeModels(AdversarialInstance,
 
         # Smote model training
         elif arguments.model_type == 'smote':
+            if _is_batch_execution(arguments):
+                raise NotImplementedError(
+                    "mixed smote in execution_mode=batches is not implemented without global one-hot. "
+                    "Use execution_mode=normal or choose a batch-adapted model."
+                )
 
             # Initialize the autoencoder model
             self._get_smote(input_shape)
@@ -4057,5 +4209,3 @@ def import_models(function):
         return function(self, *args, **kwargs)
 
     return wrapper
-
-

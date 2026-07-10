@@ -43,7 +43,7 @@ try:
 
     from tensorflow.keras.models import Model
 
-    from Engine.DataIO.LabelUtils import one_hot_encode_labels
+    from Engine.DataIO.LabelUtils import to_one_hot_batch
     from tensorflow.keras.models import model_from_json
 
     from tensorflow.keras.losses import BinaryCrossentropy
@@ -333,27 +333,25 @@ class AdversarialAlgorithm(Model):
 
         # Iterate over each class and the corresponding number of samples to generate
         for label_class, number_instances in number_samples_per_class["classes"].items():
-            # Create one-hot encoded labels for all generated samples in this class
-            # Example: if label_class = 2 and number_instances = 5, this will generate:
-            # [[0, 0, 1], [0, 0, 1], [0, 0, 1], [0, 0, 1], [0, 0, 1]]
-            label_samples_generated = one_hot_encode_labels(
-                [label_class] * number_instances,
-                num_classes=number_samples_per_class["number_classes"],
-                context="adversarial generated labels",
-            )
+            generation_batch_size = int(number_samples_per_class.get("generation_batch_size", number_instances))
+            generated_chunks = []
 
-            # Generate random noise vectors (latent vectors) for each sample
-            # Shape: (number_instances, latent_dimension)
-            latent_noise = numpy.random.normal(
-                self._latent_mean_distribution,  # Mean of the latent space distribution
-                self._latent_stander_deviation,  # Standard deviation of the latent space distribution
-                (number_instances, self._latent_dimension)
-            )
+            for start in range(0, number_instances, generation_batch_size):
+                batch_instances = min(generation_batch_size, number_instances - start)
+                label_samples_generated = to_one_hot_batch(
+                    [label_class] * batch_instances,
+                    num_classes=number_samples_per_class["number_classes"],
+                )
 
-            # Use the generator to produce synthetic samples conditioned on the class labels
-            # Inputs: latent noise vectors and one-hot class labels
-            # 'verbose=0' suppresses console output from the predict call
-            generated_samples = self._generator.predict([latent_noise, label_samples_generated], verbose=0)
+                latent_noise = numpy.random.normal(
+                    self._latent_mean_distribution,
+                    self._latent_stander_deviation,
+                    (batch_instances, self._latent_dimension)
+                )
+
+                generated_chunks.append(self._generator.predict([latent_noise, label_samples_generated], verbose=0))
+
+            generated_samples = numpy.concatenate(generated_chunks, axis=0) if generated_chunks else numpy.array([])
 
             # Round generated sample values to nearest integer (useful if generating binary data, like images with pixel values 0/1)
             if number_samples_per_class.get("data_type") != "continuous":

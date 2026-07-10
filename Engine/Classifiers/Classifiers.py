@@ -77,6 +77,10 @@ class Classifiers:
                                              "KNN",
                                              #"GaussianPrecess",
                                              "DecisionTree",
+                                             "DecisionTreeSubset",
+                                             "RandomForestSubset",
+                                             "ExtraTreesSubset",
+                                             "RandomForestLight",
                                              #"AdaBoost", #TODO corrigir
                                              "NaiveBayes",
                                              #"QuadraticDiscriminant",
@@ -85,6 +89,10 @@ class Classifiers:
                                              #"KMeansClustering",
                                              #"LinearRegression",
                                              "StochasticGradientDescent",
+                                             "SGDClassifier",
+                                             "PassiveAggressiveClassifier",
+                                             "GaussianNB",
+                                             "MLPClassifierSmall",
                                              #"SpectralClusteringModel"
                                              ]
     
@@ -93,10 +101,12 @@ class Classifiers:
     def __init__(self, arguments):
 
         dictionary_classifiers = {"RandomForest": RandomForest(arguments),
+                                        "RandomForestSubset": RandomForest(arguments),
                                         "SupportVectorMachine": SupportVectorMachine(arguments),
                                         "KNN": KNearestNeighbors(arguments),
                                         "GaussianPrecess": GaussianProcess(arguments),
                                         "DecisionTree": DecisionTree(arguments),
+                                        "DecisionTreeSubset": DecisionTree(arguments),
                                         # "AdaBoost": AdaBoost(arguments),
                                         "NaiveBayes": NaiveBayes(arguments),
                                         "QuadraticDiscriminant": QuadranticDiscriminantAnalysis(arguments),
@@ -109,11 +119,14 @@ class Classifiers:
         
         self._dictionary_classifiers_name = list()
         self._dictionary_classifiers = {}
+        self._arguments = arguments
 
         for c in arguments.classifier: 
             if c in self.dictionary_classifiers_name and c in  dictionary_classifiers.keys():
                 self._dictionary_classifiers_name.append(c)
                 self._dictionary_classifiers[c] = dictionary_classifiers[c]
+            elif getattr(arguments, "execution_mode", "normal") == "batches" and c in self.dictionary_classifiers_name:
+                self._dictionary_classifiers_name.append(c)
 
 
     def get_trained_classifiers(self, x_samples_training, y_samples_training, dataset_type, input_dataset_shape):
@@ -125,9 +138,31 @@ class Classifiers:
         for classifier_algorithm in self._dictionary_classifiers_name:
 
             classifier_model = self._dictionary_classifiers[classifier_algorithm]
-            list_instance_classifiers.append(classifier_model.get_model(x_samples_training,
-                                                                        y_samples_training,
+            x_training, y_training = self._limit_subset_if_requested(
+                classifier_algorithm,
+                x_samples_training,
+                y_samples_training,
+            )
+            list_instance_classifiers.append(classifier_model.get_model(x_training,
+                                                                        y_training,
                                                                         dataset_type, input_dataset_shape))
 
 
         return list_instance_classifiers
+
+    def _limit_subset_if_requested(self, classifier_algorithm, x_samples_training, y_samples_training):
+        if classifier_algorithm not in {"DecisionTreeSubset", "RandomForestSubset"}:
+            return x_samples_training, y_samples_training
+
+        limit = int(getattr(self._arguments, "batch_classifier_subset_size", 100000))
+        if limit <= 0:
+            return x_samples_training, y_samples_training
+
+        x_samples_training = x_samples_training[:limit]
+        y_samples_training = y_samples_training[:limit]
+        logging.info(
+            "Training %s on subset: %d rows.",
+            classifier_algorithm,
+            len(y_samples_training),
+        )
+        return x_samples_training, y_samples_training

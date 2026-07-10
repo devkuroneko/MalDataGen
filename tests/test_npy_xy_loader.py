@@ -117,6 +117,7 @@ class NpyXYLoaderTest(unittest.TestCase):
             self.assertEqual(bundle.train.y.tolist(), [0, 1, 2])
             self.assertEqual(bundle.schema.num_classes, 3)
             self.assertIsNone(bundle.schema.class_labels)
+            self.assertEqual(bundle.metadata["label_mapping_original_to_zero_based"], {1: 0, 2: 1, 3: 2})
 
     def test_rejects_optional_split_without_y_pair(self):
         with tempfile.TemporaryDirectory() as directory:

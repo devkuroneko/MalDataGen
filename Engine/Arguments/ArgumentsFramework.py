@@ -67,6 +67,33 @@ DEFAULT_OUTPUT_PATH_TRAINING_CURVE = "training_curve"
 DEFAULT_CLASSIFIER_LIST = ["RandomForest", "KNN", "DecisionTree"]
 DEFAULT_EVALUATION_METHOD = ["TrAs", "TsAr"]
 DEFAULT_SAMPLE_PLAN = "legacy"
+BATCH_CLASSIFIER_CHOICES = [
+    "sgd",
+    "passive_aggressive",
+    "naive_bayes",
+    "mlp_small",
+    "decision_tree_subset",
+    "extra_trees_subset",
+    "random_forest_light",
+    "random_forest_subset",
+]
+EVAL_CLASSIFIER_CHOICES = [
+    "decision_tree_subset",
+    "extra_trees_subset",
+    "random_forest_light",
+    "sgd",
+]
+NORMAL_CLASSIFIER_CHOICES = [
+    "decision_tree",
+    "random_forest",
+    "decision_tree_subset",
+    "random_forest_subset",
+]
+GENERATION_STRATEGY_CHOICES = [
+    "single_conditional",
+    "per_class",
+    "grouped_classes",
+]
 
 DEFAULT_VERBOSE_LIST = {logging.INFO: 2, logging.DEBUG: 1, logging.WARNING: 2,
                         logging.FATAL: 0, logging.ERROR: 0}
@@ -122,6 +149,52 @@ def add_argument_framework():
                         choices=Classifiers.dictionary_classifiers_name,
                         help="Classifier (or list of classifiers separated by empty space) default: {} availabe: {}.".format(
                             DEFAULT_CLASSIFIER_LIST, Classifiers.dictionary_classifiers_name))
+
+    parser.add_argument('--batch_classifier', type=str, default=None,
+                        choices=BATCH_CLASSIFIER_CHOICES,
+                        help='Legacy alias for --eval_classifier in execution_mode=batches.')
+
+    parser.add_argument('--eval_classifier', type=str, default="decision_tree_subset",
+                        choices=EVAL_CLASSIFIER_CHOICES,
+                        help=('Classifier used by execution_mode=batches. Default: decision_tree_subset. '
+                              'SGDClassifier remains available for low-RAM checks but can severely underestimate '
+                              'AppClassNet synthetic quality.'))
+
+    parser.add_argument('--batch_classifier_subset_size', type=int, default=100000,
+                        help='Maximum rows loaded for *_subset batch classifiers. Default: 100000.')
+
+    parser.add_argument('--train_samples_per_class', type=int, default=None,
+                        help='Per-class reservoir quota for subset eval classifiers.')
+
+    parser.add_argument('--test_samples_per_class', type=int, default=None,
+                        help='Per-class evaluation cap used by batch evaluators when applicable.')
+
+    parser.add_argument('--n_estimators', type=int, default=None,
+                        help='Estimator count for extra_trees_subset and random_forest_light.')
+
+    parser.add_argument('--max_depth', type=int, default=None,
+                        help='Tree max_depth for subset eval classifiers.')
+
+    parser.add_argument('--max_samples', type=float, default=None,
+                        help='Optional RandomForest max_samples for random_forest_light.')
+
+    parser.add_argument('--class_weight', type=str, default=None,
+                        choices=[None, 'balanced', 'balanced_subsample'],
+                        help='Optional class_weight for tree ensemble eval classifiers.')
+
+    parser.add_argument('--normal_classifier', type=str, default=None,
+                        choices=NORMAL_CLASSIFIER_CHOICES,
+                        help=('Optional classifier override for normal mode. By default the legacy classifier list '
+                              'is preserved. Subset variants train DecisionTree/RandomForest on a limited subset.'))
+
+    parser.add_argument('--generation_strategy', type=str, default="single_conditional",
+                        choices=GENERATION_STRATEGY_CHOICES,
+                        help=('Generation strategy for batches mode. single_conditional preserves the existing '
+                              'conditional generator; per_class and grouped_classes train separate generators when '
+                              'the selected algorithm supports it.'))
+
+    parser.add_argument('--classes_per_group', type=int, default=10,
+                        help='Number of classes per generator for --generation_strategy grouped_classes.')
 
     parser.add_argument('--evaluation', type=str, default=DEFAULT_EVALUATION_METHOD, nargs="+",
                         help="List Evaluation Methods ['TrAs', 'TsAr'}")

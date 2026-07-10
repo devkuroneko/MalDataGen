@@ -53,6 +53,13 @@ def npy_args(directory, split_mode="cross_validation", with_valid=False, with_te
         data_type="continuous",
         number_samples_per_class={"classes": {0: 1}, "number_classes": 1},
         number_k_folds=1,
+        execution_mode="normal",
+        max_train_samples=None,
+        max_samples_per_class=None,
+        train_samples_per_class=None,
+        test_samples_per_class=None,
+        min_samples_per_class_required=1,
+        strict_min_samples_per_class=False,
     )
     return args
 
@@ -138,6 +145,39 @@ class CrossValidationDataLoadingTest(unittest.TestCase):
             self.assertEqual(result, "done")
             self.assertEqual(owner._number_samples_per_class["number_classes"], 200)
             self.assertEqual(len(owner.list_folds), 2)
+
+    def test_batches_provided_split_uses_stratified_selection_for_train_and_valid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self._save_split(
+                directory,
+                "train",
+                numpy.arange(18).reshape(9, 2),
+                [0, 0, 0, 1, 1, 1, 2, 2, 2],
+            )
+            self._save_split(
+                directory,
+                "valid",
+                numpy.arange(12).reshape(6, 2),
+                [0, 0, 1, 1, 2, 2],
+            )
+
+            args = npy_args(directory, split_mode="provided", with_valid=True)
+            args.execution_mode = "batches"
+            args.num_classes = 3
+            args.train_samples_per_class = 2
+            args.test_samples_per_class = 1
+            owner = SimpleNamespace(arguments=args, list_folds=[], current_subdir=directory)
+            bundle = load_dataset_from_args(args)
+
+            _apply_bundle_to_owner(owner, bundle)
+            _build_provided_split_folds(owner, bundle)
+
+            train_counts = dict(zip(*numpy.unique(owner.list_folds[0]["y_training_real"], return_counts=True)))
+            valid_counts = dict(zip(*numpy.unique(owner.list_folds[0]["y_evaluation_real"], return_counts=True)))
+            self.assertEqual(train_counts, {0: 2, 1: 2, 2: 2})
+            self.assertEqual(valid_counts, {0: 1, 1: 1, 2: 1})
+            self.assertTrue((Path(directory) / "SelectionReports" / "train_stratified_selection.json").is_file())
+            self.assertTrue((Path(directory) / "SelectionReports" / "valid_stratified_selection.json").is_file())
 
 
 if __name__ == "__main__":

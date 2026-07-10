@@ -45,7 +45,7 @@ try:
 
     from tensorflow.keras.metrics import Mean
 
-    from Engine.DataIO.LabelUtils import one_hot_encode_labels
+    from Engine.DataIO.LabelUtils import to_one_hot_batch
 
     from tensorflow.keras.losses import BinaryCrossentropy
 
@@ -262,10 +262,9 @@ class QuantizedVAEAlgorithm(Model):
         for label_class, number_instances in number_samples_per_class["classes"].items():
 
             # Create one-hot encoded labels for the samples
-            label_samples_generated = one_hot_encode_labels(
+            label_samples_generated = to_one_hot_batch(
                 [label_class] * number_instances,
                 num_classes=number_samples_per_class["number_classes"],
-                context="quantized_vae generated labels",
             )
 
             sampled_indices = numpy.random.choice(number_embeddings, size=number_instances)

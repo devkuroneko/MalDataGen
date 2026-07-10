@@ -102,6 +102,41 @@ DEFAULT_VERBOSE_LIST = {logging.INFO: 2,
 
 LOGGING_FILE_NAME = "logging.log"
 
+BATCH_CLASSIFIER_NAME_MAP = {
+    "sgd": "SGDClassifier",
+    "passive_aggressive": "PassiveAggressiveClassifier",
+    "naive_bayes": "GaussianNB",
+    "mlp_small": "MLPClassifierSmall",
+    "decision_tree_subset": "DecisionTreeSubset",
+    "extra_trees_subset": "ExtraTreesSubset",
+    "random_forest_light": "RandomForestLight",
+    "random_forest_subset": "RandomForestSubset",
+}
+
+NORMAL_CLASSIFIER_NAME_MAP = {
+    "decision_tree": "DecisionTree",
+    "random_forest": "RandomForest",
+    "decision_tree_subset": "DecisionTreeSubset",
+    "random_forest_subset": "RandomForestSubset",
+}
+
+
+def _configure_classifier_arguments(parsed_arguments):
+    if int(getattr(parsed_arguments, "classes_per_group", 10)) <= 0:
+        raise ValueError("--classes_per_group must be a positive integer.")
+
+    if getattr(parsed_arguments, "execution_mode", "normal") == "batches":
+        if getattr(parsed_arguments, "batch_classifier", None):
+            parsed_arguments.eval_classifier = parsed_arguments.batch_classifier
+        parsed_arguments.batch_classifier = parsed_arguments.eval_classifier
+        parsed_arguments.classifier = [BATCH_CLASSIFIER_NAME_MAP[parsed_arguments.eval_classifier]]
+        return parsed_arguments
+
+    normal_classifier = getattr(parsed_arguments, "normal_classifier", None)
+    if normal_classifier:
+        parsed_arguments.classifier = [NORMAL_CLASSIFIER_NAME_MAP[normal_classifier]]
+    return parsed_arguments
+
 
 def arguments(function):
     """
@@ -174,6 +209,7 @@ class Arguments(DirectoryManager):
         self.arguments = add_argument_support_vector_machine(self.arguments)
 
         self.arguments = self.arguments.parse_args()
+        self.arguments = _configure_classifier_arguments(self.arguments)
         self.arguments = validate_data_load_arguments(self.arguments)
         self._create_directories(base_directory=self.arguments.output_dir)
         self.arguments.output_dir = self.current_subdir

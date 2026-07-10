@@ -103,6 +103,31 @@ def one_hot_encode_labels(labels: Any, num_classes: int, context: str = "labels"
     return encoded
 
 
+def to_one_hot_batch(labels: Any, num_classes: int, dtype=numpy.float32) -> numpy.ndarray:
+    integer_labels = validate_zero_based_labels(labels, num_classes=num_classes, context="one-hot batch labels")
+    num_classes = _validate_num_classes(int(num_classes))
+
+    if integer_labels.size:
+        min_label = int(integer_labels.min())
+        max_label = int(integer_labels.max())
+        if min_label < 0 or max_label >= num_classes:
+            raise ValueError(
+                f"one-hot batch labels must be in [0, {num_classes - 1}]. "
+                f"Got min={min_label}, max={max_label}."
+            )
+
+    logging.info(
+        "Using batch-wise one-hot encoding: labels_shape=%s num_classes=%d",
+        integer_labels.shape,
+        num_classes,
+    )
+    encoded = numpy.zeros((integer_labels.shape[0], num_classes), dtype=dtype)
+    if integer_labels.size:
+        encoded[numpy.arange(integer_labels.shape[0]), integer_labels] = 1.0
+    logging.info("Using batch-wise one-hot encoding: output_shape=%s dtype=%s", encoded.shape, encoded.dtype)
+    return encoded
+
+
 def _validate_num_classes(num_classes: int) -> int:
     if not isinstance(num_classes, int) or num_classes < 1:
         raise ValueError("num_classes must be a positive integer.")

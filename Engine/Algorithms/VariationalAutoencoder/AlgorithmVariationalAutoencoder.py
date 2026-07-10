@@ -45,7 +45,7 @@ try:
 
     from tensorflow.keras.metrics import Mean
 
-    from Engine.DataIO.LabelUtils import one_hot_encode_labels
+    from Engine.DataIO.LabelUtils import to_one_hot_batch
 
     from tensorflow.keras.losses import BinaryCrossentropy
 
@@ -313,23 +313,20 @@ class VariationalAlgorithm(Model):
 
         # Iterate over each class and the corresponding number of samples to generate
         for label_class, number_instances in number_samples_per_class["classes"].items():
-            # Create a one-hot encoded label array for all samples in the current class
-            # Example: if label_class = 1 and number_instances = 3, this generates:
-            # [[0, 1], [0, 1], [0, 1]]
-            label_samples_generated = one_hot_encode_labels(
-                [label_class] * number_instances,
-                num_classes=number_samples_per_class["number_classes"],
-                context="variational_autoencoder generated labels",
-            )
+            generation_batch_size = int(number_samples_per_class.get("generation_batch_size", number_instances))
+            generated_chunks = []
 
-            # Sample random latent vectors from a standard normal distribution
-            # Shape: (number_instances, decoder_latent_dimension)
-            latent_noise = numpy.random.normal(size=(number_instances, self._decoder_latent_dimension))
+            for start in range(0, number_instances, generation_batch_size):
+                batch_instances = min(generation_batch_size, number_instances - start)
+                label_samples_generated = to_one_hot_batch(
+                    [label_class] * batch_instances,
+                    num_classes=number_samples_per_class["number_classes"],
+                )
 
-            # Use the decoder to generate samples conditioned on the latent vectors and class labels
-            # Inputs: (latent vectors, class labels)
-            # 'verbose=0' suppresses any print output from the prediction process
-            generated_samples = self._decoder.predict([latent_noise, label_samples_generated], verbose=0)
+                latent_noise = numpy.random.normal(size=(batch_instances, self._decoder_latent_dimension))
+                generated_chunks.append(self._decoder.predict([latent_noise, label_samples_generated], verbose=0))
+
+            generated_samples = numpy.concatenate(generated_chunks, axis=0) if generated_chunks else numpy.array([])
 
             # Round the generated samples to the nearest integer
             # This is useful for discrete data, like binary features (0/1) or integer values

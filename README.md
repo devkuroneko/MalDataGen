@@ -80,6 +80,25 @@ It supports GPU acceleration, CSV/XLS ingestion, custom CLI scripts, and integra
 ### Optional AppClassNet npy_xy Support
 
 The default input mode remains the original single-CSV workflow. For AppClassNet top-200 and other datasets stored as separate NumPy `X/y` arrays, MalDataGen also supports an explicit `npy_xy` mode. See [docs/APPCLASSNET_NPY_XY.md](docs/APPCLASSNET_NPY_XY.md) for file layout, smoke tests, `split_mode=provided`, multiclass settings, sample plans, and known limitations.
+
+### AppClassNet batch-friendly classifiers
+
+For copy-ready normal, batches, full-run and comparison commands, see [docs/APPCLASSNET_BATCH_EXECUTION.md](docs/APPCLASSNET_BATCH_EXECUTION.md).
+
+`run_appclassnet_top200.py -c sf` keeps the normal-mode classifier set used by the legacy scenario:
+`RandomForest`, `SupportVectorMachine`, `KNN`, `DecisionTree`, `NaiveBayes`, `GradientBoosting` and `StochasticGradientDescent`.
+
+For lower-memory AppClassNet evaluation, batches mode defaults to a stratified `DecisionTree` subset evaluator:
+
+```bash
+python3 run_appclassnet_top200.py -c sf --execution_mode batches --use_mmap --eval_classifier decision_tree_subset
+```
+
+Available AppClassNet eval classifiers are `decision_tree_subset`, `extra_trees_subset`, `random_forest_light` and `sgd`. Tree-based evaluators should be tried first for AppClassNet. `SGDClassifier` remains useful for very low RAM checks, but as a linear model it can severely underestimate synthetic data quality on AppClassNet top-200.
+
+Metrics from `normal` and `batches` can differ because the configured classifiers can differ. For a closer comparison, run both modes with a matching subset classifier when appropriate, for example `--normal_classifier decision_tree_subset` and `--eval_classifier decision_tree_subset`. The evaluation JSON files report the classifier, whether `partial_fit` was used, train batches, samples seen, per-class real/synthetic sample counts, training time and evaluation time.
+
+`metrics.json` also records simple resource usage for AppClassNet comparison: current memory, peak memory and elapsed time by stage (`loading`, `preprocessing`, `training`, `generation`, `evaluation`, `saving`), plus total elapsed time. In batches mode it additionally records the largest batch processed, number of batches and effective batch size. `psutil` is used when installed; otherwise Linux `resource` is used for peak memory, and unavailable values are written as `not_available`.
 ---
 ### Model architecure overivew
 WWe provide a visual overview of the internal architecture of each model's building blocks through five detailed figures, highlighting the main structural changes across the models. These diagrams are documented and explained in the Overview.md [Overview.md ] file.(https://github.com/SBSeg25/MalDataGen/blob/2dd9eaad74da7726c130e50dbc35f95a463cbd00/Docs/Overview.md)

@@ -41,7 +41,7 @@ try:
     import tensorflow
     from typing import Any
 
-    from Engine.DataIO.LabelUtils import one_hot_encode_labels
+    from Engine.DataIO.LabelUtils import to_one_hot_batch
 
 except ImportError as error:
     print(error)
@@ -434,10 +434,9 @@ class DenoisingDiffusionAlgorithm(tensorflow.keras.Model):
         # Iterate over each class and generate the specified number of samples
         for label_class, number_instances in number_samples_per_class["classes"].items():
             # Create one-hot encoded labels for the current class and number of instances
-            label_samples_generated = one_hot_encode_labels(
+            label_samples_generated = to_one_hot_batch(
                 [label_class] * number_instances,
                 num_classes=number_samples_per_class["number_classes"],
-                context="denoising_diffusion generated labels",
             )
 
             # Generate synthetic data using the diffusion model (or another generation method)

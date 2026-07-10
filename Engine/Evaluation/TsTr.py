@@ -37,11 +37,39 @@ try:
     import logging
 
     from Engine.DataIO.LabelUtils import labels_to_1d_integer
-
-    from sklearn.utils import shuffle   
+    from Engine.Classifiers.BatchClassifiers import get_batch_classifier_display_name
+    from Engine.Classifiers.BatchClassifiers import iter_synthetic_labeled_batches
+    from Engine.Classifiers.BatchClassifiers import predict_array_batches
+    from Engine.Classifiers.BatchClassifiers import train_batch_classifier
+    from sklearn.utils import shuffle
 except ImportError as error:
     print(error)
     sys.exit(-1)
+
+
+def _counts_by_class(labels):
+    unique_labels, counts = numpy.unique(numpy.asarray(labels, dtype=numpy.int64), return_counts=True)
+    return {str(int(label)): int(count) for label, count in zip(unique_labels, counts)}
+
+
+def _select_stratified_array_subset(x_values, y_values, samples_per_class, seed=42):
+    if samples_per_class is None:
+        return x_values, y_values
+
+    y_values = numpy.asarray(y_values, dtype=numpy.int64)
+    random_generator = numpy.random.default_rng(seed)
+    selected = []
+    for label in numpy.unique(y_values):
+        label_indices = numpy.flatnonzero(y_values == label)
+        take = min(int(samples_per_class), int(label_indices.shape[0]))
+        if take > 0:
+            selected.append(random_generator.choice(label_indices, size=take, replace=False))
+    if not selected:
+        return x_values[:0], y_values[:0]
+    indices = numpy.concatenate(selected).astype(numpy.int64, copy=False)
+    random_generator.shuffle(indices)
+    return x_values[indices], y_values[indices]
+
 
 class TsTr:
 
@@ -63,6 +91,62 @@ class TsTr:
         logging.info(f"")
         logging.info(f"#################################################################################")
         logging.info(f"\tTS-TR: train on synthetic, test on real")
+
+        arguments = getattr(self, "arguments", None)
+        if getattr(arguments, "execution_mode", "normal") == "batches":
+            if not getattr(self, '_labels_are_discrete', True):
+                reason = "TS-TR predictive evaluation skipped because labels are not discrete."
+                logging.warning("\t\t%s", reason)
+                self.mark_evaluation_classifiers_not_applicable("TS-TR", self.fold_number + 1, reason)
+                return
+
+            classifier_key = getattr(
+                self.arguments,
+                "eval_classifier",
+                getattr(self.arguments, "batch_classifier", "decision_tree_subset"),
+            )
+            classifier_name = get_batch_classifier_display_name(classifier_key)
+            train_batches = iter_synthetic_labeled_batches(synthetic_data)
+            classifier_instance, metadata = train_batch_classifier(
+                classifier_key,
+                train_batches,
+                self._get_configured_number_classes(dictionary_data['y_evaluation_real']),
+                self.arguments,
+                batch_recorder=self.record_batch_processed,
+            )
+            evaluation_x, evaluation_y = _select_stratified_array_subset(
+                dictionary_data['x_evaluation_real'],
+                labels_to_1d_integer(dictionary_data['y_evaluation_real'], context="TS-TR evaluation labels"),
+                getattr(self.arguments, "test_samples_per_class", None),
+            )
+            real_labels, predicted_labels, evaluation_time = predict_array_batches(
+                classifier_instance,
+                evaluation_x,
+                evaluation_y,
+                getattr(self.arguments, "eval_batch_size", 16384),
+                batch_recorder=self.record_batch_processed,
+            )
+            metadata["evaluation_time_seconds"] = float(evaluation_time)
+            metadata["evaluation_time"] = float(evaluation_time)
+            metadata["synthetic_samples_used_by_class"] = metadata.get("train_class_counts", {})
+            metadata["real_samples_used_by_class"] = _counts_by_class(real_labels) if real_labels.size else {}
+            self.record_batch_classifier_metadata("TS-TR", classifier_name, self.fold_number + 1, metadata)
+
+            if real_labels.size == 0:
+                reason = "TS-TR predictive evaluation skipped because no real evaluation rows were available."
+                logging.warning("\t\t%s", reason)
+                self.mark_classifier_metrics_not_applicable("TS-TR", classifier_name, self.fold_number + 1, reason)
+            else:
+                logging.info("")
+                logging.info(f"\t\tTS-TR {classifier_name}")
+                self.get_task_metrics(real_labels, predicted_labels, "TS-TR", classifier_name, self.fold_number + 1)
+
+            reason = (
+                "R-S distance evaluation is skipped in batches mode to avoid materializing all synthetic rows."
+            )
+            logging.warning("\t\t%s", reason)
+            self.mark_distance_metrics_not_applicable("R-S", self.fold_number + 1, reason)
+            return
 
         # Initialize empty lists for labels and data
         labels, data = [], []

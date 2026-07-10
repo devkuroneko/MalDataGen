@@ -60,6 +60,7 @@ class NpyXYLoader:
         self.target_name = target_name
         self.remap_labels_to_zero_based = remap_labels_to_zero_based
         self.metadata = dict(metadata or {})
+        self.label_mapping_original_to_zero_based = None
 
         self._validate_optional_pair(self.valid_x_path, self.valid_y_path, "valid")
         self._validate_optional_pair(self.test_x_path, self.test_y_path, "test")
@@ -91,6 +92,9 @@ class NpyXYLoader:
         if self.test_x_path is not None:
             test = self._load_split("test", self.test_x_path, self.test_y_path)
 
+        original_labels = self._collect_labels(train, valid, test)
+        self.label_mapping_original_to_zero_based = self._build_label_mapping(original_labels)
+
         if self.target_type == "multiclass":
             self._handle_multiclass_label_base(train, valid, test)
 
@@ -111,6 +115,7 @@ class NpyXYLoader:
         metadata = {
             "mmap_mode": self.mmap_mode,
             "dtype": str(numpy.dtype(self.dtype)) if self.dtype is not None else None,
+            "label_mapping_original_to_zero_based": self.label_mapping_original_to_zero_based,
             **self.metadata,
         }
 
@@ -188,6 +193,18 @@ class NpyXYLoader:
         logging.warning(
             "Labels appear to be 1-based. Pass remap_labels_to_zero_based=True to remap explicitly."
         )
+
+    def _build_label_mapping(self, labels) -> dict[int, int] | None:
+        labels = numpy.asarray(labels, dtype=numpy.int64)
+        if labels.size == 0:
+            return None
+
+        unique_labels = sorted(int(label) for label in numpy.unique(labels))
+        min_label = unique_labels[0]
+        if min_label == 1 and self.remap_labels_to_zero_based:
+            return {label: label - 1 for label in unique_labels}
+
+        return {label: label for label in unique_labels}
 
     @staticmethod
     def _validate_feature_widths(*splits):

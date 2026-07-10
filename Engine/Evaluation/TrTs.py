@@ -37,6 +37,10 @@ try:
     import logging
 
     from Engine.DataIO.LabelUtils import labels_to_1d_integer
+    from Engine.Classifiers.BatchClassifiers import get_batch_classifier_display_name
+    from Engine.Classifiers.BatchClassifiers import iter_array_batches
+    from Engine.Classifiers.BatchClassifiers import predict_synthetic_batches
+    from Engine.Classifiers.BatchClassifiers import train_batch_classifier
 
     from sklearn.metrics.pairwise import euclidean_distances
 
@@ -63,6 +67,62 @@ class TrTs:
         logging.info(f"")
         logging.info(f"#################################################################################")
         logging.info(f"\tTR-TS: train on real, test on synthetic")
+
+        arguments = getattr(self, "arguments", None)
+        if getattr(arguments, "execution_mode", "normal") == "batches":
+            if not getattr(self, '_labels_are_discrete', True):
+                reason = "TR-TS predictive evaluation skipped because labels are not discrete."
+                logging.warning("\t\t%s", reason)
+                self.mark_evaluation_classifiers_not_applicable("TR-TS", self.fold_number + 1, reason)
+                return
+
+            classifier_key = getattr(
+                self.arguments,
+                "eval_classifier",
+                getattr(self.arguments, "batch_classifier", "decision_tree_subset"),
+            )
+            classifier_name = get_batch_classifier_display_name(classifier_key)
+            train_labels = labels_to_1d_integer(
+                dictionary_data['y_evaluation_real'],
+                context="TR-TS evaluation labels",
+            )
+            train_batches = iter_array_batches(
+                dictionary_data['x_evaluation_real'],
+                train_labels,
+                getattr(self.arguments, "batch_size", 8192),
+            )
+            classifier_instance, metadata = train_batch_classifier(
+                classifier_key,
+                train_batches,
+                self._get_configured_number_classes(train_labels),
+                self.arguments,
+                batch_recorder=self.record_batch_processed,
+            )
+            labels, predictions, evaluation_time = predict_synthetic_batches(
+                classifier_instance,
+                synthetic_data,
+                batch_recorder=self.record_batch_processed,
+                max_samples_per_class=getattr(self.arguments, "test_samples_per_class", None),
+            )
+            metadata["evaluation_time_seconds"] = float(evaluation_time)
+            metadata["evaluation_time"] = float(evaluation_time)
+            metadata["real_samples_used_by_class"] = metadata.get("train_class_counts", {})
+            metadata["synthetic_samples_used_by_class"] = {
+                str(int(label)): int(count)
+                for label, count in zip(*numpy.unique(labels, return_counts=True))
+            } if labels.size else {}
+            self.record_batch_classifier_metadata("TR-TS", classifier_name, self.fold_number + 1, metadata)
+
+            if labels.size == 0:
+                reason = "TR-TS predictive evaluation skipped because no synthetic batch rows were generated."
+                logging.warning("\t\t%s", reason)
+                self.mark_classifier_metrics_not_applicable("TR-TS", classifier_name, self.fold_number + 1, reason)
+                return
+
+            logging.info("")
+            logging.info(f"\t\tTR-TS {classifier_name}")
+            self.get_task_metrics(labels, predictions, "TR-TS", classifier_name, self.fold_number + 1)
+            return
 
         # Initialize empty lists for labels and data
         labels, data = [], []

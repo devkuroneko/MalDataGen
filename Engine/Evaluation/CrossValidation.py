@@ -36,6 +36,7 @@ try:
 
     import sys
     import time
+    from pathlib import Path
 
     import numpy
     import pandas
@@ -47,6 +48,11 @@ try:
     from Engine.DataIO.LabelUtils import build_class_metadata
     from Engine.DataIO.LabelUtils import validate_zero_based_labels
     from Engine.DataIO.NpyXYLoader import NpyXYLoader
+    from Engine.DataIO.StratifiedNpySelection import build_minimum_coverage_report
+    from Engine.DataIO.StratifiedNpySelection import get_last_stratified_selection_report
+    from Engine.DataIO.StratifiedNpySelection import save_stratified_selection_report
+    from Engine.DataIO.StratifiedNpySelection import select_stratified_indices_from_npy
+    from Engine.Utils.ResourceMonitor import Timer
 
     from sklearn.model_selection import KFold
     from sklearn.model_selection import StratifiedKFold
@@ -58,6 +64,145 @@ except ImportError as error:
     sys.exit(-1)
 
 NOT_APPLICABLE = "not_applicable"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+APPCLASSNET_SELECTION_ROOT = PROJECT_ROOT / "results" / "appclassnet_top200" / "batches" / "subsets"
+
+def _format_bytes(num_bytes):
+        value = float(num_bytes)
+        for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+            if value < 1024 or unit == "TiB":
+                return f"{value:.2f} {unit}"
+            value /= 1024
+        return f"{value:.2f} TiB"
+
+def _array_nbytes(array):
+        try:
+            return int(numpy.prod(array.shape) * numpy.dtype(array.dtype).itemsize)
+        except Exception:
+            return None
+
+def _log_array_memory(name, array):
+        nbytes = _array_nbytes(array)
+        logging.info(
+            "%s shape=%s dtype=%s approx_ram=%s",
+            name,
+            getattr(array, "shape", None),
+            getattr(array, "dtype", None),
+            _format_bytes(nbytes) if nbytes is not None else "unknown",
+        )
+
+def _log_execution_memory_settings(arguments):
+        logging.info("Execution mode: %s", getattr(arguments, "execution_mode", "normal"))
+        logging.info("Batch size: %s", getattr(arguments, "batch_size", None))
+        logging.info("Eval batch size: %s", getattr(arguments, "eval_batch_size", None))
+        logging.info("Generation batch size: %s", getattr(arguments, "generation_batch_size", None))
+        logging.info("Use mmap: %s", getattr(arguments, "mmap_npy", False))
+        logging.info("Max train samples: %s", getattr(arguments, "max_train_samples", None))
+        logging.info("Max samples per class: %s", getattr(arguments, "max_samples_per_class", None))
+
+def _apply_batch_limits(owner, bundle):
+        if getattr(owner.arguments, "execution_mode", "normal") != "batches":
+            return
+
+        _apply_stratified_split_selection(
+            owner,
+            bundle.train,
+            getattr(owner.arguments, "train_y_path"),
+            split_name="train",
+            samples_per_class=_batch_samples_per_class(owner.arguments, "train"),
+        )
+        if bundle.valid is not None:
+            _apply_stratified_split_selection(
+                owner,
+                bundle.valid,
+                getattr(owner.arguments, "valid_y_path"),
+                split_name="valid",
+                samples_per_class=_batch_samples_per_class(owner.arguments, "evaluation"),
+            )
+        if bundle.test is not None:
+            _apply_stratified_split_selection(
+                owner,
+                bundle.test,
+                getattr(owner.arguments, "test_y_path"),
+                split_name="test",
+                samples_per_class=_batch_samples_per_class(owner.arguments, "evaluation"),
+            )
+
+def _batch_samples_per_class(arguments, split_role):
+        min_required = int(getattr(arguments, "min_samples_per_class_required", 1))
+        if split_role == "train":
+            if getattr(arguments, "max_samples_per_class", None) is not None:
+                return max(min_required, int(arguments.max_samples_per_class))
+            if getattr(arguments, "train_samples_per_class", None) is not None:
+                return max(min_required, int(arguments.train_samples_per_class))
+            if getattr(arguments, "max_train_samples", None) is not None:
+                num_classes = int(getattr(arguments, "num_classes", 1) or 1)
+                quota = int(numpy.ceil(int(arguments.max_train_samples) / max(1, num_classes)))
+                return max(min_required, quota)
+            return max(1, min_required)
+
+        if getattr(arguments, "test_samples_per_class", None) is not None:
+            return max(min_required, int(arguments.test_samples_per_class))
+        return max(1, min_required)
+
+def _apply_stratified_split_selection(owner, split, y_path, split_name, samples_per_class):
+        if y_path is None:
+            logging.warning("Batches stratified selection skipped for %s: no y_path is available.", split_name)
+            return
+
+        if getattr(owner.arguments, "max_train_samples", None) is not None and split_name == "train":
+            logging.warning(
+                "max_train_samples=%s will not be applied before per-class coverage. "
+                "Using samples_per_class=%s for stratified train selection.",
+                owner.arguments.max_train_samples,
+                samples_per_class,
+            )
+
+        num_classes = int(getattr(owner.arguments, "num_classes", None) or getattr(owner._dataset_bundle.schema, "num_classes", 0))
+        indices = select_stratified_indices_from_npy(
+            y_path,
+            int(samples_per_class),
+            num_classes,
+            seed=42,
+            mmap_mode=_mmap_mode_for_npy(owner.arguments) or "r",
+        )
+        selection_report = get_last_stratified_selection_report() or {}
+        coverage_report = build_minimum_coverage_report(
+            selection_report,
+            int(getattr(owner.arguments, "min_samples_per_class_required", 1)),
+        )
+        selection_report.update({
+            "split_name": split_name,
+            "samples_per_class_used_for_selection": int(samples_per_class),
+            "minimum_coverage": coverage_report,
+        })
+
+        report_path = APPCLASSNET_SELECTION_ROOT / f"{split_name}_stratified_selection.json"
+        save_stratified_selection_report(selection_report, report_path)
+        output_report_path = Path(owner.current_subdir) / "SelectionReports" / f"{split_name}_stratified_selection.json"
+        save_stratified_selection_report(selection_report, output_report_path)
+
+        if not coverage_report["passes_minimum"]:
+            message = (
+                f"Batches {split_name} split has class(es) below "
+                f"min_samples_per_class_required={coverage_report['min_samples_per_class_required']}: "
+                f"{coverage_report['classes_below_minimum']}."
+            )
+            if getattr(owner.arguments, "strict_min_samples_per_class", False):
+                raise ValueError(message)
+            logging.warning(message)
+
+        logging.info(
+            "Batches mode: stratified %s selection rows=%d samples_per_class=%d report=%s",
+            split_name,
+            int(indices.shape[0]),
+            int(samples_per_class),
+            report_path,
+        )
+        split.X = numpy.asarray(split.X[indices], dtype=numpy.float32)
+        split.y = numpy.asarray(split.y[indices])
+        _log_array_memory(f"Limited {split_name} X", split.X)
+        _log_array_memory(f"Limited {split_name} y", split.y)
 
 def _save_data_to_csv(directory_output_data, data, labels, filename_prefix, fold):
         """Helper function to save data and labels to CSV."""
@@ -148,10 +293,27 @@ def _apply_bundle_to_owner(owner, bundle):
         )
         owner._data_loaded_header = list(bundle.schema.feature_names) + [bundle.schema.target_name or "label"]
         owner._data_original_header = list(owner._data_loaded_header)
-        owner._label_mapping = None
-        owner._label_inverse_mapping = None
+        owner._label_mapping = bundle.metadata.get("label_mapping_original_to_zero_based")
+        if owner._label_mapping:
+            owner._label_inverse_mapping = {
+                zero_based: original
+                for original, zero_based in owner._label_mapping.items()
+            }
+        else:
+            owner._label_inverse_mapping = None
         owner._labels_are_discrete = bundle.schema.target_type in ('binary', 'multiclass')
         owner.list_folds = []
+        owner._number_samples_per_class = _number_samples_per_class_from_schema(bundle.schema, owner._data_loaded_labels)
+        owner.arguments.number_samples_per_class = owner._number_samples_per_class
+        _log_array_memory("Loaded train X", owner._data_loaded)
+        _log_array_memory("Loaded train y", owner._data_loaded_labels)
+        _apply_batch_limits(owner, bundle)
+        owner._data_loaded = numpy.asarray(bundle.train.X, dtype=numpy.float32)
+        owner._data_loaded_labels = validate_zero_based_labels(
+            bundle.train.y,
+            num_classes=bundle.schema.num_classes,
+            context="train y",
+        )
         owner._number_samples_per_class = _number_samples_per_class_from_schema(bundle.schema, owner._data_loaded_labels)
         owner.arguments.number_samples_per_class = owner._number_samples_per_class
 
@@ -243,12 +405,32 @@ def StratifiedData(function):
     """
 
     def wrapper(self, *args, **kwargs):
-        dataset_bundle = load_dataset_from_args(self.arguments, owner=self)
+        _log_execution_memory_settings(self.arguments)
+        resource_timer = getattr(self, "resource_timer", None)
+        record_resource_usage = getattr(self, "record_resource_usage", None)
+
+        if resource_timer is None:
+            dataset_bundle = load_dataset_from_args(self.arguments, owner=self)
+        else:
+            with resource_timer("loading"):
+                dataset_bundle = load_dataset_from_args(self.arguments, owner=self)
+
+        preprocessing_timer = Timer("preprocessing")
+        preprocessing_timer.__enter__()
 
         if dataset_bundle is not None:
             _apply_bundle_to_owner(self, dataset_bundle)
+            if getattr(self.arguments, 'dry_run_memory', False):
+                logging.info("dry_run_memory enabled; skipping fold materialization and experiment execution.")
+                preprocessing_timer.__exit__(None, None, None)
+                if record_resource_usage is not None:
+                    record_resource_usage("preprocessing", preprocessing_timer.elapsed_seconds)
+                return None
             if getattr(self.arguments, 'split_mode', 'cross_validation') == 'provided':
                 _build_provided_split_folds(self, dataset_bundle)
+                preprocessing_timer.__exit__(None, None, None)
+                if record_resource_usage is not None:
+                    record_resource_usage("preprocessing", preprocessing_timer.elapsed_seconds)
                 return function(self, *args, **kwargs)
 
             if dataset_bundle.valid is not None or dataset_bundle.test is not None:
@@ -270,6 +452,15 @@ def StratifiedData(function):
             split_name, data_type, self.arguments.number_k_folds)
 
         try:
+            if getattr(self.arguments, 'dry_run_memory', False):
+                _log_array_memory("Loaded CSV X", self._data_loaded)
+                _log_array_memory("Loaded CSV y", self._data_loaded_labels)
+                logging.info("dry_run_memory enabled; skipping fold materialization and experiment execution.")
+                preprocessing_timer.__exit__(None, None, None)
+                if record_resource_usage is not None:
+                    record_resource_usage("preprocessing", preprocessing_timer.elapsed_seconds)
+                return None
+
             # Shuffle the data before performing stratified splitting
             shuffled_data, shuffled_labels = shuffle(self._data_loaded, self._data_loaded_labels, random_state=42)
 
@@ -326,36 +517,24 @@ def StratifiedData(function):
 
                  
 
-                # # Concatenate the data and labels for the shuffled dataset
-                # data_with_labels = numpy.column_stack((shuffled_data, shuffled_labels))
+                if getattr(self.arguments, "execution_mode", "normal") == "batches":
+                    logging.info("Batches mode: skipping intermediate fold CSV materialization.")
+                else:
+                    _save_data_to_csv(
+                        self.directory_output_data,
+                        self._data_loaded[train_index],
+                        self._data_loaded_labels[train_index],
+                        "data_training",
+                        fold
+                    )
 
-                # # Create a DataFrame for saving the shuffled dataset as CSV or XLS
-                # columns = [f"feature_{i}" for i in range(shuffled_data.shape[1])] + ["label"]
-                # data_frame = pandas.DataFrame(data_with_labels, columns=columns)
-
-                # # Save the shuffled data to CSV
-                # csv_filename = "{}/data_shuffled_dataset.csv".format(self.directory_output_data)
-                # data_frame.to_csv(csv_filename, index=False)
-
-                # Dentro do seu loop for fold:
-                # Save training data
-                _save_data_to_csv(
-                    self.directory_output_data,
-                    self._data_loaded[train_index],
-                    self._data_loaded_labels[train_index],
-                    "data_training",
-                    fold
-                )
- 
-
-                # Save validation data
-                _save_data_to_csv(
-                    self.directory_output_data,
-                    self._data_loaded[val_index],
-                    self._data_loaded_labels[val_index],
-                    "data_evaluation",
-                    fold
-                ) 
+                    _save_data_to_csv(
+                        self.directory_output_data,
+                        self._data_loaded[val_index],
+                        self._data_loaded_labels[val_index],
+                        "data_evaluation",
+                        fold
+                    )
 
                 # Shuffle the training and evaluation data
                 training_shuffled_data, training_shuffled_labels = shuffle(self._data_loaded[train_index],
@@ -396,9 +575,15 @@ def StratifiedData(function):
                          self.arguments.number_k_folds, split_name, end_time - start_time)
 
             # Call the original function passed as a decorator argument
+            preprocessing_timer.__exit__(None, None, None)
+            if record_resource_usage is not None:
+                record_resource_usage("preprocessing", preprocessing_timer.elapsed_seconds)
             return function(self, *args, **kwargs)
 
         except Exception as e:
+            preprocessing_timer.__exit__(*sys.exc_info())
+            if record_resource_usage is not None:
+                record_resource_usage("preprocessing", preprocessing_timer.elapsed_seconds)
             logging.error("An error occurred during fold processing: %s", str(e))
             raise  # Re-raise the exception after logging the error
 

@@ -35,7 +35,6 @@ try:
     import sys
     import json
     import numpy
-    import psutil
     import logging
     import pandas as pd 
      
@@ -76,6 +75,11 @@ try:
     from Engine.Metrics.Distance.HammingDistance import HammingDistance
     from Engine.Metrics.Distance.JaccardDistance import JaccardDistance
     from Engine.Metrics.Distance.PermutationTest import PermutationTest
+    from Engine.Utils.ResourceMonitor import Timer
+    from Engine.Utils.ResourceMonitor import log_resource_usage
+    from Engine.Utils.ResourceMonitor import get_current_memory_mb
+    from Engine.Utils.ResourceMonitor import psutil
+    from Engine.Utils.ResourceMonitor import NOT_AVAILABLE
 
 
 except ImportError as error:
@@ -134,6 +138,8 @@ class Metrics:
         """
         self._data_type = getattr(arguments, "data_type", "binary")
         self._target_type = getattr(arguments, "target_type", "auto")
+        self.arguments = arguments
+        self._resource_total_start_time = time.perf_counter()
 
         # Initialize dictionaries for binary metrics with their corresponding instances
         self._dictionary_binary_metrics = {
@@ -175,7 +181,7 @@ class Metrics:
 
         # Initialize the metrics dictionary based on the provided arguments
         self.__initialize_dictionary(arguments)
-        self._process = psutil.Process()
+        self._process = psutil.Process() if psutil is not None else None
 
     def __initialize_dictionary(self, arguments):
         """
@@ -259,6 +265,28 @@ class Metrics:
                 'Summary': {
                     metric: {'mean': NOT_APPLICABLE, 'std': NOT_APPLICABLE} for metric in self.list_sdv_metrics
                 }
+            },
+            "BatchClassifier": {
+                **{
+                    f'{fold}-Fold': {} for fold in range(1, arguments.number_k_folds + 1)
+                },
+                "Summary": {
+                    "note": (
+                        "normal and batches metrics can differ when different classifiers are configured; "
+                        "use matching subset classifiers when comparing modes."
+                    )
+                }
+            },
+            "ResourceUsage": {
+                "current_memory_mb_by_stage": {},
+                "peak_memory_mb_by_stage": {},
+                "elapsed_seconds_by_stage": {},
+                "total_elapsed_seconds": 0,
+                "batch_processing": {
+                    "largest_batch_processed": 0,
+                    "number_of_batches": 0,
+                    "effective_batch_size": getattr(arguments, "batch_size", NOT_AVAILABLE),
+                },
             }
 
         }
@@ -342,11 +370,12 @@ class Metrics:
 
     def monitoring_start_training(self):
         self._time_start_training = time.perf_counter_ns()
-        self._process_cpu_start = self._process.cpu_percent(interval=None)
-        self._process_mem_start = self._process.memory_info().rss / (1024 * 1024)  #   MB
-        self._system_cpu_start = self._process.cpu_percent(interval=None)
-        self._system_mem_start = psutil.virtual_memory().used / (1000**2) #MB
-        self._system_mem_start_perc = psutil.virtual_memory().percent
+        self._process_mem_start = get_current_memory_mb()
+        if psutil is not None:
+            self._process_cpu_start = self._process.cpu_percent(interval=None)
+            self._system_cpu_start = self._process.cpu_percent(interval=None)
+            self._system_mem_start = psutil.virtual_memory().used / (1000**2) #MB
+            self._system_mem_start_perc = psutil.virtual_memory().percent
 
 
 
@@ -364,12 +393,26 @@ class Metrics:
         duration_ns = self._time_end_generating - self._time_start_generating
         #self._dictionary_metrics["EfficiencyMetrics"][f'{fold+1}-Fold']['Time_generating_secs'] = duration.total_seconds()
 
+        if psutil is None:
+            self._dictionary_metrics["EfficiencyMetrics"][f'{fold+1}-Fold'].update({
+            'Time_generating_ms':  duration_ns / 1_000_000,
+            'Process_CPU_%': NOT_AVAILABLE,
+            'Process_Memory_MB': NOT_AVAILABLE,
+            'System_CPU_%': NOT_AVAILABLE,
+            'System_Memory_MB': NOT_AVAILABLE,
+            'System_Memory_%': NOT_AVAILABLE,
+            })
+            return
+
         # Uso de CPU (percentual médio durante a execução)
         cpu_usage = self._process.cpu_percent(interval=None) / psutil.cpu_count()
         
         # Uso de memória (diferença entre início e fim)
         process_mem_end = self._process.memory_info().rss / (1000**2)  # Em MB
-        process_mem_usage = process_mem_end - self._process_mem_start
+        if self._process_mem_start == NOT_AVAILABLE:
+            process_mem_usage = NOT_AVAILABLE
+        else:
+            process_mem_usage = process_mem_end - self._process_mem_start
 
         self._dictionary_metrics["EfficiencyMetrics"][f'{fold+1}-Fold'].update({
         'Time_generating_ms':  duration_ns / 1_000_000,
@@ -389,15 +432,76 @@ class Metrics:
         """
 
         try:
-            # Open the specified output file in write mode
-            with open(output_file_results, 'w') as json_file:
-                # Write the metrics dictionary to the JSON file
-                json.dump(self._dictionary_metrics, json_file, indent=4, cls=NumpyEncoder)
-                print(f"Dictionary successfully saved to {output_file_results}")
+            with Timer("saving") as timer:
+                with open(output_file_results, 'w') as json_file:
+                    json.dump(self._dictionary_metrics, json_file, indent=4, cls=NumpyEncoder)
+                    print(f"Dictionary successfully saved to {output_file_results}")
+            self.record_resource_usage("saving", timer.elapsed_seconds)
+            metrics_json_path = output_file_results.rsplit('/', 1)[0] + "/metrics.json"
+            if metrics_json_path != output_file_results:
+                with open(metrics_json_path, 'w') as json_file:
+                    json.dump(self._dictionary_metrics, json_file, indent=4, cls=NumpyEncoder)
 
         except Exception as e:
             # Print an error message if saving fails
             print(f"Error saving the dictionary: {e}")
+
+    def record_resource_usage(self, stage_name, elapsed_seconds=None):
+        stage_key = self._resource_stage_key(stage_name)
+        usage = log_resource_usage(stage_key)
+        resource_metrics = self._dictionary_metrics.setdefault("ResourceUsage", {})
+        resource_metrics.setdefault("current_memory_mb_by_stage", {})[stage_key] = usage["current_memory_mb"]
+        resource_metrics.setdefault("peak_memory_mb_by_stage", {})[stage_key] = usage["peak_memory_mb"]
+        if elapsed_seconds is not None:
+            resource_metrics.setdefault("elapsed_seconds_by_stage", {})[stage_key] = round(float(elapsed_seconds), 6)
+        resource_metrics["total_elapsed_seconds"] = round(
+            time.perf_counter() - getattr(self, "_resource_total_start_time", time.perf_counter()),
+            6,
+        )
+
+    def resource_timer(self, stage_name):
+        owner = self
+
+        class _ResourceTimer:
+            def __enter__(self):
+                self._timer = Timer(stage_name)
+                self._timer.__enter__()
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                self._timer.__exit__(exc_type, exc_value, traceback)
+                owner.record_resource_usage(stage_name, self._timer.elapsed_seconds)
+                return False
+
+        return _ResourceTimer()
+
+    def record_batch_processed(self, batch_size):
+        resource_metrics = self._dictionary_metrics.setdefault("ResourceUsage", {})
+        batch_metrics = resource_metrics.setdefault("batch_processing", {
+            "largest_batch_processed": 0,
+            "number_of_batches": 0,
+            "effective_batch_size": getattr(self.arguments, "batch_size", NOT_AVAILABLE),
+        })
+        batch_size = int(batch_size)
+        batch_metrics["largest_batch_processed"] = max(int(batch_metrics.get("largest_batch_processed", 0)), batch_size)
+        batch_metrics["number_of_batches"] = int(batch_metrics.get("number_of_batches", 0)) + 1
+        batch_metrics["effective_batch_size"] = getattr(self.arguments, "batch_size", NOT_AVAILABLE)
+
+    def _resource_stage_key(self, stage_name):
+        fold_number = getattr(self, "fold_number", None)
+        if fold_number is None:
+            return stage_name
+        if stage_name in {"training", "generation", "evaluation"}:
+            return f"{stage_name}_fold_{fold_number + 1}"
+        return stage_name
+
+    def record_batch_classifier_metadata(self, evaluation_type, classifier, fold, metadata):
+        fold_key = f"{fold}-Fold"
+        block = self._dictionary_metrics.setdefault("BatchClassifier", {}).setdefault(fold_key, {})
+        block[evaluation_type] = {
+            "classifier": classifier,
+            **metadata,
+        }
 
     def update_mean_std_fold(self):
         """Updates the mean and standard deviation of evaluation metrics across all folds.
