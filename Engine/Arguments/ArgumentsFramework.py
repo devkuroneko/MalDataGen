@@ -160,6 +160,10 @@ def add_argument_framework():
                               'SGDClassifier remains available for low-RAM checks but can severely underestimate '
                               'AppClassNet synthetic quality.'))
 
+    parser.add_argument('--evaluation_mode', type=str, default="both",
+                        choices=["none", "tr_ts", "ts_tr", "both"],
+                        help='Synthetic evaluation mode: none, TR-TS, TS-TR, or both. Default: both.')
+
     parser.add_argument('--batch_classifier_subset_size', type=int, default=100000,
                         help='Maximum rows loaded for *_subset batch classifiers. Default: 100000.')
 
@@ -168,6 +172,12 @@ def add_argument_framework():
 
     parser.add_argument('--test_samples_per_class', type=int, default=None,
                         help='Per-class evaluation cap used by batch evaluators when applicable.')
+
+    parser.add_argument('--synthetic_train_samples_per_class', type=int, default=None,
+                        help='Explicit per-class synthetic quota used to train TS-TR classifiers.')
+
+    parser.add_argument('--synthetic_test_samples_per_class', type=int, default=None,
+                        help='Explicit per-class synthetic cap used to evaluate TR-TS classifiers.')
 
     parser.add_argument('--n_estimators', type=int, default=None,
                         help='Estimator count for extra_trees_subset and random_forest_light.')

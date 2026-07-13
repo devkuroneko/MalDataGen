@@ -125,6 +125,11 @@ def _configure_classifier_arguments(parsed_arguments):
     if int(getattr(parsed_arguments, "classes_per_group", 10)) <= 0:
         raise ValueError("--classes_per_group must be a positive integer.")
 
+    if getattr(parsed_arguments, "synthetic_train_samples_per_class", None) is not None:
+        parsed_arguments.train_samples_per_class = parsed_arguments.synthetic_train_samples_per_class
+    if getattr(parsed_arguments, "synthetic_test_samples_per_class", None) is not None:
+        parsed_arguments.test_samples_per_class = parsed_arguments.synthetic_test_samples_per_class
+
     if getattr(parsed_arguments, "execution_mode", "normal") == "batches":
         if getattr(parsed_arguments, "batch_classifier", None):
             parsed_arguments.eval_classifier = parsed_arguments.batch_classifier
@@ -135,6 +140,39 @@ def _configure_classifier_arguments(parsed_arguments):
     normal_classifier = getattr(parsed_arguments, "normal_classifier", None)
     if normal_classifier:
         parsed_arguments.classifier = [NORMAL_CLASSIFIER_NAME_MAP[normal_classifier]]
+    return parsed_arguments
+
+
+def _option_was_provided(option_name):
+    prefix = f"{option_name}="
+    return any(argument == option_name or argument.startswith(prefix) for argument in sys.argv[1:])
+
+
+def _normalize_preprocessing_arguments(parsed_arguments):
+    """Translate legacy scaler aliases without changing legacy CSV defaults."""
+    if _option_was_provided("--scaler"):
+        logging.warning(
+            "--scaler is a legacy argument. Prefer --classifier_transform or --generator_transform to avoid "
+            "applying the same scaler to unrelated pipeline stages."
+        )
+
+    if getattr(parsed_arguments, "source_profile", "legacy_csv") != "appclassnet_top200":
+        return parsed_arguments
+
+    if (
+        getattr(parsed_arguments, "scaler", "none") == "none"
+        and not _option_was_provided("--feature_transform")
+    ):
+        parsed_arguments.feature_transform = "preserve"
+    elif (
+        getattr(parsed_arguments, "scaler", "none") in {"minmax", "standard"}
+        and not _option_was_provided("--feature_transform")
+    ):
+        parsed_arguments.feature_transform = parsed_arguments.scaler
+
+    if not getattr(parsed_arguments, "inverse_transform_synthetic", False):
+        parsed_arguments.inverse_transform_synthetic = True
+
     return parsed_arguments
 
 
@@ -209,6 +247,7 @@ class Arguments(DirectoryManager):
         self.arguments = add_argument_support_vector_machine(self.arguments)
 
         self.arguments = self.arguments.parse_args()
+        self.arguments = _normalize_preprocessing_arguments(self.arguments)
         self.arguments = _configure_classifier_arguments(self.arguments)
         self.arguments = validate_data_load_arguments(self.arguments)
         self._create_directories(base_directory=self.arguments.output_dir)

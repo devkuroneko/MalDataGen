@@ -44,6 +44,7 @@ class NpyXYLoader:
             feature_names=None,
             target_name="label",
             remap_labels_to_zero_based=False,
+            source_profile="unknown",
             metadata=None):
         self.train_x_path = self._normalize_path(train_x_path, "train_x_.npy")
         self.train_y_path = self._normalize_path(train_y_path, "train_y_path")
@@ -59,6 +60,7 @@ class NpyXYLoader:
         self.feature_names = list(feature_names) if feature_names is not None else None
         self.target_name = target_name
         self.remap_labels_to_zero_based = remap_labels_to_zero_based
+        self.source_profile = source_profile
         self.metadata = dict(metadata or {})
         self.label_mapping_original_to_zero_based = None
 
@@ -110,6 +112,15 @@ class NpyXYLoader:
             num_classes=num_classes,
             class_labels=class_labels,
             source_format="npy_xy",
+            source_profile=self.source_profile,
+            source_feature_range=self._source_feature_range(),
+            current_feature_range=self._source_feature_range(),
+            already_normalized=self.source_profile == "appclassnet_top200",
+            normalization_range=self._source_feature_range() if self.source_profile == "appclassnet_top200" else None,
+            transform_history=[],
+            transform_id=None,
+            feature_dtype=str(train.X.dtype),
+            data_space="source",
         )
 
         metadata = {
@@ -126,6 +137,11 @@ class NpyXYLoader:
             schema=schema,
             metadata=metadata,
         )
+
+    def _source_feature_range(self):
+        if self.source_profile == "appclassnet_top200":
+            return -0.5, 0.5
+        return None
 
     def _load_split(self, split_name: str, x_path: Path, y_path: Path) -> SplitData:
         x_values = self._load_array(x_path)

@@ -33,6 +33,7 @@ __credits__ = ['Synthetic Ocean AI']
 
 try:
     import sys
+    import json
     import numpy
     import pandas
     import logging
@@ -422,6 +423,28 @@ class CSVDataProcessor:
             output_file_path = f"{directory_name}/DataOutput_K_fold_{fold_number}_{generator_name}.txt"
             data_file_output.to_csv(output_file_path, index=False)
             logging.info(f"Data successfully saved to {output_file_path}.")
+            metadata = getattr(self, "_current_synthetic_metadata", None)
+            if metadata is None:
+                metadata = {
+                    "data_space": "source",
+                    "transform_id": None,
+                    "transform_history": [],
+                }
+            metadata_path = f"{output_file_path}.space.json"
+            with open(metadata_path, "w", encoding="utf-8") as metadata_file:
+                json.dump(
+                    {
+                        "synthetic_path": output_file_path,
+                        "data_space": metadata.get("data_space", "source"),
+                        "transform_id": metadata.get("transform_id"),
+                        "transform_history": metadata.get("transform_history", []),
+                    },
+                    metadata_file,
+                    indent=2,
+                    sort_keys=True,
+                )
+                metadata_file.write("\n")
+            logging.info("Synthetic data space metadata saved to %s.", metadata_path)
 
         except Exception as e:
             logging.error(f"Error saving data to CSV: {str(e)}")

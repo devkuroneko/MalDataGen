@@ -41,6 +41,7 @@ try:
     from Engine.Classifiers.BatchClassifiers import iter_synthetic_labeled_batches
     from Engine.Classifiers.BatchClassifiers import predict_array_batches
     from Engine.Classifiers.BatchClassifiers import train_batch_classifier
+    from Engine.Preprocessing.FeatureTransformManager import ScaleGuard
     from sklearn.utils import shuffle
 except ImportError as error:
     print(error)
@@ -94,6 +95,16 @@ class TsTr:
 
         arguments = getattr(self, "arguments", None)
         if getattr(arguments, "execution_mode", "normal") == "batches":
+            if hasattr(synthetic_data, "manifest"):
+                ScaleGuard.validate_compatible_metadata(
+                    ScaleGuard.describe(dictionary_data['x_evaluation_real'], data_space="source"),
+                    {
+                        "data_space": synthetic_data.manifest.get("data_space", "source"),
+                        "transform_id": synthetic_data.manifest.get("transform_id"),
+                        "transform_history": synthetic_data.manifest.get("transform_history", []),
+                    },
+                    context="TS-TR",
+                )
             if not getattr(self, '_labels_are_discrete', True):
                 reason = "TS-TR predictive evaluation skipped because labels are not discrete."
                 logging.warning("\t\t%s", reason)
@@ -167,6 +178,25 @@ class TsTr:
             data.extend(generated_samples)
 
         if getattr(self, '_labels_are_discrete', True) and data:
+            synthetic_array = numpy.asarray(data, dtype=numpy.float32)
+            synthetic_metadata = getattr(self, "_current_synthetic_metadata", None) or {
+                "data_space": "source",
+                "transform_id": None,
+                "transform_history": [],
+            }
+            real_metadata = getattr(self, "_current_real_source_metadata", None) or ScaleGuard.describe(
+                dictionary_data['x_evaluation_real'],
+                data_space="source",
+                transform_id=None,
+                transform_history=[],
+            )
+            ScaleGuard.validate_before_evaluation(
+                dictionary_data['x_evaluation_real'],
+                synthetic_array,
+                real_metadata,
+                synthetic_metadata,
+                context="TS-TR",
+            )
             shuffled_data, shuffled_labels = shuffle(data, numpy.array(labels), random_state=42)
             # Train classifiers using the generated synthetic data and corresponding labels
             classifiers = self.get_trained_classifiers(shuffled_data, shuffled_labels, numpy.float32, self.get_number_columns())
@@ -197,7 +227,7 @@ class TsTr:
         n_real, m_real = data_real.shape
         logging.info(f"x_real_eva size:{data_real.size} shape: {n_real}, {m_real}")
 
-        data_synthetic = numpy.array(data)
+        data_synthetic = numpy.asarray(data, dtype=numpy.float32)
         if data_synthetic.size == 0:
             reason = "R-S distance evaluation skipped because no synthetic samples were generated."
             logging.warning("\t\t%s", reason)

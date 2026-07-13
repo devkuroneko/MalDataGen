@@ -24,7 +24,10 @@ class SyntheticBatchWriter:
             seed,
             model_name,
             execution_mode,
-            output_format="npy_batches"):
+            output_format="npy_batches",
+            data_space="source",
+            transform_id=None,
+            transform_history=None):
         self.root_dir = Path(root_dir)
         self.num_classes = int(num_classes)
         self.num_features = int(num_features)
@@ -32,6 +35,9 @@ class SyntheticBatchWriter:
         self.model_name = model_name
         self.execution_mode = execution_mode
         self.output_format = output_format
+        self.data_space = data_space
+        self.transform_id = transform_id
+        self.transform_history = list(transform_history or [])
         self.batch_dir = self.root_dir / "synthetic_batches"
         self.batch_dir.mkdir(parents=True, exist_ok=True)
         self._single_npy_path = self.batch_dir / "synthetic.npy"
@@ -47,6 +53,9 @@ class SyntheticBatchWriter:
             "model": self.model_name,
             "execution_mode": self.execution_mode,
             "format": self.output_format,
+            "data_space": self.data_space,
+            "transform_id": self.transform_id,
+            "transform_history": self.transform_history,
         }
 
     def initialize_single_npy(self, total_rows, dtype=numpy.float32):

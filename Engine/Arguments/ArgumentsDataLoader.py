@@ -50,6 +50,11 @@ DEFAULT_EVAL_BATCH_SIZE = 16384
 DEFAULT_GENERATION_BATCH_SIZE = 8192
 DEFAULT_SAVE_SYNTHETIC_FORMAT = 'legacy'
 DEFAULT_SCALER = 'none'
+DEFAULT_SOURCE_PROFILE = 'legacy_csv'
+DEFAULT_FEATURE_TRANSFORM = 'preserve'
+DEFAULT_GENERATOR_TRANSFORM = 'preserve'
+DEFAULT_CLASSIFIER_TRANSFORM = 'preserve'
+DEFAULT_EVALUATION_SPACE = 'source'
 DEFAULT_MIN_SAMPLES_PER_CLASS_REQUIRED = 1
 DEFAULT_LEGACY_NUMBER_SAMPLES_PER_CLASS = "1:256,2:256"
 MODEL_CLASS_COUNT_ARGUMENTS = (
@@ -214,6 +219,35 @@ def add_argument_data_load(parser):
                         choices=['none', 'minmax', 'standard'],
                         help=("Feature scaler. Default 'none' preserves the legacy CSV behavior; AppClassNet "
                               "runner defaults to minmax and passes preprocessed arrays to the pipeline."))
+
+    parser.add_argument('--source_profile', type=str, default=DEFAULT_SOURCE_PROFILE,
+                        choices=['legacy_csv', 'appclassnet_top200', 'custom'],
+                        help='Dataset preprocessing profile. Default legacy_csv preserves the original CSV flow.')
+
+    parser.add_argument('--feature_transform', type=str, default=DEFAULT_FEATURE_TRANSFORM,
+                        choices=['preserve', 'auto', 'minmax', 'standard'],
+                        help='Centralized feature transform applied before pipeline ingestion.')
+
+    parser.add_argument('--generator_transform', type=str, default=DEFAULT_GENERATOR_TRANSFORM,
+                        choices=['preserve', 'auto', 'minmax', 'standard'],
+                        help='Internal generator input transform. Synthetic data can be inverse-transformed after generation.')
+
+    parser.add_argument('--classifier_transform', type=str, default=DEFAULT_CLASSIFIER_TRANSFORM,
+                        choices=['preserve', 'auto', 'minmax', 'standard'],
+                        help='Classifier input transform. Tree classifiers should normally preserve AppClassNet scale.')
+
+    parser.add_argument('--evaluation_space', type=str, default=DEFAULT_EVALUATION_SPACE,
+                        choices=['source', 'transformed'],
+                        help='Feature space used by evaluations.')
+
+    parser.add_argument('--allow_double_transform', action='store_true', default=False,
+                        help='Allow applying an equivalent feature transform more than once.')
+
+    parser.add_argument('--allow_scaler_refit', action='store_true', default=False,
+                        help='Allow refitting a previously fitted preprocessing scaler.')
+
+    parser.add_argument('--inverse_transform_synthetic', action='store_true', default=False,
+                        help='Inverse-transform synthetic samples back to source space after generator-space generation.')
 
     parser.add_argument('--num_classes', type=int, default=DEFAULT_NUM_CLASSES,
                         help='Optional class-domain size for new loaders, for example --num_classes 200.')

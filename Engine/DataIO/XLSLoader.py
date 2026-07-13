@@ -36,8 +36,6 @@ try:
     import pandas
     import logging
 
-    from sklearn.preprocessing import MinMaxScaler
-
 except ImportError as error:
     print(error)
     sys.exit(-1)
@@ -45,7 +43,7 @@ except ImportError as error:
 
 class XLSDataProcessor:
     """
-    A class to process and manage XLS data files, including loading, saving, normalization, and handling
+    A class to process and manage XLS data files, including loading, saving, and handling
     of dataset attributes such as labels and features. This class provides functionalities for managing
     dataset preprocessing steps such as cleaning, filtering, and handling missing data, as well as scaling
     features for machine learning tasks.
@@ -77,10 +75,10 @@ class XLSDataProcessor:
             The header of the processed dataset (features + label column).
         @_data_original_header (list):
             The original column headers from the input XLS file.
-        @_data_scaler (MinMaxScaler):
-            A MinMaxScaler used for normalizing the feature data between 0 and 1.
+        @_data_scaler:
+            Always None. Loaders do not apply feature scaling.
         @_scaler_params (tuple):
-            Stores the parameters of the scaler, such as the minimum and maximum values used for normalization.
+            Always None. Feature transforms are handled by Engine.Preprocessing.
         @list_folds (list):
             A list of dataset folds used for cross-validation during training.
 
@@ -122,7 +120,7 @@ class XLSDataProcessor:
         self._data_loaded_labels = None
         self._data_loaded_header = None
         self._data_original_header = None
-        self._data_scaler = MinMaxScaler(feature_range=(0, 1))
+        self._data_scaler = None
         self._scaler_params = None
         self.list_folds = []
 
@@ -137,7 +135,7 @@ class XLSDataProcessor:
         3. Replaces infinite values with NaN and drops missing values.
         4. Extracts and optionally limits the number of samples.
         5. Selects specific columns based on user-defined parameters.
-        6. Extracts labels and normalizes data.
+        6. Extracts labels and preserves feature values.
 
         Raises:
             FileNotFoundError: If the file is not found at the given path.
@@ -205,7 +203,7 @@ class XLSDataProcessor:
         self._data_loaded = data_file.values.astype(numpy.float32)
         self._data_loaded_header = data_file.columns.tolist() + [self._data_load_label_column]
 
-        # Normalize the data
+        # Loaders do not transform features.
         self._normalize_data()
 
     def save_xls(self, generated_data, fold_number, directory_name, generator_name):
@@ -242,10 +240,7 @@ class XLSDataProcessor:
             logging.error(f"Error creating DataFrame: {str(e)}")
             raise
 
-        # Apply inverse scaling if scaler parameters exist
-        if self._scaler_params:
-            data_min, data_max = self._scaler_params
-            data_file_output.iloc[:, :-1] = self._data_scaler.inverse_transform(data_file_output.iloc[:, :-1])
+        logging.info("No normalization reversion applied; XLS loader preserves feature values.")
 
         try:
             # Construct output file path
@@ -259,16 +254,11 @@ class XLSDataProcessor:
 
     def _normalize_data(self):
         """
-        Normalizes the data between 0 and 1 using MinMaxScaler.
+        Preserve loaded feature values. Feature transforms are centralized.
         """
-        self._data_loaded = numpy.array(self._data_scaler.fit_transform(self._data_loaded), dtype=numpy.float32)
-
-        # Store the scaler parameters for later use
-
-        self._scaler_params = (self._data_scaler.data_min_, self._data_scaler.data_max_)
-
-        # Logging to inform that the data has been normalized
-        logging.info("Data normalized between 0 and 1.")
+        self._data_loaded = numpy.asarray(self._data_loaded, dtype=numpy.float32)
+        self._scaler_params = None
+        logging.info("XLS feature normalization disabled; raw feature values were preserved.")
 
 
     def get_number_columns(self):

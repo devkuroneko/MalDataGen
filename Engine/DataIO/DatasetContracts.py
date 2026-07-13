@@ -23,6 +23,8 @@ except ImportError as error:  # pragma: no cover - mirrors project import style
 FEATURE_TYPES = {"binary", "continuous", "mixed", "unknown"}
 TARGET_TYPES = {"binary", "multiclass", "regression", "none", "auto"}
 SOURCE_FORMATS = {"csv", "npy_xy", "unknown"}
+SOURCE_PROFILES = {"legacy_csv", "appclassnet_top200", "custom", "unknown"}
+DATA_SPACES = {"source", "generator", "classifier", "unknown", "transformed"}
 
 
 def _validate_choice(value: str, allowed_values: set[str], field_name: str) -> str:
@@ -53,6 +55,15 @@ class DatasetSchema:
     num_classes: int | None = None
     class_labels: Iterable[Any] | None = None
     source_format: str = "unknown"
+    source_profile: str = "unknown"
+    source_feature_range: tuple[float, float] | None = None
+    current_feature_range: tuple[float, float] | None = None
+    already_normalized: bool = False
+    normalization_range: tuple[float, float] | None = None
+    transform_history: list[dict[str, Any]] = field(default_factory=list)
+    transform_id: str | None = None
+    feature_dtype: str | None = None
+    data_space: str = "unknown"
 
     def __post_init__(self) -> None:
         if not isinstance(self.feature_names, list):
@@ -67,7 +78,13 @@ class DatasetSchema:
         self.feature_type = _validate_choice(self.feature_type, FEATURE_TYPES, "feature_type")
         self.target_type = _validate_choice(self.target_type, TARGET_TYPES, "target_type")
         self.source_format = _validate_choice(self.source_format, SOURCE_FORMATS, "source_format")
+        self.source_profile = _validate_choice(self.source_profile, SOURCE_PROFILES, "source_profile")
+        self.data_space = _validate_choice(self.data_space, DATA_SPACES, "data_space")
         self.class_labels = _normalize_optional_labels(self.class_labels)
+        self.source_feature_range = self._normalize_range(self.source_feature_range, "source_feature_range")
+        self.current_feature_range = self._normalize_range(self.current_feature_range, "current_feature_range")
+        self.normalization_range = self._normalize_range(self.normalization_range, "normalization_range")
+        self.transform_history = list(self.transform_history or [])
 
         if self.target_type == "none":
             self.target_name = None
@@ -83,6 +100,14 @@ class DatasetSchema:
                     raise ValueError("class_labels length must match num_classes when both are provided.")
         elif self.num_classes is not None and (not isinstance(self.num_classes, int) or self.num_classes < 1):
             raise ValueError("num_classes must be a positive integer when provided.")
+
+    @staticmethod
+    def _normalize_range(value, field_name):
+        if value is None:
+            return None
+        if len(value) != 2:
+            raise ValueError(f"{field_name} must contain exactly two values.")
+        return float(value[0]), float(value[1])
 
 
 @dataclass(slots=True)

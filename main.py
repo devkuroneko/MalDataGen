@@ -64,6 +64,9 @@ try:
     from Engine.DataIO.SyntheticLabelAudit import audit_synthetic_label_generation
     from Engine.DataIO.SyntheticSanityChecks import run_synthetic_sanity_checks
     from Engine.Utils.ResourceMonitor import get_current_memory_mb
+    from Engine.Preprocessing.FeatureTransformManager import FeatureTransformPolicy
+    from Engine.Preprocessing.FeatureTransformManager import ModelInputAdapter
+    from Engine.Preprocessing.FeatureTransformManager import ScaleGuard
 
     from Engine.Classifiers.Classifiers import Classifiers
 
@@ -102,6 +105,27 @@ PARTITIONED_GENERATION_SUPPORTED_MODELS = {
     "quantized",
     "denoising_diffusion",
 }
+
+
+def run_synthetic_evaluation_modes(owner, dictionary_data, evaluation_synthetic):
+    evaluation_mode = getattr(owner.arguments, "evaluation_mode", "both")
+    owner._guard_current_evaluation_space(dictionary_data, evaluation_synthetic)
+    if evaluation_mode in {"tr_ts", "both"}:
+        owner.evaluation_TR_TS(dictionary_data, evaluation_synthetic)
+    else:
+        owner.mark_evaluation_classifiers_not_applicable(
+            "TR-TS",
+            owner.fold_number + 1,
+            f"TR-TS skipped because evaluation_mode={evaluation_mode}.",
+        )
+    if evaluation_mode in {"ts_tr", "both"}:
+        owner.evaluation_TS_TR(dictionary_data, evaluation_synthetic)
+    else:
+        owner.mark_evaluation_classifiers_not_applicable(
+            "TS-TR",
+            owner.fold_number + 1,
+            f"TS-TR skipped because evaluation_mode={evaluation_mode}.",
+        )
 
 
 
@@ -344,6 +368,10 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
         self._manager.configure()
 
         self._sdv = None 
+        self._model_input_adapter = None
+        self._current_real_source_metadata = None
+        self._current_synthetic_metadata = None
+        self._current_evaluation_source_x = None
 
     @import_metrics
     @import_classifiers
@@ -401,6 +429,24 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                 # print("number_samples_per_class", number_samples_per_class)
                 
             
+                self._model_input_adapter = self._build_model_input_adapter()
+                self._model_input_adapter.fit_generator(dictionary_data['x_training_real'])
+                x_training_for_generator = self._model_input_adapter.transform_generator_input(
+                    dictionary_data['x_training_real'],
+                    split_name="train",
+                )
+                x_evaluation_for_generator = self._model_input_adapter.transform_generator_input(
+                    dictionary_data['x_evaluation_real'],
+                    split_name="valid",
+                )
+                self._current_real_source_metadata = ScaleGuard.describe(
+                    dictionary_data['x_evaluation_real'],
+                    data_space="source",
+                    transform_id=None,
+                    transform_history=[],
+                )
+                self._current_evaluation_source_x = dictionary_data['x_evaluation_real']
+
                 if self._uses_partitioned_generation():
                     logging.info(
                         "Skipping global generator training because generation_strategy=%s trains sub-generators.",
@@ -417,7 +463,7 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                 else:
                     # Create the model and make predictions using the training data
                     with self.resource_timer("training"):
-                        self.train_model(dictionary_data['x_training_real'],
+                        self.train_model(x_training_for_generator,
                                          dictionary_data['y_training_real'],
                                          monitor_path, fold)
                 
@@ -425,9 +471,9 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
 
                 with self.resource_timer("generation"):
                     evaluation_synthetic = self.synthesize_data(
-                                                  dictionary_data['x_evaluation_real'],
+                                                  x_evaluation_for_generator,
                                                   dictionary_data['y_evaluation_real'],
-                                                  dictionary_data['x_training_real'],
+                                                  x_training_for_generator,
                                                   dictionary_data['y_training_real'],
                                                   monitor_path,
                                                   fold,
@@ -451,8 +497,7 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                         logging.warning(reason)
                         self.mark_fold_not_applicable(self.fold_number + 1, reason)
                     else:
-                        self.evaluation_TR_TS(dictionary_data, evaluation_synthetic)
-                        self.evaluation_TS_TR(dictionary_data, evaluation_synthetic)
+                        run_synthetic_evaluation_modes(self, dictionary_data, evaluation_synthetic)
                 
                 #self.evaluation_TR_TR(dictionary_data)
                 # self.calculate_sdv_metrics(dictionary_data, fold)
@@ -552,6 +597,45 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
             getattr(self.arguments, "execution_mode", "normal") == "batches"
             and getattr(self.arguments, "generation_strategy", "single_conditional")
             in {"per_class", "grouped_classes"}
+        )
+
+    def _build_model_input_adapter(self):
+        source_profile = getattr(self.arguments, "source_profile", "legacy_csv")
+        policy = FeatureTransformPolicy.for_profile(
+            source_profile,
+            feature_transform=getattr(self.arguments, "feature_transform", None),
+            generator_transform=getattr(self.arguments, "generator_transform", None),
+            classifier_transform=getattr(self.arguments, "classifier_transform", None),
+            evaluation_space=getattr(self.arguments, "evaluation_space", None),
+            allow_refit=getattr(self.arguments, "allow_scaler_refit", False) or source_profile == "legacy_csv",
+            allow_double_transform=getattr(self.arguments, "allow_double_transform", False) or source_profile == "legacy_csv",
+            inverse_transform_synthetic=getattr(self.arguments, "inverse_transform_synthetic", False),
+        )
+        return ModelInputAdapter(policy)
+
+    def _guard_current_evaluation_space(self, dictionary_data, synthetic_data):
+        if hasattr(synthetic_data, "iter_batches"):
+            return
+        if not synthetic_data:
+            return
+        synthetic_values = numpy.vstack([
+            numpy.asarray(values, dtype=numpy.float32)
+            for values in synthetic_data.values()
+            if len(values)
+        ])
+        if synthetic_values.size == 0:
+            return
+        synthetic_metadata = self._current_synthetic_metadata or {
+            "data_space": "source",
+            "transform_id": None,
+            "transform_history": [],
+        }
+        ScaleGuard.validate_before_evaluation(
+            dictionary_data['x_evaluation_real'],
+            synthetic_values,
+            self._current_real_source_metadata,
+            synthetic_metadata,
+            context="TR-TS/TS-TR",
         )
 
     def _record_generation_strategy_metadata(self, fold, metadata):
@@ -864,6 +948,20 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
             # Completion log for data generation process
             logging.info("Data generation completed successfully for model type: %s", self.arguments.model_type)
 
+            if self._model_input_adapter is not None:
+                self.data_generated = self._model_input_adapter.transform_synthetic_collection_to_source(
+                    self.data_generated
+                )
+                self._current_synthetic_metadata = {
+                    "data_space": self._model_input_adapter.synthetic_space_after_generation(),
+                    "transform_id": (
+                        self._model_input_adapter.generator_manager.transform_id
+                        if self._model_input_adapter.synthetic_space_after_generation() != "source"
+                        else None
+                    ),
+                    "transform_history": self._model_input_adapter.generator_manager.transform_history,
+                }
+
             audit_path, _ = audit_synthetic_label_generation(
                 self.data_generated,
                 number_samples_per_class,
@@ -876,7 +974,7 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
             logging.info("Synthetic label generation audit passed: %s", audit_path)
 
             sanity_path, _ = run_synthetic_sanity_checks(
-                x_real_samples,
+                self._current_evaluation_source_x if self._current_evaluation_source_x is not None else x_real_samples,
                 y_real_samples,
                 self.data_generated,
                 number_classes=number_samples_per_class["number_classes"],
@@ -933,6 +1031,20 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                 model_name=self.arguments.model_type,
                 execution_mode=getattr(self.arguments, "execution_mode", "normal"),
                 output_format=output_format,
+                data_space=(
+                    self._model_input_adapter.synthetic_space_after_generation()
+                    if self._model_input_adapter is not None else "source"
+                ),
+                transform_id=(
+                    self._model_input_adapter.generator_manager.transform_id
+                    if self._model_input_adapter is not None
+                    and self._model_input_adapter.synthetic_space_after_generation() != "source"
+                    else None
+                ),
+                transform_history=(
+                    self._model_input_adapter.generator_manager.transform_history
+                    if self._model_input_adapter is not None else []
+                ),
             )
             if output_format == "single_npy":
                 writer.initialize_single_npy(sum(number_samples_per_class["classes"].values()))
@@ -1006,6 +1118,8 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                                 "generation_batch_size": int(generation_batch_size),
                             }
                             generated_batch = generator.get_samples(batch_plan)[int(label_class)]
+                            if self._model_input_adapter is not None:
+                                generated_batch = self._model_input_adapter.inverse_synthetic_batch(generated_batch)
                             writer.write_batch(int(label_class), batch_index, generated_batch)
                             audit.record(
                                 requested_class=int(label_class),
@@ -1040,7 +1154,7 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
             audit_path, _ = audit.finalize()
             logging.info("Synthetic label generation audit passed: %s", audit_path)
             sanity_path, _ = run_synthetic_sanity_checks(
-                x_evaluation_real,
+                self._current_evaluation_source_x if self._current_evaluation_source_x is not None else x_evaluation_real,
                 y_evaluation_real,
                 reader,
                 number_classes=number_samples_per_class["number_classes"],
@@ -1107,6 +1221,20 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                 model_name=self.arguments.model_type,
                 execution_mode=getattr(self.arguments, "execution_mode", "normal"),
                 output_format=output_format,
+                data_space=(
+                    self._model_input_adapter.synthetic_space_after_generation()
+                    if self._model_input_adapter is not None else "source"
+                ),
+                transform_id=(
+                    self._model_input_adapter.generator_manager.transform_id
+                    if self._model_input_adapter is not None
+                    and self._model_input_adapter.synthetic_space_after_generation() != "source"
+                    else None
+                ),
+                transform_history=(
+                    self._model_input_adapter.generator_manager.transform_history
+                    if self._model_input_adapter is not None else []
+                ),
             )
             if output_format == "single_npy":
                 writer.initialize_single_npy(sum(number_samples_per_class["classes"].values()))
@@ -1129,6 +1257,8 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                     batch_plan["classes"] = {int(label_class): int(batch_count)}
                     batch_plan["generation_batch_size"] = int(generation_batch_size)
                     generated_batch = generator.get_samples(batch_plan)[int(label_class)]
+                    if self._model_input_adapter is not None:
+                        generated_batch = self._model_input_adapter.inverse_synthetic_batch(generated_batch)
                     writer.write_batch(int(label_class), batch_index, generated_batch)
                     audit.record(
                         requested_class=int(label_class),
@@ -1151,7 +1281,7 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
             audit_path, _ = audit.finalize()
             logging.info("Synthetic label generation audit passed: %s", audit_path)
             sanity_path, _ = run_synthetic_sanity_checks(
-                x_real_samples,
+                self._current_evaluation_source_x if self._current_evaluation_source_x is not None else x_real_samples,
                 y_real_samples,
                 reader,
                 number_classes=number_samples_per_class["number_classes"],

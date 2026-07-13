@@ -276,6 +276,7 @@ def load_dataset_from_args(arguments, owner=None):
             feature_type=_feature_type_for_npy(arguments),
             num_classes=getattr(arguments, 'num_classes', None),
             remap_labels_to_zero_based=getattr(arguments, 'remap_labels_to_zero_based', False),
+            source_profile=getattr(arguments, 'source_profile', 'unknown'),
         )
         bundle = loader.load()
         _log_bundle_summary(bundle)

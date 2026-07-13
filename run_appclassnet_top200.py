@@ -21,6 +21,10 @@ import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+from Engine.Preprocessing.FeatureTransformManager import FeatureTransformManager
+from Engine.Preprocessing.FeatureTransformManager import FeatureTransformPolicy
+from Engine.Preprocessing.FeatureTransformManager import TransformManifest
+
 
 DEFAULT_VERBOSITY_LEVEL = logging.INFO
 DEFAULT_NUM_EPOCHS = 300
@@ -35,7 +39,7 @@ DEFAULT_EVAL_BATCH_SIZE = 16384
 DEFAULT_GENERATION_BATCH_SIZE = 8192
 DEFAULT_BASELINE_TRAIN_SAMPLES_PER_CLASS = 1000
 DEFAULT_BASELINE_TEST_SAMPLES_PER_CLASS = 500
-DEFAULT_SCALER = "minmax"
+DEFAULT_SCALER = "none"
 TIME_FORMAT = "%Y-%m-%d_%H:%M:%S"
 
 APPCLASSNET_NUM_CLASSES = 200
@@ -556,11 +560,61 @@ def selected_campaigns_use_sigmoid(campaigns_chosen):
 def validate_scaler_for_campaigns(parsed_arguments, campaigns_chosen):
     if parsed_arguments.scaler not in {"none", "minmax", "standard"}:
         raise ValueError(f"Unsupported scaler: {parsed_arguments.scaler}")
-    if selected_campaigns_use_sigmoid(campaigns_chosen) and parsed_arguments.scaler != "minmax":
+    if (
+        selected_campaigns_use_sigmoid(campaigns_chosen)
+        and parsed_arguments.generator_transform == "preserve"
+        and _option_was_provided("--generator_transform")
+    ):
         raise ValueError(
-            "Selected generator uses sigmoid output, which requires --scaler minmax for AppClassNet. "
-            f"Received --scaler {parsed_arguments.scaler}."
+            "Selected generator uses sigmoid output. Use --generator_transform minmax so only the generator "
+            "input/output path uses [0,1], then inverse-transform synthetic data before evaluation."
         )
+
+
+def _option_was_provided(option_name):
+    prefix = f"{option_name}="
+    return any(argument == option_name or argument.startswith(prefix) for argument in sys.argv[1:])
+
+
+def effective_evaluation_mode(parsed_arguments) -> str:
+    if getattr(parsed_arguments, "baseline_real_only", False):
+        return "none"
+    return getattr(parsed_arguments, "evaluation_mode", "both")
+
+
+def normalize_preprocessing_arguments(parsed_arguments, campaigns_chosen):
+    if _option_was_provided("--scaler"):
+        logging.warning(
+            "--scaler is a legacy argument. Prefer --classifier_transform or --generator_transform to avoid "
+            "applying the same scaler to unrelated pipeline stages."
+        )
+
+    if parsed_arguments.source_profile == "appclassnet_top200":
+        if parsed_arguments.scaler == "none" and not _option_was_provided("--feature_transform"):
+            parsed_arguments.feature_transform = "preserve"
+        elif parsed_arguments.scaler in {"minmax", "standard"} and not _option_was_provided("--feature_transform"):
+            parsed_arguments.feature_transform = parsed_arguments.scaler
+
+        if selected_campaigns_use_sigmoid(campaigns_chosen) and parsed_arguments.generator_transform == "auto":
+            logging.warning(
+                "Selected generator uses sigmoid output; resolving --generator_transform auto to minmax. "
+                "Synthetic output will be inverse-transformed before evaluation when enabled."
+            )
+            parsed_arguments.generator_transform = "minmax"
+
+    parsed_arguments._preprocessing_policy = FeatureTransformPolicy.for_profile(
+        parsed_arguments.source_profile,
+        feature_transform=parsed_arguments.feature_transform,
+        generator_transform=parsed_arguments.generator_transform,
+        classifier_transform=parsed_arguments.classifier_transform,
+        evaluation_space=parsed_arguments.evaluation_space,
+        allow_refit=parsed_arguments.allow_scaler_refit or parsed_arguments.source_profile == "legacy_csv",
+        allow_double_transform=(
+            parsed_arguments.allow_double_transform or parsed_arguments.source_profile == "legacy_csv"
+        ),
+        inverse_transform_synthetic=parsed_arguments.inverse_transform_synthetic,
+    )
+    return parsed_arguments
 
 
 def run_input_diagnostics(parsed_arguments, raw_root, output_dir, campaigns_chosen):
@@ -759,43 +813,15 @@ def _feature_min_max(numpy, values, chunk_size):
     return feature_min, feature_max
 
 
-def _fit_appclassnet_scaler(numpy, scaler_name, train_x_values, chunk_size):
-    if scaler_name == "none":
-        return None, *_feature_min_max(numpy, train_x_values, chunk_size)
-
-    try:
-        from sklearn.preprocessing import MinMaxScaler
-        from sklearn.preprocessing import StandardScaler
-    except ImportError as error:
-        raise RuntimeError("scikit-learn is required for AppClassNet scaling.") from error
-
-    feature_min, feature_max = _feature_min_max(numpy, train_x_values, chunk_size)
-    if scaler_name == "minmax":
-        scaler = MinMaxScaler(feature_range=(0, 1))
-        scaler.fit(numpy.vstack([feature_min, feature_max]).astype(numpy.float32, copy=False))
-        scaler.n_samples_seen_ = int(train_x_values.shape[0])
-        return scaler, feature_min, feature_max
-
-    if scaler_name == "standard":
-        scaler = StandardScaler()
-        for start in range(0, train_x_values.shape[0], chunk_size):
-            end = min(start + chunk_size, train_x_values.shape[0])
-            scaler.partial_fit(numpy.asarray(train_x_values[start:end], dtype=numpy.float32))
-        return scaler, feature_min, feature_max
-
-    raise ValueError(f"Unsupported scaler: {scaler_name}")
+def _iter_x_batches(numpy, x_values, chunk_size):
+    for start in range(0, x_values.shape[0], chunk_size):
+        end = min(start + chunk_size, x_values.shape[0])
+        yield numpy.asarray(x_values[start:end], dtype=numpy.float32)
 
 
-def _transform_with_optional_scaler(numpy, scaler, values):
-    values = numpy.asarray(values, dtype=numpy.float32)
-    if scaler is None:
-        return values
-    return scaler.transform(values).astype(numpy.float32, copy=False)
-
-
-def _write_scaled_split(numpy, scaler, x_values, y_values, output_x_path, output_y_path, chunk_size):
+def _write_transformed_split(numpy, manager, x_values, y_values, output_x_path, output_y_path, chunk_size, split_name):
     output_x_path.parent.mkdir(parents=True, exist_ok=True)
-    scaled_x = numpy.lib.format.open_memmap(
+    transformed_x = numpy.lib.format.open_memmap(
         output_x_path,
         mode="w+",
         dtype=numpy.float32,
@@ -805,13 +831,18 @@ def _write_scaled_split(numpy, scaler, x_values, y_values, output_x_path, output
     after_max = None
     for start in range(0, x_values.shape[0], chunk_size):
         end = min(start + chunk_size, x_values.shape[0])
-        transformed = _transform_with_optional_scaler(numpy, scaler, x_values[start:end])
-        scaled_x[start:end] = transformed
+        transformed = manager.transform(
+            x_values[start:end],
+            split_name=split_name,
+            input_space="source",
+            output_space="transformed",
+        )
+        transformed_x[start:end] = transformed
         chunk_min = numpy.nanmin(transformed, axis=0)
         chunk_max = numpy.nanmax(transformed, axis=0)
         after_min = chunk_min if after_min is None else numpy.minimum(after_min, chunk_min)
         after_max = chunk_max if after_max is None else numpy.maximum(after_max, chunk_max)
-    scaled_x.flush()
+    transformed_x.flush()
     numpy.save(output_y_path, numpy.asarray(y_values))
     return after_min, after_max
 
@@ -823,7 +854,18 @@ def preprocess_appclassnet_splits(parsed_arguments, raw_root, mode_name):
     except ImportError as error:
         raise RuntimeError("NumPy and joblib are required for AppClassNet preprocessing.") from error
 
-    scaler_name = parsed_arguments.scaler
+    policy = getattr(parsed_arguments, "_preprocessing_policy", None)
+    if policy is None:
+        policy = FeatureTransformPolicy.for_profile(
+            parsed_arguments.source_profile,
+            feature_transform=parsed_arguments.feature_transform,
+            generator_transform=parsed_arguments.generator_transform,
+            classifier_transform=parsed_arguments.classifier_transform,
+            evaluation_space=parsed_arguments.evaluation_space,
+            allow_refit=parsed_arguments.allow_scaler_refit,
+            allow_double_transform=parsed_arguments.allow_double_transform,
+            inverse_transform_synthetic=parsed_arguments.inverse_transform_synthetic,
+        )
     preprocessing_dir = REPO_ROOT / RESULTS_ROOT / mode_name / "preprocessing"
     scaled_root = preprocessing_dir / "scaled_npy"
     preprocessing_dir.mkdir(parents=True, exist_ok=True)
@@ -834,28 +876,26 @@ def preprocess_appclassnet_splits(parsed_arguments, raw_root, mode_name):
     train_x_values = numpy.load(train_x_path, mmap_mode=mmap_mode, allow_pickle=False)
     chunk_size = max(1, int(parsed_arguments.prepare_chunk_size))
 
-    logging.info("AppClassNet preprocessing: scaler=%s mode=%s", scaler_name, mode_name)
-    scaler, train_feature_min, train_feature_max = _fit_appclassnet_scaler(
-        numpy,
-        scaler_name,
-        train_x_values,
-        chunk_size,
+    logging.info(
+        "AppClassNet preprocessing: feature_transform=%s mode=%s",
+        policy.feature_transform,
+        mode_name,
     )
+    manager = FeatureTransformManager(policy, stage="feature", output_space="transformed")
+    manager.partial_fit_batches(_iter_x_batches(numpy, train_x_values, chunk_size), split_name="train")
+    train_feature_min, train_feature_max = _feature_min_max(numpy, train_x_values, chunk_size)
 
     scaler_path = preprocessing_dir / "scaler.joblib"
-    joblib.dump(
-        {
-            "scaler_name": scaler_name,
-            "scaler": scaler,
-            "fit_split": "train",
-            "feature_min_before_scaling": _json_list(train_feature_min),
-            "feature_max_before_scaling": _json_list(train_feature_max),
-        },
-        scaler_path,
-    )
+    manager.save(scaler_path)
 
     preprocessing_report = {
-        "scaler": scaler_name,
+        "scaler": parsed_arguments.scaler,
+        "source_profile": policy.source_profile,
+        "feature_transform": policy.feature_transform,
+        "generator_transform": policy.generator_transform,
+        "classifier_transform": policy.classifier_transform,
+        "evaluation_space": policy.evaluation_space,
+        "transform_id": manager.transform_id,
         "mode": mode_name,
         "fit_split": "train",
         "scaler_path": str(scaler_path),
@@ -870,14 +910,15 @@ def preprocess_appclassnet_splits(parsed_arguments, raw_root, mode_name):
         before_min, before_max = _feature_min_max(numpy, x_values, chunk_size)
         scaled_x_path = scaled_root / f"{split_name}_x.npy"
         scaled_y_path = scaled_root / f"{split_name}_y.npy"
-        after_min, after_max = _write_scaled_split(
+        after_min, after_max = _write_transformed_split(
             numpy,
-            scaler,
+            manager,
             x_values,
             y_values,
             scaled_x_path,
             scaled_y_path,
             chunk_size,
+            split_name,
         )
         preprocessing_report["splits"][split_name] = {
             "x_path": str(scaled_x_path),
@@ -888,7 +929,7 @@ def preprocess_appclassnet_splits(parsed_arguments, raw_root, mode_name):
             "feature_min_after_scaling": _json_list(after_min),
             "feature_max_after_scaling": _json_list(after_max),
         }
-        logging.info("AppClassNet preprocessing: wrote scaled %s split to %s", split_name, scaled_x_path)
+        logging.info("AppClassNet preprocessing: wrote %s split to %s", split_name, scaled_x_path)
 
     train_stats = preprocessing_report["splits"]["train"]
     preprocessing_report["feature_min_before_scaling"] = train_stats["feature_min_before_scaling"]
@@ -903,7 +944,66 @@ def preprocess_appclassnet_splits(parsed_arguments, raw_root, mode_name):
 
     logging.info("AppClassNet preprocessing scaler saved to %s", scaler_path)
     logging.info("AppClassNet preprocessing stats saved to %s", report_path)
-    return scaled_root, scaler_path, report_path
+
+    manifest = TransformManifest(
+        source_profile=policy.source_profile,
+        paths={
+            "raw_root": str(raw_root),
+            "preprocessed_root": str(scaled_root),
+            "scaler_path": str(scaler_path),
+            "stats_path": str(report_path),
+        },
+        original_ranges={
+            "train": [_json_list(train_feature_min), _json_list(train_feature_max)],
+        },
+        current_ranges={
+            split_name: [
+                preprocessing_report["splits"][split_name]["feature_min_after_scaling"],
+                preprocessing_report["splits"][split_name]["feature_max_after_scaling"],
+            ]
+            for split_name in APPCLASSNET_SPLITS
+        },
+        transformations=manager.transform_history,
+        transform_id=manager.transform_id,
+        train_fit={
+            "fit_split": "train",
+            "operation": manager.operation,
+            "input_range": manager.input_range,
+            "output_range": manager.output_range,
+        },
+        split_usage={
+            split_name: {
+                "x_path": preprocessing_report["splits"][split_name]["x_path"],
+                "y_path": preprocessing_report["splits"][split_name]["y_path"],
+                "used_scaler_fit_split": "train",
+                "transform_id": manager.transform_id,
+            }
+            for split_name in APPCLASSNET_SPLITS
+        },
+        generator_input_space="generator" if policy.generator_transform != "preserve" else "source",
+        synthetic_output_space=(
+            "source"
+            if policy.generator_transform == "preserve" or policy.inverse_transform_synthetic
+            else "generator"
+        ),
+        evaluation_space=policy.evaluation_space,
+        classifier_input_space=(
+            "classifier" if policy.classifier_transform not in {"preserve", "auto"} else "source"
+        ),
+        inverse_transform_synthetic=policy.inverse_transform_synthetic,
+        warnings=[],
+        validations=[
+            {
+                "name": "fit_only_train",
+                "status": "passed",
+                "detail": "FeatureTransformManager fitted on train and reused for valid/test.",
+            }
+        ],
+    )
+    manifest_path = preprocessing_dir / "preprocessing_manifest.json"
+    manifest.save(manifest_path)
+    logging.info("AppClassNet preprocessing manifest saved to %s", manifest_path)
+    return scaled_root, scaler_path, manifest_path
 
 
 def run_real_real_baseline(parsed_arguments, raw_root, output_dir):
@@ -912,8 +1012,6 @@ def run_real_real_baseline(parsed_arguments, raw_root, output_dir):
         from sklearn.metrics import accuracy_score
         from sklearn.metrics import balanced_accuracy_score
         from sklearn.metrics import f1_score
-        from sklearn.preprocessing import MinMaxScaler
-        from sklearn.preprocessing import StandardScaler
     except ImportError as error:
         raise RuntimeError("NumPy and scikit-learn are required for --baseline_real_only.") from error
 
@@ -952,18 +1050,23 @@ def run_real_real_baseline(parsed_arguments, raw_root, output_dir):
     train_x, train_y = load_selected_rows(numpy, train_x_values, train_y_values, train_indices, seed=2)
     test_x, test_y = load_selected_rows(numpy, test_x_values, test_y_values, test_indices, seed=3)
 
-    if parsed_arguments.scaler == "none":
-        scaler = None
-    elif parsed_arguments.scaler == "minmax":
-        scaler = MinMaxScaler(feature_range=(0, 1))
-    elif parsed_arguments.scaler == "standard":
-        scaler = StandardScaler()
-    else:
-        raise ValueError(f"Unsupported scaler: {parsed_arguments.scaler}")
-
-    if scaler is not None:
-        train_x = scaler.fit_transform(train_x).astype(numpy.float32, copy=False)
-        test_x = scaler.transform(test_x).astype(numpy.float32, copy=False)
+    policy = getattr(parsed_arguments, "_preprocessing_policy", None)
+    if policy is None:
+        policy = FeatureTransformPolicy.for_profile(parsed_arguments.source_profile)
+    classifier_policy = FeatureTransformPolicy.for_profile(
+        policy.source_profile,
+        feature_transform="preserve",
+        generator_transform="preserve",
+        classifier_transform=parsed_arguments.classifier_transform,
+        evaluation_space=policy.evaluation_space,
+        allow_refit=policy.allow_refit,
+        allow_double_transform=policy.allow_double_transform,
+        inverse_transform_synthetic=policy.inverse_transform_synthetic,
+    )
+    classifier_manager = FeatureTransformManager(classifier_policy, stage="classifier", output_space="classifier")
+    classifier_manager.fit(train_x, split_name="train")
+    train_x = classifier_manager.transform(train_x, split_name="train", input_space="source", output_space="classifier")
+    test_x = classifier_manager.transform(test_x, split_name="test", input_space="source", output_space="classifier")
 
     classifier = build_baseline_classifier(parsed_arguments)
     logging.info("Baseline real-real: training %s on %s", classifier.__class__.__name__, train_x.shape)
@@ -982,15 +1085,34 @@ def run_real_real_baseline(parsed_arguments, raw_root, output_dir):
         "test_samples_per_class_requested": parsed_arguments.test_samples_per_class,
         "train_class_counts": train_counts,
         "test_class_counts": test_counts,
+        "data_space": "source",
+        "feature_range": {
+            "train": summarize_feature_matrix(numpy, train_x),
+            "test": summarize_feature_matrix(numpy, test_x),
+        },
         "train_short_classes": {str(key): value for key, value in train_short_classes.items()},
         "test_short_classes": {str(key): value for key, value in test_short_classes.items()},
         "scaler": {
-            "name": parsed_arguments.scaler,
-            "feature_range": [0, 1] if parsed_arguments.scaler == "minmax" else None,
-            "data_min": _json_list(scaler.data_min_) if hasattr(scaler, "data_min_") else None,
-            "data_max": _json_list(scaler.data_max_) if hasattr(scaler, "data_max_") else None,
-            "mean": _json_list(scaler.mean_) if hasattr(scaler, "mean_") else None,
-            "scale": _json_list(scaler.scale_) if hasattr(scaler, "scale_") else None,
+            "legacy_name": parsed_arguments.scaler,
+            "classifier_transform": parsed_arguments.classifier_transform,
+            "transform_id": classifier_manager.transform_id,
+            "feature_range": [0, 1] if parsed_arguments.classifier_transform == "minmax" else None,
+            "data_min": (
+                _json_list(classifier_manager.scaler.data_min_)
+                if hasattr(classifier_manager.scaler, "data_min_") else None
+            ),
+            "data_max": (
+                _json_list(classifier_manager.scaler.data_max_)
+                if hasattr(classifier_manager.scaler, "data_max_") else None
+            ),
+            "mean": (
+                _json_list(classifier_manager.scaler.mean_)
+                if hasattr(classifier_manager.scaler, "mean_") else None
+            ),
+            "scale": (
+                _json_list(classifier_manager.scaler.scale_)
+                if hasattr(classifier_manager.scaler, "scale_") else None
+            ),
         },
         "metrics": {
             "Accuracy": float(accuracy_score(test_y, predictions)),
@@ -1015,6 +1137,212 @@ def run_real_real_baseline(parsed_arguments, raw_root, output_dir):
 
     logging.info("Baseline real-real metrics saved to %s", metrics_path)
     return metrics_path, metrics
+
+
+def _load_json_file(path):
+    path = Path(path)
+    if not path.is_file():
+        return None
+    try:
+        with path.open(encoding="utf-8") as json_file:
+            return json.load(json_file)
+    except Exception as error:
+        logging.warning("Could not read JSON %s: %s", path, error)
+        return None
+
+
+def _metric_value(metrics_block, metric_name):
+    value = metrics_block.get(metric_name)
+    if isinstance(value, dict):
+        value = value.get("mean")
+    try:
+        value = float(value)
+        if math.isfinite(value):
+            return value
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _extract_evaluation_metrics(results_data, evaluation_name):
+    evaluation_block = results_data.get(evaluation_name)
+    if not isinstance(evaluation_block, dict):
+        return None, {}
+    for classifier_name, classifier_block in evaluation_block.items():
+        if not isinstance(classifier_block, dict):
+            continue
+        fold_metrics = None
+        for key, value in classifier_block.items():
+            if key.endswith("-Fold") and isinstance(value, dict):
+                fold_metrics = value
+                break
+        if fold_metrics is None:
+            summary = classifier_block.get("Summary")
+            if isinstance(summary, dict):
+                fold_metrics = summary
+        if fold_metrics is None:
+            continue
+        return classifier_name, {
+            "Accuracy": _metric_value(fold_metrics, "Accuracy"),
+            "MacroF1": _metric_value(fold_metrics, "MacroF1"),
+            "WeightedF1": _metric_value(fold_metrics, "WeightedF1"),
+            "BalancedAccuracy": _metric_value(fold_metrics, "BalancedAccuracy"),
+        }
+    return None, {}
+
+
+def _extract_batch_metadata(results_data, evaluation_name):
+    batch_block = results_data.get("BatchClassifier")
+    if not isinstance(batch_block, dict):
+        return {}
+    for fold_block in batch_block.values():
+        if isinstance(fold_block, dict) and isinstance(fold_block.get(evaluation_name), dict):
+            return fold_block[evaluation_name]
+    return {}
+
+
+def _synthetic_manifest_summary(output_dir_run, max_batches=200):
+    try:
+        import numpy
+    except ImportError:
+        return {"data_space": "unknown", "feature_range": None, "manifest_path": None}
+
+    manifests = sorted(Path(output_dir_run).rglob("synthetic_batches/manifest.json"))
+    if not manifests:
+        return {"data_space": "unknown", "feature_range": None, "manifest_path": None}
+    manifest_path = manifests[0]
+    manifest = _load_json_file(manifest_path) or {}
+    feature_min = None
+    feature_max = None
+    batches_seen = 0
+    for batches in manifest.get("batches_by_class", {}).values():
+        for batch in batches:
+            if batches_seen >= max_batches:
+                break
+            batch_path = Path(batch.get("path", ""))
+            if not batch_path.is_absolute():
+                batch_path = (manifest_path.parent / batch_path).resolve()
+            if not batch_path.is_file():
+                batch_path = Path(batch.get("path", ""))
+            if not batch_path.is_file():
+                continue
+            try:
+                if batch_path.suffix == ".npy":
+                    values = numpy.load(batch_path, mmap_mode="r", allow_pickle=False)
+                    if "offset_start" in batch:
+                        values = values[int(batch["offset_start"]):int(batch["offset_end"])]
+                else:
+                    values = numpy.loadtxt(batch_path, delimiter=",", dtype=numpy.float32)
+                values = numpy.asarray(values, dtype=numpy.float32)
+                if values.ndim == 1:
+                    values = values.reshape(1, -1)
+                current_min = float(numpy.nanmin(values))
+                current_max = float(numpy.nanmax(values))
+                feature_min = current_min if feature_min is None else min(feature_min, current_min)
+                feature_max = current_max if feature_max is None else max(feature_max, current_max)
+                batches_seen += 1
+            except Exception as error:
+                logging.warning("Could not summarize synthetic batch %s: %s", batch_path, error)
+    return {
+        "data_space": manifest.get("data_space", "unknown"),
+        "transform_id": manifest.get("transform_id"),
+        "transform_history": manifest.get("transform_history", []),
+        "feature_range": [feature_min, feature_max] if feature_min is not None else None,
+        "manifest_path": str(manifest_path),
+        "sampled_batches": int(batches_seen),
+    }
+
+
+def _empty_evaluation_summary(status, reason):
+    return {
+        "status": status,
+        "reason": reason,
+        "classifier": None,
+        "real_samples_by_class": {},
+        "synthetic_samples_by_class": {},
+        "data_space": None,
+        "feature_range": None,
+        "Accuracy": None,
+        "MacroF1": None,
+        "WeightedF1": None,
+        "BalancedAccuracy": None,
+    }
+
+
+def _build_method_summary(results_data, evaluation_name, output_dir_run, synthetic_summary, active):
+    if not active:
+        return _empty_evaluation_summary("not_run", f"Skipped by evaluation_mode.")
+    classifier_name, metric_values = _extract_evaluation_metrics(results_data, evaluation_name)
+    metadata = _extract_batch_metadata(results_data, evaluation_name)
+    status = "completed" if classifier_name and metric_values else "not_available"
+    return {
+        "status": status,
+        "classifier": classifier_name or metadata.get("classifier"),
+        "real_samples_by_class": metadata.get("real_samples_used_by_class", {}),
+        "synthetic_samples_by_class": metadata.get("synthetic_samples_used_by_class", {}),
+        "data_space": synthetic_summary.get("data_space", "source"),
+        "feature_range": synthetic_summary.get("feature_range"),
+        "synthetic_manifest": synthetic_summary.get("manifest_path"),
+        "Accuracy": metric_values.get("Accuracy"),
+        "MacroF1": metric_values.get("MacroF1"),
+        "WeightedF1": metric_values.get("WeightedF1"),
+        "BalancedAccuracy": metric_values.get("BalancedAccuracy"),
+    }
+
+
+def write_baseline_batches_metrics(metrics, output_path):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "TR-TR": {
+            "status": "completed",
+            "classifier": metrics.get("classifier"),
+            "real_samples_by_class": {
+                "train": metrics.get("train_class_counts", {}),
+                "test": metrics.get("test_class_counts", {}),
+            },
+            "synthetic_samples_by_class": {},
+            "data_space": metrics.get("data_space", "source"),
+            "feature_range": metrics.get("feature_range", {}),
+            **metrics.get("metrics", {}),
+        },
+        "TR-TS": _empty_evaluation_summary("not_run", "baseline_real_only executes only TR-TR."),
+        "TS-TR": _empty_evaluation_summary("not_run", "baseline_real_only executes only TR-TR."),
+    }
+    with output_path.open("w", encoding="utf-8") as metrics_file:
+        json.dump(payload, metrics_file, indent=2, sort_keys=True)
+        metrics_file.write("\n")
+    logging.info("AppClassNet batches metrics saved to %s", output_path)
+    return output_path
+
+
+def write_batches_metrics(results_paths, output_path, parsed_arguments):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "TR-TR": _empty_evaluation_summary("not_run", "Synthetic run does not execute TR-TR."),
+        "TR-TS": _empty_evaluation_summary("not_run", f"evaluation_mode={parsed_arguments.evaluation_mode}."),
+        "TS-TR": _empty_evaluation_summary("not_run", f"evaluation_mode={parsed_arguments.evaluation_mode}."),
+    }
+    active_tr_ts = parsed_arguments.evaluation_mode in {"tr_ts", "both"}
+    active_ts_tr = parsed_arguments.evaluation_mode in {"ts_tr", "both"}
+    for results_path in results_paths:
+        results_data = _load_json_file(results_path)
+        if not isinstance(results_data, dict):
+            continue
+        output_dir_run = Path(results_path).parents[1]
+        synthetic_summary = _synthetic_manifest_summary(output_dir_run)
+        payload["TR-TS"] = _build_method_summary(
+            results_data, "TR-TS", output_dir_run, synthetic_summary, active_tr_ts
+        )
+        payload["TS-TR"] = _build_method_summary(
+            results_data, "TS-TR", output_dir_run, synthetic_summary, active_ts_tr
+        )
+    with output_path.open("w", encoding="utf-8") as metrics_file:
+        json.dump(payload, metrics_file, indent=2, sort_keys=True)
+        metrics_file.write("\n")
+    logging.info("AppClassNet batches metrics saved to %s", output_path)
+    return output_path
 
 
 def log_appclassnet_memory_plan(parsed_arguments, raw_root):
@@ -1235,6 +1563,7 @@ def build_main_command(
     data_load_max_samples,
     normal_classifier,
     batch_classifier_subset_size,
+    parsed_arguments,
 ):
     command = [
         python_executable,
@@ -1255,6 +1584,33 @@ def build_main_command(
     if normal_classifier:
         command.extend(["--normal_classifier", normal_classifier])
         command.extend(["--batch_classifier_subset_size", str(batch_classifier_subset_size)])
+
+    command.extend([
+        "--source_profile",
+        parsed_arguments.source_profile,
+        "--feature_transform",
+        "preserve",
+        "--generator_transform",
+        parsed_arguments.generator_transform,
+        "--classifier_transform",
+        parsed_arguments.classifier_transform,
+        "--evaluation_space",
+        parsed_arguments.evaluation_space,
+        "--evaluation_mode",
+        parsed_arguments.evaluation_mode,
+    ])
+    if parsed_arguments.allow_double_transform:
+        command.append("--allow_double_transform")
+    if parsed_arguments.allow_scaler_refit:
+        command.append("--allow_scaler_refit")
+    if parsed_arguments.inverse_transform_synthetic:
+        command.append("--inverse_transform_synthetic")
+    if parsed_arguments.synthetic_train_samples_per_class is not None:
+        command.extend(["--synthetic_train_samples_per_class", str(parsed_arguments.synthetic_train_samples_per_class)])
+        command.extend(["--train_samples_per_class", str(parsed_arguments.synthetic_train_samples_per_class)])
+    if parsed_arguments.synthetic_test_samples_per_class is not None:
+        command.extend(["--synthetic_test_samples_per_class", str(parsed_arguments.synthetic_test_samples_per_class)])
+        command.extend(["--test_samples_per_class", str(parsed_arguments.synthetic_test_samples_per_class)])
 
     for parameter, value in combination.items():
         append_cli_value(command, parameter, value)
@@ -1324,6 +1680,18 @@ def build_batch_main_command(python_executable, raw_root, output_dir_run, combin
         parsed_arguments.generation_strategy,
         "--classes_per_group",
         str(parsed_arguments.classes_per_group),
+        "--source_profile",
+        parsed_arguments.source_profile,
+        "--feature_transform",
+        "preserve",
+        "--generator_transform",
+        parsed_arguments.generator_transform,
+        "--classifier_transform",
+        parsed_arguments.classifier_transform,
+        "--evaluation_space",
+        parsed_arguments.evaluation_space,
+        "--evaluation_mode",
+        parsed_arguments.evaluation_mode,
     ]
 
     if parsed_arguments.use_mmap:
@@ -1335,11 +1703,24 @@ def build_batch_main_command(python_executable, raw_root, output_dir_run, combin
     if parsed_arguments.max_samples_per_class is not None:
         command.extend(["--max_samples_per_class", str(parsed_arguments.max_samples_per_class)])
 
-    if parsed_arguments.train_samples_per_class is not None:
-        command.extend(["--train_samples_per_class", str(parsed_arguments.train_samples_per_class)])
-
-    if parsed_arguments.test_samples_per_class is not None:
-        command.extend(["--test_samples_per_class", str(parsed_arguments.test_samples_per_class)])
+    synthetic_train_quota = (
+        parsed_arguments.synthetic_train_samples_per_class
+        if parsed_arguments.synthetic_train_samples_per_class is not None
+        else parsed_arguments.train_samples_per_class
+    )
+    synthetic_test_quota = (
+        parsed_arguments.synthetic_test_samples_per_class
+        if parsed_arguments.synthetic_test_samples_per_class is not None
+        else parsed_arguments.test_samples_per_class
+    )
+    if synthetic_train_quota is not None:
+        command.extend(["--train_samples_per_class", str(synthetic_train_quota)])
+    if synthetic_test_quota is not None:
+        command.extend(["--test_samples_per_class", str(synthetic_test_quota)])
+    if parsed_arguments.synthetic_train_samples_per_class is not None:
+        command.extend(["--synthetic_train_samples_per_class", str(parsed_arguments.synthetic_train_samples_per_class)])
+    if parsed_arguments.synthetic_test_samples_per_class is not None:
+        command.extend(["--synthetic_test_samples_per_class", str(parsed_arguments.synthetic_test_samples_per_class)])
 
     if parsed_arguments.n_estimators is not None:
         command.extend(["--n_estimators", str(parsed_arguments.n_estimators)])
@@ -1363,6 +1744,12 @@ def build_batch_main_command(python_executable, raw_root, output_dir_run, combin
     command.extend(["--save_synthetic_format", synthetic_format])
     if parsed_arguments.materialize_synthetic:
         command.append("--materialize_synthetic")
+    if parsed_arguments.allow_double_transform:
+        command.append("--allow_double_transform")
+    if parsed_arguments.allow_scaler_refit:
+        command.append("--allow_scaler_refit")
+    if parsed_arguments.inverse_transform_synthetic:
+        command.append("--inverse_transform_synthetic")
 
     for parameter, value in combination.items():
         append_cli_value(command, parameter, value)
@@ -1662,6 +2049,12 @@ def build_parser():
         help="batch-mode evaluation classifier; tree subsets are recommended first for AppClassNet",
     )
     parser.add_argument(
+        "--evaluation_mode",
+        choices=["none", "tr_ts", "ts_tr", "both"],
+        default="both",
+        help="synthetic evaluation mode; baseline_real_only forces effective none",
+    )
+    parser.add_argument(
         "--batch_classifier_subset_size",
         default=100000,
         type=int,
@@ -1677,7 +2070,53 @@ def build_parser():
         "--scaler",
         choices=["none", "minmax", "standard"],
         default=DEFAULT_SCALER,
-        help="AppClassNet feature scaler; default minmax matches the public top-200 baseline preprocessing",
+        help="Legacy AppClassNet feature scaler alias; default none preserves the public top-200 feature scale",
+    )
+    parser.add_argument(
+        "--source_profile",
+        choices=["legacy_csv", "appclassnet_top200", "custom"],
+        default="appclassnet_top200",
+        help="preprocessing source profile; AppClassNet runner defaults to appclassnet_top200",
+    )
+    parser.add_argument(
+        "--feature_transform",
+        choices=["preserve", "auto", "minmax", "standard"],
+        default="preserve",
+        help="source feature transform before materialization; AppClassNet default preserve",
+    )
+    parser.add_argument(
+        "--generator_transform",
+        choices=["preserve", "auto", "minmax", "standard"],
+        default="auto",
+        help="internal generator transform; auto resolves only when a model requires a documented internal scale",
+    )
+    parser.add_argument(
+        "--classifier_transform",
+        choices=["preserve", "auto", "minmax", "standard"],
+        default="preserve",
+        help="classifier input transform; tree classifiers preserve AppClassNet scale by default",
+    )
+    parser.add_argument(
+        "--evaluation_space",
+        choices=["source", "transformed"],
+        default="source",
+        help="space used by evaluation; AppClassNet default source",
+    )
+    parser.add_argument(
+        "--allow_double_transform",
+        action="store_true",
+        help="allow applying an equivalent transform more than once",
+    )
+    parser.add_argument(
+        "--allow_scaler_refit",
+        action="store_true",
+        help="allow refitting a previously fitted preprocessing scaler",
+    )
+    parser.add_argument(
+        "--inverse_transform_synthetic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="inverse-transform generator-space synthetic data back to source space before saving/evaluation",
     )
     parser.add_argument(
         "--baseline_classifier",
@@ -1696,6 +2135,18 @@ def build_parser():
         default=DEFAULT_BASELINE_TEST_SAMPLES_PER_CLASS,
         type=int,
         help="stratified real test samples per class used by --baseline_real_only",
+    )
+    parser.add_argument(
+        "--synthetic_train_samples_per_class",
+        default=None,
+        type=int,
+        help="per-class synthetic quota used to train TS-TR classifiers",
+    )
+    parser.add_argument(
+        "--synthetic_test_samples_per_class",
+        default=None,
+        type=int,
+        help="per-class synthetic cap used to evaluate TR-TS classifiers",
     )
     parser.add_argument(
         "--max_depth",
@@ -1782,6 +2233,7 @@ def main():
         return 0
 
     campaigns_chosen = choose_campaigns(arguments.campaign, full=arguments.full)
+    normalize_preprocessing_arguments(arguments, campaigns_chosen)
     if arguments.diagnostic_only or arguments.baseline_real_only:
         output_dir = REPO_ROOT / RESULTS_ROOT
     else:
@@ -1795,6 +2247,13 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     configure_logging(output_dir, arguments.verbosity)
+    if arguments.baseline_real_only:
+        if arguments.evaluation_mode != "none":
+            logging.warning(
+                "--baseline_real_only executes only TR-TR; ignoring --evaluation_mode=%s and using none.",
+                arguments.evaluation_mode,
+            )
+        arguments.evaluation_mode = effective_evaluation_mode(arguments)
     print_all_settings(arguments)
     warn_prepare_limit_if_needed(arguments, campaigns_chosen)
 
@@ -1810,6 +2269,7 @@ def main():
 
     if arguments.baseline_real_only:
         metrics_path, metrics = run_real_real_baseline(arguments, raw_root, output_dir)
+        write_baseline_batches_metrics(metrics, REPO_ROOT / RESULTS_ROOT / "batches" / "metrics.json")
         logging.info("Baseline real-only mode completed. Metrics: %s", metrics_path)
         return 0
 
@@ -1920,6 +2380,7 @@ def main():
                     arguments.data_load_max_samples,
                     arguments.normal_classifier,
                     arguments.batch_classifier_subset_size,
+                    arguments,
                 )
             else:
                 command = build_batch_main_command(
@@ -1972,6 +2433,12 @@ def main():
         logging.info("\t Campaign duration: %s", time_end_campaign - time_start_campaign)
 
     time_end_evaluation = datetime.datetime.now()
+    if arguments.execution_mode == "batches":
+        write_batches_metrics(
+            results_grouping,
+            REPO_ROOT / RESULTS_ROOT / "batches" / "metrics.json",
+            arguments,
+        )
     logging.info("Evaluation duration: %s", time_end_evaluation - time_start_evaluation)
     return 0
 

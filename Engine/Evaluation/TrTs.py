@@ -41,6 +41,7 @@ try:
     from Engine.Classifiers.BatchClassifiers import iter_array_batches
     from Engine.Classifiers.BatchClassifiers import predict_synthetic_batches
     from Engine.Classifiers.BatchClassifiers import train_batch_classifier
+    from Engine.Preprocessing.FeatureTransformManager import ScaleGuard
 
     from sklearn.metrics.pairwise import euclidean_distances
 
@@ -70,6 +71,16 @@ class TrTs:
 
         arguments = getattr(self, "arguments", None)
         if getattr(arguments, "execution_mode", "normal") == "batches":
+            if hasattr(synthetic_data, "manifest"):
+                ScaleGuard.validate_compatible_metadata(
+                    ScaleGuard.describe(dictionary_data['x_evaluation_real'], data_space="source"),
+                    {
+                        "data_space": synthetic_data.manifest.get("data_space", "source"),
+                        "transform_id": synthetic_data.manifest.get("transform_id"),
+                        "transform_history": synthetic_data.manifest.get("transform_history", []),
+                    },
+                    context="TR-TS",
+                )
             if not getattr(self, '_labels_are_discrete', True):
                 reason = "TR-TS predictive evaluation skipped because labels are not discrete."
                 logging.warning("\t\t%s", reason)
@@ -154,6 +165,26 @@ class TrTs:
             self.mark_evaluation_classifiers_not_applicable("TR-TS", self.fold_number + 1, reason)
             return
 
+        synthetic_array = numpy.asarray(data, dtype=numpy.float32)
+        synthetic_metadata = getattr(self, "_current_synthetic_metadata", None) or {
+            "data_space": "source",
+            "transform_id": None,
+            "transform_history": [],
+        }
+        real_metadata = getattr(self, "_current_real_source_metadata", None) or ScaleGuard.describe(
+            dictionary_data['x_evaluation_real'],
+            data_space="source",
+            transform_id=None,
+            transform_history=[],
+        )
+        ScaleGuard.validate_before_evaluation(
+            dictionary_data['x_evaluation_real'],
+            synthetic_array,
+            real_metadata,
+            synthetic_metadata,
+            context="TR-TS",
+        )
+
         # Train classifiers using the real training data and corresponding labels
         classifiers = self.get_trained_classifiers(dictionary_data['x_evaluation_real'],
                                                     labels_to_1d_integer(
@@ -164,7 +195,7 @@ class TrTs:
         # Evaluate the classifiers on synthetic data for each classifier instance
         for classifier_name, classifier_instances in zip(self._dictionary_classifiers_name, classifiers):
             # Predict the labels using the trained classifier on the synthetic data
-            label_predicted = classifier_instances.predict(data)
+            label_predicted = classifier_instances.predict(synthetic_array)
             logging.info("")
             logging.info(f"\t\tTR-TS {classifier_name}")
             # Calculate and log the binary classification metrics (such as accuracy, precision, recall, etc.)
