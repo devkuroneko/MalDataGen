@@ -118,7 +118,7 @@ def _apply_batch_limits(owner, bundle):
                 bundle.valid,
                 getattr(owner.arguments, "valid_y_path"),
                 split_name="valid",
-                samples_per_class=_batch_samples_per_class(owner.arguments, "evaluation"),
+                samples_per_class=_batch_samples_per_class(owner.arguments, "valid"),
             )
         if bundle.test is not None:
             _apply_stratified_split_selection(
@@ -126,7 +126,7 @@ def _apply_batch_limits(owner, bundle):
                 bundle.test,
                 getattr(owner.arguments, "test_y_path"),
                 split_name="test",
-                samples_per_class=_batch_samples_per_class(owner.arguments, "evaluation"),
+                samples_per_class=_batch_samples_per_class(owner.arguments, "test"),
             )
 
 def _batch_samples_per_class(arguments, split_role):
@@ -142,7 +142,7 @@ def _batch_samples_per_class(arguments, split_role):
                 return max(min_required, quota)
             return max(1, min_required)
 
-        if getattr(arguments, "test_samples_per_class", None) is not None:
+        if split_role == "test" and getattr(arguments, "test_samples_per_class", None) is not None:
             return max(min_required, int(arguments.test_samples_per_class))
         return max(1, min_required)
 
@@ -203,18 +203,33 @@ def _apply_stratified_split_selection(owner, split, y_path, split_name, samples_
         split.X, split.y = validate_xy_alignment(
             split.X,
             split.y,
-            f"batches split before stratified selection split={split_name}",
+            "batches split before stratified selection",
+            split=split_name,
         )
+        scanned_rows = int(selection_report.get("total_rows_scanned", -1))
+        if scanned_rows != int(split.X.shape[0]):
+            raise ValueError(
+                f"Batches stratified selection y_path row mismatch for split={split_name}: "
+                f"y_path rows={scanned_rows}, split X rows={split.X.shape[0]}, "
+                f"split y rows={split.y.shape[0]}, y_path={y_path}."
+            )
         if indices.size:
             max_selected_index = int(indices.max())
             if max_selected_index >= split.X.shape[0]:
-                raise ValueError(
+                raise RuntimeError(
                     f"Batches stratified selection produced index {max_selected_index} outside "
                     f"{split_name} X rows={split.X.shape[0]}; y_path={y_path} does not match this split X."
                 )
         split.X = numpy.asarray(split.X[indices], dtype=numpy.float32)
         split.y = numpy.asarray(split.y[indices])
-        validate_xy_alignment(split.X, split.y, f"batches split after stratified selection split={split_name}")
+        split.refresh_metadata()
+        validate_xy_alignment(
+            split.X,
+            split.y,
+            "batches split after stratified selection",
+            split=split_name,
+            source_indices=indices,
+        )
         _log_array_memory(f"Limited {split_name} X", split.X)
         _log_array_memory(f"Limited {split_name} y", split.y)
 
@@ -256,7 +271,16 @@ def _log_bundle_summary(bundle):
 
         for split_name, split in bundle.splits.items():
             y_shape = None if split.y is None else split.y.shape
-            logging.info("Dataset split %s: X=%s, y=%s", split_name, split.X.shape, y_shape)
+            logging.info(
+                "Dataset split %s: X=%s, y=%s x_path=%s y_path=%s min_class_count=%s dataset_id=%s",
+                split_name,
+                split.X.shape,
+                y_shape,
+                split.x_path,
+                split.y_path,
+                split.minimum_class_count,
+                split.dataset_id,
+            )
 
 def load_dataset_from_args(arguments, owner=None):
         """Load the configured dataset without changing the legacy CSV default.
@@ -340,16 +364,51 @@ def _number_samples_per_class_from_schema(schema, labels):
         metadata["target_type"] = getattr(schema, "target_type", "auto")
         return metadata
 
-def _create_fold(training_split, evaluation_split, evaluation_name=None, evaluation_not_applicable=False):
-        evaluation_source = evaluation_split if evaluation_split is not None else training_split
-        validate_xy_alignment(training_split.X, training_split.y, f"fold training split={training_split.name}")
-        validate_xy_alignment(evaluation_source.X, evaluation_source.y, f"fold evaluation split={evaluation_source.name}")
+def _split_metadata(split):
+        if split is None:
+            return None
         return {
-            'x_training_real': numpy.asarray(training_split.X, dtype=numpy.float32),
-            'y_training_real': validate_zero_based_labels(training_split.y, context=f"{training_split.name} y"),
+            "name": split.name,
+            "x_path": split.x_path,
+            "y_path": split.y_path,
+            "dataset_id": split.dataset_id,
+            "num_samples": split.num_samples,
+            "class_counts": {str(key): int(value) for key, value in split.class_counts.items()},
+            "minimum_class_count": split.minimum_class_count,
+            "shape": list(split.X.shape),
+        }
 
-            'x_evaluation_real': numpy.asarray(evaluation_source.X, dtype=numpy.float32),
-            'y_evaluation_real': validate_zero_based_labels(evaluation_source.y, context=f"{evaluation_source.name} y"),
+def _create_fold(
+        training_split,
+        evaluation_split,
+        evaluation_name=None,
+        evaluation_not_applicable=False,
+        valid_split=None,
+        test_split=None,
+        dataset_bundle=None):
+        evaluation_source = evaluation_split if evaluation_split is not None else training_split
+        train_x, train_y = validate_xy_alignment(
+            training_split.X,
+            training_split.y,
+            "fold training",
+            split=training_split.name,
+        )
+        evaluation_x, evaluation_y = validate_xy_alignment(
+            evaluation_source.X,
+            evaluation_source.y,
+            "fold evaluation",
+            split=evaluation_source.name,
+        )
+        train_source_indices = numpy.arange(train_y.shape[0], dtype=numpy.int64)
+        evaluation_source_indices = numpy.arange(evaluation_y.shape[0], dtype=numpy.int64)
+        return {
+            'x_training_real': numpy.asarray(train_x, dtype=numpy.float32),
+            'y_training_real': validate_zero_based_labels(train_y, context=f"{training_split.name} y"),
+            'training_source_indices': train_source_indices,
+
+            'x_evaluation_real': numpy.asarray(evaluation_x, dtype=numpy.float32),
+            'y_evaluation_real': validate_zero_based_labels(evaluation_y, context=f"{evaluation_source.name} y"),
+            'evaluation_source_indices': evaluation_source_indices,
 
             'x_training_synthetic': None,
             'y_training_synthetic': None,
@@ -358,7 +417,19 @@ def _create_fold(training_split, evaluation_split, evaluation_name=None, evaluat
             'y_evaluation_synthetic': None,
 
             'evaluation_split_name': evaluation_name or evaluation_source.name,
+            'training_split_name': training_split.name,
+            'validation_split_name': None if valid_split is None else valid_split.name,
             'evaluation_not_applicable': evaluation_not_applicable,
+            'real_train_split': training_split,
+            'real_valid_split': valid_split,
+            'real_test_split': test_split,
+            'dataset_bundle': dataset_bundle,
+            'split_metadata': {
+                "train": _split_metadata(training_split),
+                "valid": _split_metadata(valid_split),
+                "test": _split_metadata(test_split),
+                "evaluation": _split_metadata(evaluation_source),
+            },
         }
 
 def _mark_test_not_applicable(owner, reason):
@@ -373,17 +444,12 @@ def _mark_test_not_applicable(owner, reason):
 def _build_provided_split_folds(owner, bundle):
         evaluation_split = bundle.valid or bundle.test
         evaluation_name = None if evaluation_split is None else evaluation_split.name
-        evaluation_not_applicable = evaluation_split is None
-
-        if bundle.valid is not None and bundle.test is not None:
-            reason = "Final test split evaluation is not supported by the current TR-TS/TS-TR pipeline."
-            logging.warning("%s Marking test split as %s.", reason, NOT_APPLICABLE)
-            _mark_test_not_applicable(owner, reason)
+        evaluation_not_applicable = bundle.test is None
 
         if evaluation_not_applicable:
             logging.warning(
-                "split_mode=provided has no valid/test split. Training can proceed from train, but predictive "
-                "and distance evaluations are %s for this run.",
+                "split_mode=provided has no test split. Training/validation can proceed, but final predictive "
+                "evaluations are %s for this run.",
                 NOT_APPLICABLE,
             )
 
@@ -393,12 +459,16 @@ def _build_provided_split_folds(owner, bundle):
             evaluation_split,
             evaluation_name=evaluation_name,
             evaluation_not_applicable=evaluation_not_applicable,
+            valid_split=bundle.valid,
+            test_split=bundle.test,
+            dataset_bundle=bundle,
         ))
 
         logging.info(
-            "Provided split fold created: train=%s, evaluation=%s, evaluation_not_applicable=%s",
+            "Provided split fold created: train=%s, validation=%s, final_test=%s, evaluation_not_applicable=%s",
             bundle.train.name,
-            evaluation_name,
+            None if bundle.valid is None else bundle.valid.name,
+            None if bundle.test is None else bundle.test.name,
             evaluation_not_applicable,
         )
 
@@ -479,7 +549,26 @@ def StratifiedData(function):
                 return None
 
             # Shuffle the data before performing stratified splitting
-            shuffled_data, shuffled_labels = shuffle(self._data_loaded, self._data_loaded_labels, random_state=42)
+            self._data_loaded, self._data_loaded_labels = validate_xy_alignment(
+                self._data_loaded,
+                self._data_loaded_labels,
+                "CrossValidation loaded dataset",
+                split="loaded",
+            )
+            loaded_source_indices = numpy.arange(self._data_loaded_labels.shape[0], dtype=numpy.int64)
+            shuffled_data, shuffled_labels, shuffled_source_indices = shuffle(
+                self._data_loaded,
+                self._data_loaded_labels,
+                loaded_source_indices,
+                random_state=42,
+            )
+            validate_xy_alignment(
+                shuffled_data,
+                shuffled_labels,
+                "CrossValidation shuffled dataset",
+                split="shuffled",
+                source_indices=shuffled_source_indices,
+            )
 
             if labels_are_discrete:
                 self.arguments.number_samples_per_class = build_class_metadata(
@@ -539,38 +628,62 @@ def StratifiedData(function):
                 else:
                     _save_data_to_csv(
                         self.directory_output_data,
-                        self._data_loaded[train_index],
-                        self._data_loaded_labels[train_index],
+                        shuffled_data[train_index],
+                        shuffled_labels[train_index],
                         "data_training",
                         fold
                     )
 
                     _save_data_to_csv(
                         self.directory_output_data,
-                        self._data_loaded[val_index],
-                        self._data_loaded_labels[val_index],
+                        shuffled_data[val_index],
+                        shuffled_labels[val_index],
                         "data_evaluation",
                         fold
                     )
 
                 # Shuffle the training and evaluation data
-                training_shuffled_data, training_shuffled_labels = shuffle(self._data_loaded[train_index],
-                                                                           self._data_loaded_labels[train_index],
-                                                                           random_state=42)
+                training_shuffled_data, training_shuffled_labels, training_source_indices = shuffle(
+                    shuffled_data[train_index],
+                    shuffled_labels[train_index],
+                    shuffled_source_indices[train_index],
+                    random_state=42,
+                )
                 
                 
 
-                evaluation_shuffled_data, evaluation_shuffled_labels = shuffle(self._data_loaded[val_index],
-                                                                               self._data_loaded_labels[val_index],
-                                                                               random_state=42)
+                evaluation_shuffled_data, evaluation_shuffled_labels, evaluation_source_indices = shuffle(
+                    shuffled_data[val_index],
+                    shuffled_labels[val_index],
+                    shuffled_source_indices[val_index],
+                    random_state=42,
+                )
+                validate_xy_alignment(
+                    training_shuffled_data,
+                    training_shuffled_labels,
+                    "CrossValidation fold train",
+                    split=split_name,
+                    fold=fold + 1,
+                    source_indices=training_source_indices,
+                )
+                validate_xy_alignment(
+                    evaluation_shuffled_data,
+                    evaluation_shuffled_labels,
+                    "CrossValidation fold evaluation",
+                    split=split_name,
+                    fold=fold + 1,
+                    source_indices=evaluation_source_indices,
+                )
 
                 # Store the training and evaluation data for later use
                 self.list_folds.append({
                     'x_training_real': training_shuffled_data,
                     'y_training_real': training_shuffled_labels,
+                    'training_source_indices': training_source_indices,
 
                     'x_evaluation_real': evaluation_shuffled_data,
                     'y_evaluation_real': evaluation_shuffled_labels,
+                    'evaluation_source_indices': evaluation_source_indices,
                     
                     'x_training_synthetic': None,
                     'y_training_synthetic': None,

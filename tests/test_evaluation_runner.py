@@ -6,6 +6,8 @@ import numpy
 from Engine.Evaluation.EvaluationRunner import EvaluationDataset
 from Engine.Evaluation.EvaluationRunner import EvaluationMode
 from Engine.Evaluation.EvaluationRunner import EvaluationRunner
+from Engine.Evaluation.EvaluationRunner import split_to_dictionary
+from Engine.DataIO.DatasetContracts import SplitData
 
 
 class EvaluationRunnerOwner:
@@ -48,6 +50,39 @@ class EvaluationRunnerTest(unittest.TestCase):
         self.assertEqual(metadata["test_class_counts"], {"0": 1})
         self.assertEqual(len(metadata["train_hash"]), 64)
         self.assertEqual(len(metadata["test_hash"]), 64)
+
+    def test_build_dataset_records_provided_split_names_and_paths(self):
+        owner = EvaluationRunnerOwner()
+        runner = EvaluationRunner(owner, EvaluationMode.TR_TR)
+        dictionary_data = split_to_dictionary(
+            real_train_data=SplitData(
+                X=numpy.zeros((4, 2), dtype=numpy.float32),
+                y=numpy.array([0, 0, 1, 1]),
+                name="train",
+                x_path="/dataset/train_x.npy",
+                y_path="/dataset/train_y.npy",
+                dataset_id="appclassnet_top200",
+            ),
+            real_test_data=SplitData(
+                X=numpy.ones((6, 2), dtype=numpy.float32),
+                y=numpy.array([0, 0, 0, 1, 1, 1]),
+                name="test",
+                x_path="/dataset/test_x.npy",
+                y_path="/dataset/test_y.npy",
+                dataset_id="appclassnet_top200",
+            ),
+        )
+
+        dataset = runner.build_evaluation_dataset(dictionary_data)
+        runner.validate(dataset)
+        runner.save_results(dataset, 1)
+
+        metadata = owner._dictionary_metrics["EvaluationMetadata"]["1-Fold"]["TR-TR"]
+        self.assertEqual(metadata["train_split_name"], "train")
+        self.assertEqual(metadata["test_split_name"], "test")
+        self.assertEqual(metadata["train_x_path"], "/dataset/train_x.npy")
+        self.assertEqual(metadata["test_y_path"], "/dataset/test_y.npy")
+        self.assertEqual(metadata["test_minimum_class_count"], 3)
 
     def test_validate_rejects_misaligned_train_labels(self):
         owner = EvaluationRunnerOwner()

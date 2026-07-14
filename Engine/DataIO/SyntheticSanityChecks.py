@@ -92,6 +92,8 @@ class SyntheticSanityChecker:
         self.fold_number = None if fold_number is None else int(fold_number)
         self.model_type = model_type
         self.experiment_directory = experiment_directory
+        self.real_dataset_id = hex(id(real_x))
+        self.real_label_id = hex(id(real_y))
         self.output_path = (
             APPCLASSNET_SANITY_ROOT
             / self.execution_mode
@@ -146,13 +148,19 @@ class SyntheticSanityChecker:
             synthetic_shape = (synthetic_rows, synthetic_shape[1])
         logging.info(
             "SyntheticSanityChecks preflight: fold=%s split=%s real_x.shape=%s real_y.shape=%s "
-            "synthetic_x.shape=%s synthetic_y.shape=%s",
+            "synthetic_x.shape=%s synthetic_y.shape=%s real_x_id=%s real_y_id=%s classes=%d "
+            "label_min=%s label_max=%s",
             self.fold_number,
             "evaluation",
             self.real_x.shape,
             self.real_y.shape,
             synthetic_shape,
             (synthetic_y_rows,),
+            self.real_dataset_id,
+            self.real_label_id,
+            int(numpy.unique(self.real_y).shape[0]) if self.real_y.size else 0,
+            int(numpy.min(self.real_y)) if self.real_y.size else None,
+            int(numpy.max(self.real_y)) if self.real_y.size else None,
         )
 
     def _real_feature_and_class_stats(self):
@@ -365,7 +373,11 @@ def _subset_quota(arguments, number_classes):
 
 
 def _stratified_real_subset(real_x, real_y, number_classes, quota_per_class):
-    real_x, real_y = validate_xy_alignment(real_x, real_y, "SyntheticSanityChecks stratified real subset")
+    real_x, real_y = validate_xy_alignment(
+        real_x,
+        real_y,
+        "SyntheticSanityChecks stratified real subset input",
+    )
     random_generator = numpy.random.default_rng(42)
     selected_indices = []
     subset_counts = numpy.zeros(int(number_classes), dtype=numpy.int64)
@@ -384,15 +396,40 @@ def _stratified_real_subset(real_x, real_y, number_classes, quota_per_class):
 
     indices = numpy.concatenate(selected_indices).astype(numpy.int64, copy=False)
     random_generator.shuffle(indices)
+    max_selected_index = int(indices.max()) if indices.size else None
+    if real_x.shape[0] != real_y.shape[0]:
+        raise ValueError(
+            "SyntheticSanityChecks stratified real subset X/y mismatch before indexing: "
+            f"real_x.shape={real_x.shape}, real_y.shape={real_y.shape}."
+        )
+    if max_selected_index is not None and max_selected_index >= real_x.shape[0]:
+        raise RuntimeError(
+            "SyntheticSanityChecks stratified real subset produced out-of-bounds index before NumPy indexing: "
+            f"max_selected_index={max_selected_index}, real_x_rows={real_x.shape[0]}, "
+            f"real_y_rows={real_y.shape[0]}, number_classes={number_classes}, quota_per_class={quota_per_class}."
+        )
     logging.info(
-        "SyntheticSanityChecks stratified subset: real_x.shape=%s real_y.shape=%s max_selected_index=%s",
+        "SyntheticSanityChecks stratified subset: real_x.shape=%s real_y.shape=%s "
+        "selected_rows=%d max_selected_index=%s classes=%d label_min=%s label_max=%s",
         real_x.shape,
         real_y.shape,
-        int(indices.max()) if indices.size else None,
+        int(indices.shape[0]),
+        max_selected_index,
+        int(numpy.unique(real_y).shape[0]) if real_y.size else 0,
+        int(numpy.min(real_y)) if real_y.size else None,
+        int(numpy.max(real_y)) if real_y.size else None,
+    )
+    subset_x = numpy.asarray(real_x[indices], dtype=numpy.float32)
+    subset_y = real_y[indices]
+    validate_xy_alignment(
+        subset_x,
+        subset_y,
+        "SyntheticSanityChecks stratified real subset output",
+        source_indices=indices,
     )
     return (
-        numpy.asarray(real_x[indices], dtype=numpy.float32),
-        real_y[indices],
+        subset_x,
+        subset_y,
         subset_counts,
     )
 

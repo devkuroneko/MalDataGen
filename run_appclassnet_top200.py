@@ -15,6 +15,7 @@ import itertools
 import json
 import logging
 import math
+import numbers
 import shlex
 import subprocess
 import sys
@@ -33,13 +34,14 @@ DEFAULT_DEMO_EPOCHS = 1
 DEFAULT_K_FOLDS = 5
 DEFAULT_DATA_TYPE = "continuous"
 DEFAULT_SAVE_DATA = "True"
-DEFAULT_SAMPLES_PER_CLASS = 256
+DEFAULT_SAMPLES_PER_CLASS = 2500
 DEFAULT_CHUNK_SIZE = 100_000
 DEFAULT_BATCH_SIZE = 8192
 DEFAULT_EVAL_BATCH_SIZE = 16384
 DEFAULT_GENERATION_BATCH_SIZE = 8192
-DEFAULT_BASELINE_TRAIN_SAMPLES_PER_CLASS = 1000
-DEFAULT_BASELINE_TEST_SAMPLES_PER_CLASS = 500
+DEFAULT_BASELINE_TRAIN_SAMPLES_PER_CLASS = 100_000
+DEFAULT_BASELINE_TEST_SAMPLES_PER_CLASS = 5_000
+DEFAULT_SYNTHETIC_SAMPLES_PER_CLASS = 50
 DEFAULT_SCALER = "none"
 TIME_FORMAT = "%Y-%m-%d_%H:%M:%S"
 
@@ -1682,39 +1684,173 @@ def annotate_explicit_cli_arguments(parsed_arguments, raw_args):
     return parsed_arguments
 
 
-def resolve_effective_argument(parsed_arguments, combination, parameter):
-    explicit = set(getattr(parsed_arguments, "_explicit_cli_options", set()))
-    requested_value = getattr(parsed_arguments, parameter, None)
-    campaign_has_value = parameter in combination
-    campaign_value = combination.get(parameter)
+def _evaluation_mode_includes(evaluation_mode, requested_mode):
+    return evaluation_mode in {requested_mode, "both"}
 
-    if parameter in explicit:
-        effective_value = requested_value
-        source = "cli"
-    elif campaign_has_value:
-        effective_value = campaign_value
-        source = "campaign"
+
+def resolve_argument(cli_value, campaign_value, default_value):
+    if cli_value is not None:
+        return cli_value, "cli"
+    if campaign_value is not None:
+        return campaign_value, "campaign"
+    return default_value, "default"
+
+
+def _non_negative_int(parameter, value):
+    if isinstance(value, bool):
+        raise ValueError(f"--{parameter} must be an integer greater than or equal to zero.")
+    if isinstance(value, numbers.Integral):
+        integer_value = int(value)
+    elif isinstance(value, str):
+        value_text = value.strip()
+        digits_text = value_text[1:] if value_text.startswith(("+", "-")) else value_text
+        if not digits_text.isdigit():
+            raise ValueError(f"--{parameter} must be an integer greater than or equal to zero.")
+        try:
+            integer_value = int(value_text)
+        except ValueError as error:
+            raise ValueError(f"--{parameter} must be an integer greater than or equal to zero.") from error
     else:
-        effective_value = requested_value
-        source = "default"
+        raise ValueError(f"--{parameter} must be an integer greater than or equal to zero.")
+    if integer_value < 0:
+        raise ValueError(f"--{parameter} must be an integer greater than or equal to zero.")
+    return integer_value
 
-    logging.info(
-        "Argument resolution: %s requested=%s campaign=%s effective=%s source=%s",
-        parameter,
-        requested_value,
-        campaign_value,
-        effective_value,
-        source,
+
+def _default_sample_value(parameter, evaluation_mode):
+    defaults = {
+        "train_samples_per_class": DEFAULT_BASELINE_TRAIN_SAMPLES_PER_CLASS,
+        "test_samples_per_class": DEFAULT_BASELINE_TEST_SAMPLES_PER_CLASS,
+        "synthetic_train_samples_per_class": (
+            DEFAULT_SYNTHETIC_SAMPLES_PER_CLASS
+            if _evaluation_mode_includes(evaluation_mode, "ts_tr")
+            else 0
+        ),
+        "synthetic_test_samples_per_class": (
+            DEFAULT_SYNTHETIC_SAMPLES_PER_CLASS
+            if _evaluation_mode_includes(evaluation_mode, "tr_ts")
+            else 0
+        ),
+    }
+    return defaults[parameter]
+
+
+def resolve_effective_sample_arguments(parsed_arguments, combination):
+    evaluation_mode = getattr(parsed_arguments, "evaluation_mode", "both")
+    parameters = (
+        "train_samples_per_class",
+        "test_samples_per_class",
+        "synthetic_train_samples_per_class",
+        "synthetic_test_samples_per_class",
     )
-    return effective_value, source
+    values = {}
+    origins = {}
+    details = {}
+
+    for parameter in parameters:
+        cli_value = getattr(parsed_arguments, parameter, None)
+        campaign_value = combination.get(parameter)
+        default_value = _default_sample_value(parameter, evaluation_mode)
+        effective_value, origin = resolve_argument(cli_value, campaign_value, default_value)
+        effective_value = _non_negative_int(parameter, effective_value)
+        values[parameter] = effective_value
+        origins[parameter] = origin
+        details[parameter] = {
+            "cli": cli_value,
+            "campaign": campaign_value,
+            "default": default_value,
+            "effective": effective_value,
+            "origin": origin,
+        }
+        logging.info(
+            "Argument resolution: %s cli=%s campaign=%s default=%s effective=%s origin=%s",
+            parameter,
+            cli_value,
+            campaign_value,
+            default_value,
+            effective_value,
+            origin,
+        )
+
+    if (
+        _evaluation_mode_includes(evaluation_mode, "ts_tr")
+        and values["synthetic_train_samples_per_class"] <= 0
+    ):
+        raise ValueError(
+            "--synthetic_train_samples_per_class must be greater than zero when evaluation_mode includes TS-TR."
+        )
+    if (
+        _evaluation_mode_includes(evaluation_mode, "tr_ts")
+        and values["synthetic_test_samples_per_class"] <= 0
+    ):
+        raise ValueError(
+            "--synthetic_test_samples_per_class must be greater than zero when evaluation_mode includes TR-TS."
+        )
+
+    required_generated_per_class = (
+        values["synthetic_train_samples_per_class"]
+        + values["synthetic_test_samples_per_class"]
+    )
+    generated_cli_value = getattr(parsed_arguments, "generated_samples_per_class", None)
+    generated_campaign_value = combination.get("generated_samples_per_class")
+    generated_default_value = required_generated_per_class
+    generated_value, generated_origin = resolve_argument(
+        generated_cli_value,
+        generated_campaign_value,
+        generated_default_value,
+    )
+    generated_value = _non_negative_int("generated_samples_per_class", generated_value)
+    values["generated_samples_per_class"] = generated_value
+    origins["generated_samples_per_class"] = generated_origin
+    details["generated_samples_per_class"] = {
+        "cli": generated_cli_value,
+        "campaign": generated_campaign_value,
+        "default": generated_default_value,
+        "effective": generated_value,
+        "origin": generated_origin,
+    }
+    logging.info(
+        "Argument resolution: generated_samples_per_class cli=%s campaign=%s default=%s effective=%s origin=%s",
+        generated_cli_value,
+        generated_campaign_value,
+        generated_default_value,
+        generated_value,
+        generated_origin,
+    )
+    logging.info(
+        "Synthetic generation plan: synthetic_train_per_class=%s synthetic_test_per_class=%s "
+        "required_generated_per_class=%s planned_generated_per_class=%s",
+        values["synthetic_train_samples_per_class"],
+        values["synthetic_test_samples_per_class"],
+        required_generated_per_class,
+        generated_value,
+    )
+    if generated_value < required_generated_per_class:
+        raise ValueError(
+            "InsufficientGeneratedSamplesPerClass: "
+            f"generated_samples_per_class={generated_value} is smaller than required_generated_per_class="
+            f"{required_generated_per_class} "
+            f"(synthetic_train_samples_per_class={values['synthetic_train_samples_per_class']} + "
+            f"synthetic_test_samples_per_class={values['synthetic_test_samples_per_class']})."
+        )
+
+    return {
+        "values": values,
+        "origins": origins,
+        "details": details,
+        "required_generated_per_class": required_generated_per_class,
+        "planned_generated_per_class": generated_value,
+    }
+
+
+def resolve_effective_argument(parsed_arguments, combination, parameter):
+    plan = resolve_effective_sample_arguments(parsed_arguments, combination)
+    return plan["values"][parameter], plan["origins"][parameter]
 
 
 def synthetic_required_samples_per_class(parsed_arguments, combination):
-    train_value, _ = resolve_effective_argument(parsed_arguments, combination, "synthetic_train_samples_per_class")
-    test_value, _ = resolve_effective_argument(parsed_arguments, combination, "synthetic_test_samples_per_class")
-    if train_value is None and test_value is None:
-        return None
-    return int(train_value or 0) + int(test_value or 0)
+    plan = resolve_effective_sample_arguments(parsed_arguments, combination)
+    return plan["required_generated_per_class"]
 
 
 def build_number_samples_per_class_plan(samples_per_class):
@@ -1773,6 +1909,7 @@ GENERATION_QUOTA_PARAMETERS = {
     "test_samples_per_class",
     "synthetic_train_samples_per_class",
     "synthetic_test_samples_per_class",
+    "generated_samples_per_class",
 }
 
 
@@ -1830,18 +1967,19 @@ def build_main_command(
         command.append("--allow_scaler_refit")
     if parsed_arguments.inverse_transform_synthetic:
         command.append("--inverse_transform_synthetic")
+    sample_arguments = resolve_effective_sample_arguments(parsed_arguments, combination)
+    sample_values = sample_arguments["values"]
     for parameter in (
             "train_samples_per_class",
             "test_samples_per_class",
             "synthetic_train_samples_per_class",
             "synthetic_test_samples_per_class"):
-        effective_value, _ = resolve_effective_argument(parsed_arguments, combination, parameter)
-        if effective_value is not None:
-            command.extend([f"--{parameter}", str(effective_value)])
+        command.extend([f"--{parameter}", str(sample_values[parameter])])
 
-    required_synthetic = synthetic_required_samples_per_class(parsed_arguments, combination)
-    if required_synthetic is not None:
-        command.extend(["--number_samples_per_class", build_number_samples_per_class_plan(required_synthetic)])
+    command.extend([
+        "--number_samples_per_class",
+        build_number_samples_per_class_plan(sample_values["generated_samples_per_class"]),
+    ])
 
     for parameter, value in combination.items():
         if parameter in GENERATION_QUOTA_PARAMETERS:
@@ -1938,23 +2076,21 @@ def build_batch_main_command(python_executable, raw_root, output_dir_run, combin
     if parsed_arguments.max_samples_per_class is not None:
         command.extend(["--max_samples_per_class", str(parsed_arguments.max_samples_per_class)])
 
+    sample_arguments = resolve_effective_sample_arguments(parsed_arguments, combination)
+    sample_values = sample_arguments["values"]
     for parameter in (
             "train_samples_per_class",
             "test_samples_per_class",
             "synthetic_train_samples_per_class",
             "synthetic_test_samples_per_class"):
-        effective_value, _ = resolve_effective_argument(parsed_arguments, combination, parameter)
-        if effective_value is not None:
-            command.extend([f"--{parameter}", str(effective_value)])
+        command.extend([f"--{parameter}", str(sample_values[parameter])])
 
-    required_synthetic = synthetic_required_samples_per_class(parsed_arguments, combination)
-    if required_synthetic is not None:
-        command.extend([
-            "--sample_plan",
-            "class_counts",
-            "--number_samples_per_class",
-            build_number_samples_per_class_plan(required_synthetic),
-        ])
+    command.extend([
+        "--sample_plan",
+        "class_counts",
+        "--number_samples_per_class",
+        build_number_samples_per_class_plan(sample_values["generated_samples_per_class"]),
+    ])
 
     if parsed_arguments.n_estimators is not None:
         command.extend(["--n_estimators", str(parsed_arguments.n_estimators)])
@@ -2405,13 +2541,13 @@ def build_parser():
     )
     parser.add_argument(
         "--train_samples_per_class",
-        default=DEFAULT_BASELINE_TRAIN_SAMPLES_PER_CLASS,
+        default=None,
         type=int,
         help="stratified real train samples per class used by --baseline_real_only",
     )
     parser.add_argument(
         "--test_samples_per_class",
-        default=DEFAULT_BASELINE_TEST_SAMPLES_PER_CLASS,
+        default=None,
         type=int,
         help="stratified real test samples per class used by --baseline_real_only",
     )
@@ -2426,6 +2562,12 @@ def build_parser():
         default=None,
         type=int,
         help="per-class synthetic cap used to evaluate TR-TS classifiers",
+    )
+    parser.add_argument(
+        "--generated_samples_per_class",
+        default=None,
+        type=int,
+        help="per-class synthetic rows generated before splitting synthetic train/test quotas",
     )
     parser.add_argument(
         "--max_depth",
@@ -2540,6 +2682,9 @@ def main():
                 arguments.evaluation_mode,
             )
         arguments.evaluation_mode = effective_evaluation_mode(arguments)
+        baseline_sample_arguments = resolve_effective_sample_arguments(arguments, {})
+        for parameter, value in baseline_sample_arguments["values"].items():
+            setattr(arguments, parameter, value)
     print_all_settings(arguments)
     warn_prepare_limit_if_needed(arguments, campaigns_chosen)
 

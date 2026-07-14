@@ -46,6 +46,8 @@ try:
     from Engine.Classifiers.BatchClassifiers import validate_synthetic_batches_for_evaluation
     from Engine.Evaluation.EvaluationRunner import EvaluationMode
     from Engine.Evaluation.EvaluationRunner import EvaluationRunner
+    from Engine.Evaluation.EvaluationRunner import require_split_name
+    from Engine.Evaluation.EvaluationRunner import split_to_dictionary
     from Engine.Evaluation.EvaluationRunner import uses_strict_appclassnet_protocol
     from Engine.Preprocessing.FeatureTransformManager import ScaleGuard
 
@@ -57,7 +59,7 @@ except ImportError as error:
 
 class TrTs:
 
-    def evaluation_TR_TS(self, dictionary_data, synthetic_data):
+    def evaluation_TR_TS(self, dictionary_data=None, synthetic_data=None, *, real_train_data=None, synthetic_test_data=None):
         """
         Evaluates the performance of classifiers trained on real data and evaluated on synthetic data.
         This method trains classifiers using real data and evaluates them using synthetic data. The binary
@@ -74,6 +76,22 @@ class TrTs:
         logging.info(f"")
         logging.info(f"#################################################################################")
         logging.info(f"\tTR-TS: train on real, test on synthetic")
+        if real_train_data is not None:
+            require_split_name("TR-TS", real_train_data.name, "train")
+            dictionary_data = split_to_dictionary(real_train_data=real_train_data, real_test_data=real_train_data)
+        if synthetic_test_data is not None:
+            synthetic_data = synthetic_test_data
+        if dictionary_data is None:
+            raise ValueError("TR-TS requires real_train_data or dictionary_data.")
+        logging.info(
+            "TR-TS routing: train_split=%s test_split=synthetic_test real_train_path=%s real_train_y_path=%s "
+            "real_train_minimum_class_count=%s requested_train_samples_per_class=%s",
+            dictionary_data.get("training_split_name"),
+            dictionary_data.get("split_metadata", {}).get("train", {}).get("x_path"),
+            dictionary_data.get("split_metadata", {}).get("train", {}).get("y_path"),
+            dictionary_data.get("split_metadata", {}).get("train", {}).get("minimum_class_count"),
+            getattr(getattr(self, "arguments", None), "train_samples_per_class", None),
+        )
 
         arguments = getattr(self, "arguments", None)
         if getattr(arguments, "execution_mode", "normal") == "batches":

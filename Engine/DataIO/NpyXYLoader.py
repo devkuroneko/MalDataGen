@@ -158,7 +158,14 @@ class NpyXYLoader:
         if self.target_type == "multiclass":
             y_values = self._validate_multiclass_labels(split_name, y_values)
 
-        return SplitData(X=x_values, y=y_values, name=split_name)
+        return SplitData(
+            X=x_values,
+            y=y_values,
+            name=split_name,
+            x_path=str(x_path),
+            y_path=str(y_path),
+            dataset_id=self.source_profile,
+        )
 
     def _load_array(self, path: Path):
         if not path.is_file():

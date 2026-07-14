@@ -40,21 +40,67 @@ def _normalize_optional_labels(class_labels: Iterable[Any] | None) -> tuple[Any,
     return tuple(class_labels)
 
 
-def validate_xy_alignment(x, y, dataset_name: str):
+def _shape_of(values):
+    return getattr(values, "shape", None)
+
+
+def _object_id(values):
+    return hex(id(values))
+
+
+def _label_summary(y_array):
+    if y_array.size == 0:
+        return "classes=0 min=None max=None"
+    try:
+        unique_labels = numpy.unique(y_array)
+        min_label = unique_labels.min().item() if hasattr(unique_labels.min(), "item") else unique_labels.min()
+        max_label = unique_labels.max().item() if hasattr(unique_labels.max(), "item") else unique_labels.max()
+    except Exception:
+        return f"classes=unknown min=unknown max=unknown"
+    return (
+        f"classes={int(unique_labels.shape[0])} "
+        f"min={min_label} "
+        f"max={max_label}"
+    )
+
+
+def _source_indices_summary(source_indices):
+    if source_indices is None:
+        return "source_indices=None"
+    indices = numpy.asarray(source_indices).reshape(-1)
+    if indices.size == 0:
+        return "source_indices=size=0 min=None max=None"
+    return (
+        f"source_indices=size={int(indices.size)} "
+        f"min={int(indices.min())} max={int(indices.max())}"
+    )
+
+
+def validate_xy_alignment(x, y, dataset_name: str, *, split=None, fold=None, source_indices=None):
     """Validate that a feature matrix and label vector describe the same rows."""
     x_array = numpy.asarray(x)
     y_array = numpy.asarray(y).reshape(-1)
+    context = (
+        f"{dataset_name} split={split} fold={fold} "
+        f"X_id={_object_id(x)} y_id={_object_id(y)} "
+        f"original_X_shape={_shape_of(x)} original_y_shape={_shape_of(y)} "
+        f"{_source_indices_summary(source_indices)} {_label_summary(y_array)}"
+    )
     if x_array.ndim != 2:
         raise ValueError(
-            f"{dataset_name} X/y alignment error: X must be 2D; got X shape={x_array.shape}."
+            f"{context} X/y alignment error: X must be 2D; got X shape={x_array.shape}."
         )
     if x_array.shape[0] != y_array.shape[0]:
         raise ValueError(
-            f"{dataset_name} X/y alignment error: X has {x_array.shape[0]} rows, "
+            f"{context} X/y alignment error: X has {x_array.shape[0]} rows, "
             f"y has {y_array.shape[0]} rows. X shape={x_array.shape}, y shape={y_array.shape}."
         )
-    if not numpy.all(numpy.isfinite(y_array)):
-        raise ValueError(f"{dataset_name} X/y alignment error: y contains NaN or inf labels.")
+    try:
+        labels_are_finite = bool(numpy.all(numpy.isfinite(y_array)))
+    except TypeError:
+        labels_are_finite = False
+    if not labels_are_finite:
+        raise ValueError(f"{context} X/y alignment error: y contains NaN or inf labels.")
     return x_array, y_array
 
 
@@ -72,7 +118,10 @@ class AlignedDataset:
         self.X, self.y = validate_xy_alignment(
             self.X,
             self.y,
-            f"AlignedDataset split={self.split_name!r} fold={self.fold_id}",
+            "AlignedDataset",
+            split=self.split_name,
+            fold=self.fold_id,
+            source_indices=self.source_indices,
         )
 
 
@@ -153,6 +202,12 @@ class SplitData:
     X: Any
     y: Any | None = None
     name: str = "train"
+    x_path: str | None = None
+    y_path: str | None = None
+    dataset_id: str | None = None
+    num_samples: int = 0
+    class_counts: dict[Any, int] = field(default_factory=dict)
+    minimum_class_count: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name:
@@ -163,6 +218,7 @@ class SplitData:
             raise ValueError(f"SplitData.X for split {self.name!r} must be 2D. Got shape {self.X.shape}.")
 
         if self.y is None:
+            self.refresh_metadata()
             return
 
         self.y = self._normalize_y(self.y)
@@ -171,6 +227,7 @@ class SplitData:
                 f"SplitData X/y row mismatch for split {self.name!r}: "
                 f"X has {self.X.shape[0]} rows, y has {self.y.shape[0]} rows."
             )
+        self.refresh_metadata()
 
     @staticmethod
     def _normalize_y(y: Any) -> numpy.ndarray:
@@ -193,6 +250,29 @@ class SplitData:
     @property
     def num_features(self) -> int:
         return int(self.X.shape[1])
+
+    def refresh_metadata(self) -> None:
+        self.num_samples = int(self.X.shape[0])
+        if self.y is None:
+            self.class_counts = {}
+            self.minimum_class_count = None
+            return
+        labels = numpy.asarray(self.y).reshape(-1)
+        if labels.size == 0:
+            self.class_counts = {}
+            self.minimum_class_count = 0
+            return
+        unique_labels, counts = numpy.unique(labels, return_counts=True)
+        self.class_counts = {}
+        for label, count in zip(unique_labels, counts):
+            if numpy.issubdtype(unique_labels.dtype, numpy.integer):
+                key = int(label)
+            elif hasattr(label, "item"):
+                key = label.item()
+            else:
+                key = label
+            self.class_counts[key] = int(count)
+        self.minimum_class_count = int(counts.min()) if counts.size else 0
 
 
 @dataclass(slots=True)

@@ -46,6 +46,8 @@ try:
     from Engine.Classifiers.BatchClassifiers import validate_synthetic_batches_for_evaluation
     from Engine.Evaluation.EvaluationRunner import EvaluationMode
     from Engine.Evaluation.EvaluationRunner import EvaluationRunner
+    from Engine.Evaluation.EvaluationRunner import require_split_name
+    from Engine.Evaluation.EvaluationRunner import split_to_dictionary
     from Engine.Preprocessing.FeatureTransformManager import ScaleGuard
     from sklearn.utils import shuffle
 except ImportError as error:
@@ -80,7 +82,7 @@ def _select_stratified_array_subset(x_values, y_values, samples_per_class, seed=
 
 class TsTr:
 
-    def evaluation_TS_TR(self, dictionary_data, synthetic_data):
+    def evaluation_TS_TR(self, dictionary_data=None, synthetic_data=None, *, synthetic_train_data=None, real_test_data=None):
 
         """
         Evaluates the performance of classifiers trained on synthetic data and evaluated on real data.
@@ -98,6 +100,32 @@ class TsTr:
         logging.info(f"")
         logging.info(f"#################################################################################")
         logging.info(f"\tTS-TR: train on synthetic, test on real")
+        if real_test_data is not None:
+            require_split_name("TS-TR", real_test_data.name, "test")
+            dictionary_data = split_to_dictionary(real_train_data=real_test_data, real_test_data=real_test_data)
+        if synthetic_train_data is not None:
+            synthetic_data = synthetic_train_data
+        if dictionary_data is None:
+            raise ValueError("TS-TR requires real_test_data or dictionary_data.")
+        split_metadata = dictionary_data.get("split_metadata", {}).get("test", {})
+        requested_test_samples = getattr(getattr(self, "arguments", None), "test_samples_per_class", None)
+        available_minimum = split_metadata.get("minimum_class_count")
+        effective_test_samples = (
+            None if requested_test_samples is None
+            else min(int(requested_test_samples), int(available_minimum))
+            if available_minimum is not None
+            else int(requested_test_samples)
+        )
+        logging.info(
+            "TS-TR routing: train_split=synthetic_train test_split=%s real_test_path=%s real_test_y_path=%s "
+            "real_test_minimum_class_count=%s requested_test_samples_per_class=%s effective_test_samples_per_class=%s",
+            split_metadata.get("name", dictionary_data.get("evaluation_split_name")),
+            split_metadata.get("x_path"),
+            split_metadata.get("y_path"),
+            available_minimum,
+            requested_test_samples,
+            effective_test_samples,
+        )
 
         arguments = getattr(self, "arguments", None)
         if getattr(arguments, "execution_mode", "normal") == "batches":

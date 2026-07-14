@@ -10,6 +10,7 @@ from Engine.DataIO.SyntheticSanityChecks import NON_CLASS_CONDITIONAL_WARNING
 from Engine.DataIO.SyntheticSanityChecks import SCALE_WARNING
 from Engine.DataIO.SyntheticSanityChecks import SyntheticSanityChecker
 from Engine.DataIO.SyntheticSanityChecks import _stratified_real_subset
+from Engine.DataIO.DatasetContracts import AlignedDataset
 from main import SynDataGen
 
 
@@ -119,6 +120,43 @@ class SyntheticSanityChecksTest(unittest.TestCase):
 
         self.assertEqual(subset_x.shape[0], subset_y.shape[0])
         self.assertEqual(subset_counts.tolist(), [2, 2])
+
+    def test_aligned_dataset_is_accepted_by_sanity_runner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            aligned = AlignedDataset(
+                X=numpy.array([[0, 0], [0, 1], [10, 10], [10, 11]], dtype=numpy.float32),
+                y=numpy.array([0, 0, 1, 1], dtype=numpy.int64),
+                split_name="valid",
+                fold_id=1,
+                source_indices=numpy.array([8, 9, 10, 11]),
+            )
+            synthetic_data = {
+                0: numpy.array([[0, 0]], dtype=numpy.float32),
+                1: numpy.array([[10, 10]], dtype=numpy.float32),
+            }
+            checker = SyntheticSanityChecker(
+                real_x=aligned.X,
+                real_y=aligned.y,
+                synthetic_data=synthetic_data,
+                number_classes=2,
+                execution_mode="batches",
+                arguments=SimpleNamespace(train_samples_per_class=1),
+                fold_number=1,
+                model_type="copy",
+                experiment_directory=directory,
+            )
+            checker.output_path = Path(directory) / "synthetic_sanity_checks.json"
+
+            _, report = checker.run()
+
+            self.assertEqual(report["real_to_synthetic_classifier"]["real_subset_total_rows"], 2)
+
+    def test_subset_by_classes_fails_before_masking_when_y_is_from_full_dataset(self):
+        fold_x = numpy.zeros((4, 2), dtype=numpy.float32)
+        full_y = numpy.array([0, 0, 1, 1, 0, 1], dtype=numpy.int64)
+
+        with self.assertRaisesRegex(ValueError, "subset by classes input.*X has 4 rows, y has 6 rows"):
+            SynDataGen._subset_by_classes(fold_x, full_y, [0, 1])
 
     def test_insufficient_synthetic_generation_plan_fails_fast(self):
         owner = SynDataGen.__new__(SynDataGen)

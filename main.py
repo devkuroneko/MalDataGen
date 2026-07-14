@@ -110,20 +110,80 @@ PARTITIONED_GENERATION_SUPPORTED_MODELS = {
 }
 
 
+def _dataset_bundle_from_evaluation_input(owner, evaluation_input):
+    if hasattr(evaluation_input, "train") and hasattr(evaluation_input, "test"):
+        return evaluation_input
+    if isinstance(evaluation_input, dict):
+        return evaluation_input.get("dataset_bundle") or getattr(owner, "_dataset_bundle", None)
+    return getattr(owner, "_dataset_bundle", None)
+
+
+def _legacy_dictionary_for_real_splits(real_train_data, real_test_data):
+    return {
+        "x_training_real": real_train_data.X,
+        "y_training_real": real_train_data.y,
+        "x_evaluation_real": real_test_data.X,
+        "y_evaluation_real": real_test_data.y,
+        "training_split_name": real_train_data.name,
+        "evaluation_split_name": real_test_data.name,
+        "real_train_split": real_train_data,
+        "real_test_split": real_test_data,
+        "split_metadata": {
+            "train": {
+                "name": real_train_data.name,
+                "x_path": real_train_data.x_path,
+                "y_path": real_train_data.y_path,
+                "dataset_id": real_train_data.dataset_id,
+                "num_samples": real_train_data.num_samples,
+                "class_counts": {str(key): int(value) for key, value in real_train_data.class_counts.items()},
+                "minimum_class_count": real_train_data.minimum_class_count,
+                "shape": list(real_train_data.X.shape),
+            },
+            "test": {
+                "name": real_test_data.name,
+                "x_path": real_test_data.x_path,
+                "y_path": real_test_data.y_path,
+                "dataset_id": real_test_data.dataset_id,
+                "num_samples": real_test_data.num_samples,
+                "class_counts": {str(key): int(value) for key, value in real_test_data.class_counts.items()},
+                "minimum_class_count": real_test_data.minimum_class_count,
+                "shape": list(real_test_data.X.shape),
+            },
+        },
+    }
+
+
 def run_synthetic_evaluation_modes(owner, dictionary_data, evaluation_synthetic):
     evaluation_mode = getattr(owner.arguments, "evaluation_mode", "both")
     run_tr_ts = evaluation_mode in {"tr_ts", "both"}
     run_ts_tr = evaluation_mode in {"ts_tr", "both"}
     synthetic_for_tr_ts = getattr(evaluation_synthetic, "test_reader", evaluation_synthetic)
     synthetic_for_ts_tr = getattr(evaluation_synthetic, "train_reader", evaluation_synthetic)
+    dataset_bundle = _dataset_bundle_from_evaluation_input(owner, dictionary_data)
+    use_provided_bundle = (
+        dataset_bundle is not None
+        and getattr(owner.arguments, "split_mode", "cross_validation") == "provided"
+        and getattr(dataset_bundle, "test", None) is not None
+    )
+    if use_provided_bundle:
+        real_train = dataset_bundle.train
+        real_test = dataset_bundle.test
+        guard_dictionary = _legacy_dictionary_for_real_splits(real_train, real_test)
+    else:
+        real_train = None
+        real_test = None
+        guard_dictionary = dictionary_data
     if run_tr_ts:
-        owner._guard_current_evaluation_space(dictionary_data, synthetic_for_tr_ts)
+        owner._guard_current_evaluation_space(guard_dictionary, synthetic_for_tr_ts)
     if run_ts_tr and synthetic_for_ts_tr is not synthetic_for_tr_ts:
-        owner._guard_current_evaluation_space(dictionary_data, synthetic_for_ts_tr)
+        owner._guard_current_evaluation_space(guard_dictionary, synthetic_for_ts_tr)
     elif run_ts_tr and not run_tr_ts:
-        owner._guard_current_evaluation_space(dictionary_data, synthetic_for_ts_tr)
+        owner._guard_current_evaluation_space(guard_dictionary, synthetic_for_ts_tr)
     if run_tr_ts:
-        owner.evaluation_TR_TS(dictionary_data, synthetic_for_tr_ts)
+        if use_provided_bundle:
+            owner.evaluation_TR_TS(real_train_data=real_train, synthetic_test_data=synthetic_for_tr_ts)
+        else:
+            owner.evaluation_TR_TS(dictionary_data, synthetic_for_tr_ts)
     else:
         owner.mark_evaluation_classifiers_not_applicable(
             "TR-TS",
@@ -131,7 +191,10 @@ def run_synthetic_evaluation_modes(owner, dictionary_data, evaluation_synthetic)
             f"TR-TS skipped because evaluation_mode={evaluation_mode}.",
         )
     if run_ts_tr:
-        owner.evaluation_TS_TR(dictionary_data, synthetic_for_ts_tr)
+        if use_provided_bundle:
+            owner.evaluation_TS_TR(synthetic_train_data=synthetic_for_ts_tr, real_test_data=real_test)
+        else:
+            owner.evaluation_TS_TR(dictionary_data, synthetic_for_ts_tr)
     else:
         owner.mark_evaluation_classifiers_not_applicable(
             "TS-TR",
@@ -511,7 +574,18 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                     else:
                         run_synthetic_evaluation_modes(self, dictionary_data, evaluation_synthetic)
                         if getattr(self.arguments, "run_tr_tr", False):
-                            self.evaluation_TR_TR(dictionary_data)
+                            dataset_bundle = dictionary_data.get("dataset_bundle") or getattr(self, "_dataset_bundle", None)
+                            if (
+                                dataset_bundle is not None
+                                and getattr(self.arguments, "split_mode", "cross_validation") == "provided"
+                                and getattr(dataset_bundle, "test", None) is not None
+                            ):
+                                self.evaluation_TR_TR(
+                                    real_train_data=dataset_bundle.train,
+                                    real_test_data=dataset_bundle.test,
+                                )
+                            else:
+                                self.evaluation_TR_TR(dictionary_data)
                 
                 # self.calculate_sdv_metrics(dictionary_data, fold)
 
@@ -617,13 +691,16 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
         real_x, real_y = validate_xy_alignment(
             real_x,
             real_y,
-            f"sanity check source split={split_name} fold={self.fold_number + 1}",
+            "sanity check source",
+            split=split_name,
+            fold=self.fold_number + 1,
         )
         return AlignedDataset(
             X=real_x,
             y=real_y,
             split_name=split_name,
             fold_id=self.fold_number + 1,
+            source_indices=numpy.arange(real_y.shape[0], dtype=numpy.int64),
             data_space="source",
         )
 
@@ -725,9 +802,23 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
 
     @staticmethod
     def _subset_by_classes(x_values, y_values, classes):
+        x_values, y_values = validate_xy_alignment(
+            x_values,
+            y_values,
+            "subset by classes input",
+        )
         labels = numpy.ravel(numpy.asarray(y_values)).astype(int)
         mask = numpy.isin(labels, numpy.asarray(classes, dtype=int))
-        return numpy.asarray(x_values[mask], dtype=numpy.float32), labels[mask]
+        indices = numpy.flatnonzero(mask)
+        subset_x = numpy.asarray(x_values[indices], dtype=numpy.float32)
+        subset_y = labels[indices]
+        validate_xy_alignment(
+            subset_x,
+            subset_y,
+            "subset by classes output",
+            source_indices=indices,
+        )
+        return subset_x, subset_y
 
     def _release_current_generator(self):
         model_type = self.arguments.model_type
@@ -777,6 +868,12 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
         """
 
         logging.info("Starting model creation and prediction process.")
+        x_real_samples, y_real_samples = validate_xy_alignment(
+            x_real_samples,
+            y_real_samples,
+            "train_model input",
+            fold=k_fold + 1 if k_fold is not None else None,
+        )
         logging.info("Number of real samples: %d", len(x_real_samples)) # Log the number of real samples
 
         try:
@@ -865,6 +962,23 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
 
             #dictionary_data['y_training_real']
             #labels = dictionary_data['y_evaluation_real']
+            x_real_samples, y_real_samples = validate_xy_alignment(
+                x_real_samples,
+                y_real_samples,
+                "synthesize_data real/evaluation input",
+                split="evaluation",
+                fold=(fold + 1) if fold is not None else self.fold_number + 1,
+            )
+            if x_training_real is not None or y_training_real is not None:
+                if x_training_real is None or y_training_real is None:
+                    raise ValueError("synthesize_data requires both x_training_real and y_training_real when either is provided.")
+                x_training_real, y_training_real = validate_xy_alignment(
+                    x_training_real,
+                    y_training_real,
+                    "synthesize_data training input",
+                    split="train",
+                    fold=(fold + 1) if fold is not None else self.fold_number + 1,
+                )
             number_samples_per_class = self._build_generation_metadata(y_real_samples)
             logging.info("\t\tnumber_samples_per_class: %s", number_samples_per_class)
 
@@ -1313,6 +1427,13 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
             y_real_samples,
             split_name=None,
             seed=42):
+            x_real_samples, y_real_samples = validate_xy_alignment(
+                x_real_samples,
+                y_real_samples,
+                "_synthesize_data_incremental input",
+                split=split_name or "evaluation",
+                fold=self.fold_number + 1,
+            )
             generator = self._get_active_generator()
             output_format = getattr(self.arguments, "save_synthetic_format", "npy_batches")
             if output_format == "legacy":
@@ -1391,7 +1512,7 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
             logging.info("Synthetic label generation audit passed: %s", audit_path)
             sanity_path, _ = run_synthetic_sanity_checks(
                 self._aligned_sanity_real_dataset(
-                    self._current_evaluation_source_x if self._current_evaluation_source_x is not None else x_real_samples,
+                    x_real_samples,
                     y_real_samples,
                     split_name or "evaluation",
                 ),

@@ -28,6 +28,10 @@ class EvaluationMode(str, Enum):
     TS_TR = "TS-TR"
 
 
+class EvaluationSplitMismatchError(ValueError):
+    """Raised when a final evaluation receives the wrong real split."""
+
+
 @dataclass
 class EvaluationDataset:
     X_train: Any
@@ -73,6 +77,67 @@ def class_counts(labels):
     return {str(int(label)): int(count) for label, count in zip(unique_labels, counts)}
 
 
+def minimum_class_count(labels):
+    counts = class_counts(labels)
+    if not counts:
+        return 0
+    return int(min(counts.values()))
+
+
+def split_metadata_from_mapping(dictionary_data, role):
+    metadata = dictionary_data.get("split_metadata", {})
+    if role in metadata and metadata[role] is not None:
+        return dict(metadata[role])
+    name = dictionary_data.get(f"{role}_split_name")
+    return {"name": name} if name is not None else {}
+
+
+def split_to_dictionary(real_train_data=None, real_test_data=None):
+    if real_train_data is None:
+        raise ValueError("real_train_data is required.")
+    test_split = real_test_data if real_test_data is not None else real_train_data
+    return {
+        "x_training_real": real_train_data.X,
+        "y_training_real": real_train_data.y,
+        "x_evaluation_real": test_split.X,
+        "y_evaluation_real": test_split.y,
+        "training_split_name": real_train_data.name,
+        "evaluation_split_name": test_split.name,
+        "real_train_split": real_train_data,
+        "real_test_split": test_split,
+        "split_metadata": {
+            "train": split_metadata_from_split(real_train_data),
+            "test": split_metadata_from_split(test_split),
+            "evaluation": split_metadata_from_split(test_split),
+        },
+    }
+
+
+def split_metadata_from_split(split):
+    if split is None:
+        return None
+    return {
+        "name": split.name,
+        "x_path": getattr(split, "x_path", None),
+        "y_path": getattr(split, "y_path", None),
+        "dataset_id": getattr(split, "dataset_id", None),
+        "num_samples": int(getattr(split, "num_samples", len(split.X))),
+        "class_counts": {
+            str(key): int(value)
+            for key, value in getattr(split, "class_counts", {}).items()
+        },
+        "minimum_class_count": getattr(split, "minimum_class_count", None),
+        "shape": list(numpy.asarray(split.X).shape),
+    }
+
+
+def require_split_name(evaluation_name, actual_name, expected_name):
+    if actual_name != expected_name:
+        raise EvaluationSplitMismatchError(
+            f"{evaluation_name} requires real split '{expected_name}', but received '{actual_name}'."
+        )
+
+
 def dataset_hash(values):
     values = numpy.asarray(values)
     digest = hashlib.sha256()
@@ -92,13 +157,21 @@ class EvaluationRunner:
         strict = uses_strict_appclassnet_protocol(getattr(self.owner, "arguments", None))
 
         if self.mode == EvaluationMode.TR_TR:
+            train_metadata = split_metadata_from_mapping(dictionary_data, "train")
+            test_metadata = split_metadata_from_mapping(dictionary_data, "test")
+            if strict and train_metadata.get("name") is not None:
+                require_split_name("TR-TR", train_metadata.get("name"), "train")
+            if strict and test_metadata.get("name") is not None:
+                require_split_name("TR-TR", test_metadata.get("name"), "test")
             return EvaluationDataset(
                 X_train=dictionary_data["x_training_real"],
                 y_train=labels_to_1d_integer(dictionary_data["y_training_real"], context="TR-TR training labels"),
                 X_test=dictionary_data["x_evaluation_real"],
                 y_test=labels_to_1d_integer(dictionary_data["y_evaluation_real"], context="TR-TR evaluation labels"),
-                train_origin="real:training",
-                test_origin="real:evaluation",
+                train_origin=f"real:{train_metadata.get('name', 'training')}",
+                test_origin=f"real:{test_metadata.get('name', 'evaluation')}",
+                train_metadata=train_metadata,
+                test_metadata=test_metadata,
             )
 
         if self.mode == EvaluationMode.TR_TS:
@@ -106,10 +179,14 @@ class EvaluationRunner:
             if strict:
                 train_x = dictionary_data["x_training_real"]
                 train_y = dictionary_data["y_training_real"]
-                train_origin = "real:training"
+                train_metadata = split_metadata_from_mapping(dictionary_data, "train")
+                if train_metadata.get("name") is not None:
+                    require_split_name("TR-TS", train_metadata.get("name"), "train")
+                train_origin = "real:train" if train_metadata.get("name") == "train" else "real:training"
             else:
                 train_x = dictionary_data["x_evaluation_real"]
                 train_y = dictionary_data["y_evaluation_real"]
+                train_metadata = split_metadata_from_mapping(dictionary_data, "evaluation")
                 train_origin = "real:evaluation:legacy_tr_ts"
             return EvaluationDataset(
                 X_train=train_x,
@@ -118,36 +195,55 @@ class EvaluationRunner:
                 y_test=synthetic_y,
                 train_origin=train_origin,
                 test_origin="synthetic:evaluation",
-                train_metadata=ScaleGuard.describe(train_x, data_space="source"),
+                train_metadata={**ScaleGuard.describe(train_x, data_space="source"), **train_metadata},
                 test_metadata=getattr(self.owner, "_current_synthetic_metadata", None),
             )
 
         if self.mode == EvaluationMode.TS_TR:
             synthetic_x, synthetic_y = materialize_synthetic_dict(synthetic_data)
+            test_metadata = split_metadata_from_mapping(dictionary_data, "test")
+            if strict and test_metadata.get("name") is not None:
+                require_split_name("TS-TR", test_metadata.get("name"), "test")
             return EvaluationDataset(
                 X_train=synthetic_x,
                 y_train=synthetic_y,
                 X_test=dictionary_data["x_evaluation_real"],
                 y_test=labels_to_1d_integer(dictionary_data["y_evaluation_real"], context="TS-TR evaluation labels"),
                 train_origin="synthetic:training",
-                test_origin="real:evaluation",
+                test_origin=f"real:{test_metadata.get('name', 'evaluation')}",
                 train_metadata=getattr(self.owner, "_current_synthetic_metadata", None),
-                test_metadata=getattr(self.owner, "_current_real_source_metadata", None),
+                test_metadata={**(getattr(self.owner, "_current_real_source_metadata", None) or {}), **test_metadata},
             )
 
         raise ValueError(f"Unsupported evaluation mode: {self.mode}")
 
     def validate(self, dataset: EvaluationDataset):
-        dataset.X_train, dataset.y_train = validate_xy_alignment(
-            dataset.X_train,
-            dataset.y_train,
-            f"{self.mode.value} train origin={dataset.train_origin}",
-        )
-        dataset.X_test, dataset.y_test = validate_xy_alignment(
-            dataset.X_test,
-            dataset.y_test,
-            f"{self.mode.value} test origin={dataset.test_origin}",
-        )
+        try:
+            dataset.X_train, dataset.y_train = validate_xy_alignment(
+                dataset.X_train,
+                dataset.y_train,
+                f"{self.mode.value} train origin={dataset.train_origin}",
+            )
+        except ValueError as error:
+            prefix = (
+                "train X/y length mismatch"
+                if "X has" in str(error) and "y has" in str(error)
+                else "train X/y alignment error"
+            )
+            raise ValueError(f"{prefix}: {error}") from error
+        try:
+            dataset.X_test, dataset.y_test = validate_xy_alignment(
+                dataset.X_test,
+                dataset.y_test,
+                f"{self.mode.value} test origin={dataset.test_origin}",
+            )
+        except ValueError as error:
+            prefix = (
+                "test X/y length mismatch"
+                if "X has" in str(error) and "y has" in str(error)
+                else "test X/y alignment error"
+            )
+            raise ValueError(f"{prefix}: {error}") from error
         if len(dataset.X_train) == 0 or len(dataset.X_test) == 0:
             raise ValueError(f"{self.mode.value} requires non-empty train and test datasets.")
 
@@ -201,6 +297,16 @@ class EvaluationRunner:
             "transform_id": dataset.transform_id,
             "train_shape": list(numpy.asarray(dataset.X_train).shape),
             "test_shape": list(numpy.asarray(dataset.X_test).shape),
+            "train_split_name": (dataset.train_metadata or {}).get("name"),
+            "test_split_name": (dataset.test_metadata or {}).get("name"),
+            "train_x_path": (dataset.train_metadata or {}).get("x_path"),
+            "train_y_path": (dataset.train_metadata or {}).get("y_path"),
+            "test_x_path": (dataset.test_metadata or {}).get("x_path"),
+            "test_y_path": (dataset.test_metadata or {}).get("y_path"),
+            "train_dataset_id": (dataset.train_metadata or {}).get("dataset_id"),
+            "test_dataset_id": (dataset.test_metadata or {}).get("dataset_id"),
+            "train_minimum_class_count": minimum_class_count(dataset.y_train),
+            "test_minimum_class_count": minimum_class_count(dataset.y_test),
             "train_hash": dataset_hash(dataset.X_train),
             "test_hash": dataset_hash(dataset.X_test),
             "train_class_counts": class_counts(dataset.y_train),

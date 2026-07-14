@@ -7,6 +7,10 @@ import json
 
 import numpy
 
+from Engine.DataIO.DatasetContracts import DatasetBundle
+from Engine.DataIO.DatasetContracts import DatasetSchema
+from Engine.DataIO.DatasetContracts import SplitData
+from Engine.Evaluation.EvaluationRunner import EvaluationSplitMismatchError
 from Engine.Preprocessing.FeatureTransformManager import PreprocessingSpaceMismatchError
 from Engine.Preprocessing.FeatureTransformManager import ScaleGuard
 from main import run_synthetic_evaluation_modes
@@ -77,6 +81,46 @@ class AppClassNetEvaluationModeTest(unittest.TestCase):
             ],
         )
 
+    def test_provided_tr_ts_uses_train_and_synthetic_test(self):
+        bundle = _provided_bundle()
+        owner = _FakeEvaluationOwner("tr_ts", split_mode="provided")
+        owner._dataset_bundle = bundle
+        synthetic = SimpleNamespace(train_reader={"split": "synthetic_train"}, test_reader={"split": "synthetic_test"})
+
+        run_synthetic_evaluation_modes(owner, {"dataset_bundle": bundle}, synthetic)
+
+        self.assertEqual(owner.calls[-2:], [("TR-TS", "train", synthetic.test_reader), ("skip", "TS-TR")])
+
+    def test_provided_ts_tr_uses_synthetic_train_and_test(self):
+        bundle = _provided_bundle()
+        owner = _FakeEvaluationOwner("ts_tr", split_mode="provided")
+        owner._dataset_bundle = bundle
+        synthetic = SimpleNamespace(train_reader={"split": "synthetic_train"}, test_reader={"split": "synthetic_test"})
+
+        run_synthetic_evaluation_modes(owner, {"dataset_bundle": bundle}, synthetic)
+
+        self.assertEqual(owner.calls[-2:], [("skip", "TR-TS"), ("TS-TR", synthetic.train_reader, "test")])
+
+    def test_provided_both_never_routes_valid_to_ts_tr(self):
+        bundle = _provided_bundle()
+        owner = _FakeEvaluationOwner("both", split_mode="provided")
+        owner._dataset_bundle = bundle
+        synthetic = SimpleNamespace(train_reader={"split": "synthetic_train"}, test_reader={"split": "synthetic_test"})
+
+        run_synthetic_evaluation_modes(owner, {"dataset_bundle": bundle}, synthetic)
+
+        self.assertIn(("TS-TR", synthetic.train_reader, "test"), owner.calls)
+        self.assertNotIn(("TS-TR", synthetic.train_reader, "valid"), owner.calls)
+
+    def test_ts_tr_rejects_valid_as_real_test_split(self):
+        owner = _FakeEvaluationOwner("ts_tr", split_mode="provided")
+
+        with self.assertRaisesRegex(EvaluationSplitMismatchError, "TS-TR requires real split 'test', but received 'valid'"):
+            owner.evaluation_TS_TR(
+                synthetic_train_data={"split": "synthetic_train"},
+                real_test_data=_provided_bundle().valid,
+            )
+
     def test_scale_mismatch_blocks_evaluation(self):
         real = numpy.array([[-0.5, 0.0], [0.5, 0.25]], dtype=numpy.float32)
         synthetic = numpy.array([[0.0, 1.0], [0.5, 0.75]], dtype=numpy.float32)
@@ -112,14 +156,91 @@ class AppClassNetEvaluationModeTest(unittest.TestCase):
 
         self.assertIn("--evaluation_mode", command)
         self.assertEqual(command[command.index("--evaluation_mode") + 1], "tr_ts")
-        self.assertNotIn("--train_samples_per_class", command)
-        self.assertNotIn("--test_samples_per_class", command)
+        self.assertEqual(
+            command[command.index("--train_samples_per_class") + 1],
+            str(runner.DEFAULT_BASELINE_TRAIN_SAMPLES_PER_CLASS),
+        )
+        self.assertEqual(
+            command[command.index("--test_samples_per_class") + 1],
+            str(runner.DEFAULT_BASELINE_TEST_SAMPLES_PER_CLASS),
+        )
         self.assertIn("--synthetic_train_samples_per_class", command)
         self.assertIn("--synthetic_test_samples_per_class", command)
         self.assertEqual(command[command.index("--number_samples_per_class") + 1], build_number_samples_per_class_plan(28))
 
+    def test_no_sample_arguments_use_defaults(self):
+        command = _batch_command_for_args(self, _batch_args(), {"model_type": "copy"})
+
+        self.assertEqual(
+            command[command.index("--train_samples_per_class") + 1],
+            str(runner.DEFAULT_BASELINE_TRAIN_SAMPLES_PER_CLASS),
+        )
+        self.assertEqual(
+            command[command.index("--test_samples_per_class") + 1],
+            str(runner.DEFAULT_BASELINE_TEST_SAMPLES_PER_CLASS),
+        )
+        self.assertEqual(
+            command[command.index("--synthetic_train_samples_per_class") + 1],
+            str(runner.DEFAULT_SYNTHETIC_SAMPLES_PER_CLASS),
+        )
+        self.assertEqual(
+            command[command.index("--synthetic_test_samples_per_class") + 1],
+            str(runner.DEFAULT_SYNTHETIC_SAMPLES_PER_CLASS),
+        )
+        self.assertEqual(
+            command[command.index("--number_samples_per_class") + 1],
+            build_number_samples_per_class_plan(runner.DEFAULT_SYNTHETIC_SAMPLES_PER_CLASS * 2),
+        )
+
+    def test_campaign_sample_arguments_override_defaults(self):
+        command = _batch_command_for_args(
+            self,
+            _batch_args(),
+            {
+                "model_type": "copy",
+                "train_samples_per_class": 80,
+                "test_samples_per_class": 40,
+                "synthetic_train_samples_per_class": 12,
+                "synthetic_test_samples_per_class": 13,
+                "generated_samples_per_class": 30,
+            },
+        )
+
+        self.assertEqual(command[command.index("--train_samples_per_class") + 1], "80")
+        self.assertEqual(command[command.index("--test_samples_per_class") + 1], "40")
+        self.assertEqual(command[command.index("--synthetic_train_samples_per_class") + 1], "12")
+        self.assertEqual(command[command.index("--synthetic_test_samples_per_class") + 1], "13")
+        self.assertEqual(command[command.index("--number_samples_per_class") + 1], build_number_samples_per_class_plan(30))
+
+    def test_cli_sample_arguments_override_campaign(self):
+        args = _batch_args()
+        args.train_samples_per_class = 1000
+        args.synthetic_train_samples_per_class = 500
+        args.synthetic_test_samples_per_class = 500
+        args.generated_samples_per_class = 1000
+
+        command = _batch_command_for_args(
+            self,
+            args,
+            {
+                "model_type": "copy",
+                "train_samples_per_class": 500,
+                "synthetic_train_samples_per_class": 100,
+                "synthetic_test_samples_per_class": 100,
+                "generated_samples_per_class": 200,
+            },
+        )
+
+        self.assertEqual(command[command.index("--train_samples_per_class") + 1], "1000")
+        self.assertEqual(command[command.index("--synthetic_train_samples_per_class") + 1], "500")
+        self.assertEqual(command[command.index("--synthetic_test_samples_per_class") + 1], "500")
+        self.assertEqual(command[command.index("--number_samples_per_class") + 1], build_number_samples_per_class_plan(1000))
+
     def test_synthetic_50_50_plans_100_per_class(self):
         self.assertEqual(_planned_samples_for_synthetic_quotas(self, 50, 50), build_number_samples_per_class_plan(100))
+
+    def test_synthetic_100_100_plans_200_per_class(self):
+        self.assertEqual(_planned_samples_for_synthetic_quotas(self, 100, 100), build_number_samples_per_class_plan(200))
 
     def test_synthetic_200_200_plans_400_per_class(self):
         self.assertEqual(_planned_samples_for_synthetic_quotas(self, 200, 200), build_number_samples_per_class_plan(400))
@@ -158,6 +279,25 @@ class AppClassNetEvaluationModeTest(unittest.TestCase):
         self.assertEqual(command[command.index("--train_samples_per_class") + 1], "1000")
         self.assertEqual(command[command.index("--synthetic_train_samples_per_class") + 1], "500")
 
+    def test_generated_samples_per_class_sufficient_is_used_for_legacy_plan(self):
+        args = _batch_args()
+        args.synthetic_train_samples_per_class = 100
+        args.synthetic_test_samples_per_class = 100
+        args.generated_samples_per_class = 250
+
+        command = _batch_command_for_args(self, args, {"model_type": "copy"})
+
+        self.assertEqual(command[command.index("--number_samples_per_class") + 1], build_number_samples_per_class_plan(250))
+
+    def test_generated_samples_per_class_insufficient_fails_before_subprocess(self):
+        args = _batch_args()
+        args.synthetic_train_samples_per_class = 200
+        args.synthetic_test_samples_per_class = 200
+        args.generated_samples_per_class = 399
+
+        with self.assertRaisesRegex(ValueError, "InsufficientGeneratedSamplesPerClass"):
+            _batch_command_for_args(self, args, {"model_type": "copy"})
+
     def test_duplicate_arguments_are_detected(self):
         with self.assertRaisesRegex(ValueError, "DuplicateCommandArgumentConflict"):
             deduplicate_command_options([
@@ -190,6 +330,32 @@ class AppClassNetEvaluationModeTest(unittest.TestCase):
 
         self.assertEqual(command.count("--variational_autoencoder_batch_size"), 1)
         self.assertEqual(command[command.index("--variational_autoencoder_batch_size") + 1], "8192")
+
+    def test_batch_command_contains_no_duplicate_arguments(self):
+        command = _batch_command_for_args(
+            self,
+            _batch_args(),
+            {"model_type": "variational", "variational_autoencoder_batch_size": 128},
+        )
+        options = [token for token in command if str(token).startswith("--")]
+
+        self.assertEqual(len(options), len(set(options)))
+
+    def test_legacy_number_samples_per_class_plan_uses_generated_count(self):
+        plan = build_number_samples_per_class_plan(123)
+
+        self.assertTrue(plan.startswith("0:123,1:123,2:123"))
+        self.assertTrue(plan.endswith("197:123,198:123,199:123"))
+        self.assertEqual(len(plan.split(",")), APPCLASSNET_NUM_CLASSES)
+
+    def test_runner_parser_sample_defaults_are_none(self):
+        parsed = runner.build_parser().parse_args([])
+
+        self.assertIsNone(parsed.train_samples_per_class)
+        self.assertIsNone(parsed.test_samples_per_class)
+        self.assertIsNone(parsed.synthetic_train_samples_per_class)
+        self.assertIsNone(parsed.synthetic_test_samples_per_class)
+        self.assertIsNone(parsed.generated_samples_per_class)
 
     def test_evaluation_mode_none(self):
         _, payload = runner.write_batches_metrics(
@@ -355,22 +521,70 @@ class AppClassNetEvaluationModeTest(unittest.TestCase):
 
 
 class _FakeEvaluationOwner:
-    def __init__(self, evaluation_mode):
-        self.arguments = SimpleNamespace(evaluation_mode=evaluation_mode)
+    def __init__(self, evaluation_mode, split_mode="cross_validation"):
+        self.arguments = SimpleNamespace(evaluation_mode=evaluation_mode, split_mode=split_mode)
         self.fold_number = 0
         self.calls = []
 
     def _guard_current_evaluation_space(self, dictionary_data, synthetic_data):
         self.calls.append(("guard", synthetic_data))
 
-    def evaluation_TR_TS(self, dictionary_data, synthetic_data):
-        self.calls.append(("TR-TS", synthetic_data))
+    def evaluation_TR_TS(self, dictionary_data=None, synthetic_data=None, *, real_train_data=None, synthetic_test_data=None):
+        if real_train_data is not None:
+            self.calls.append(("TR-TS", real_train_data.name, synthetic_test_data))
+        else:
+            self.calls.append(("TR-TS", synthetic_data))
 
-    def evaluation_TS_TR(self, dictionary_data, synthetic_data):
-        self.calls.append(("TS-TR", synthetic_data))
+    def evaluation_TS_TR(self, dictionary_data=None, synthetic_data=None, *, synthetic_train_data=None, real_test_data=None):
+        if real_test_data is not None:
+            if real_test_data.name != "test":
+                raise EvaluationSplitMismatchError(
+                    f"TS-TR requires real split 'test', but received '{real_test_data.name}'."
+                )
+            self.calls.append(("TS-TR", synthetic_train_data, real_test_data.name))
+        else:
+            self.calls.append(("TS-TR", synthetic_data))
 
     def mark_evaluation_classifiers_not_applicable(self, evaluation_type, fold, reason):
         self.calls.append(("skip", evaluation_type))
+
+
+def _provided_bundle():
+    schema = DatasetSchema(
+        feature_names=["f0", "f1"],
+        target_type="multiclass",
+        feature_type="continuous",
+        num_classes=3,
+        source_format="npy_xy",
+        source_profile="appclassnet_top200",
+    )
+    return DatasetBundle(
+        train=SplitData(
+            X=numpy.zeros((6, 2), dtype=numpy.float32),
+            y=numpy.array([0, 0, 1, 1, 2, 2]),
+            name="train",
+            x_path="/dataset/train_x.npy",
+            y_path="/dataset/train_y.npy",
+            dataset_id="appclassnet_top200",
+        ),
+        valid=SplitData(
+            X=numpy.ones((3, 2), dtype=numpy.float32),
+            y=numpy.array([0, 1, 2]),
+            name="valid",
+            x_path="/dataset/valid_x.npy",
+            y_path="/dataset/valid_y.npy",
+            dataset_id="appclassnet_top200",
+        ),
+        test=SplitData(
+            X=numpy.full((9, 2), 2.0, dtype=numpy.float32),
+            y=numpy.array([0, 0, 0, 1, 1, 1, 2, 2, 2]),
+            name="test",
+            x_path="/dataset/test_x.npy",
+            y_path="/dataset/test_y.npy",
+            dataset_id="appclassnet_top200",
+        ),
+        schema=schema,
+    )
 
 
 class _SyntheticMemoryBatches:
@@ -405,6 +619,7 @@ def _batch_args(evaluation_mode="both"):
         test_samples_per_class=None,
         synthetic_train_samples_per_class=None,
         synthetic_test_samples_per_class=None,
+        generated_samples_per_class=None,
         n_estimators=None,
         max_depth=None,
         max_samples=None,
@@ -419,7 +634,7 @@ def _batch_args(evaluation_mode="both"):
     )
 
 
-def _planned_samples_for_synthetic_quotas(test_case, train_quota, test_quota):
+def _batch_command_for_args(test_case, args, combination):
     directory = tempfile.TemporaryDirectory()
     test_case.addCleanup(directory.cleanup)
     raw_root = Path(directory.name)
@@ -427,18 +642,22 @@ def _planned_samples_for_synthetic_quotas(test_case, train_quota, test_quota):
         numpy.save(raw_root / f"{split}_x.npy", numpy.zeros((APPCLASSNET_NUM_CLASSES, 2), dtype=numpy.float32))
         numpy.save(raw_root / f"{split}_y.npy", numpy.arange(APPCLASSNET_NUM_CLASSES, dtype=numpy.int64))
 
-    args = _batch_args()
-    args.synthetic_train_samples_per_class = train_quota
-    args.synthetic_test_samples_per_class = test_quota
-    command = build_batch_main_command(
+    return build_batch_main_command(
         "python3",
         raw_root,
         raw_root / "out",
-        {"model_type": "copy"},
+        combination,
         20,
         "multiclass",
         args,
     )
+
+
+def _planned_samples_for_synthetic_quotas(test_case, train_quota, test_quota):
+    args = _batch_args()
+    args.synthetic_train_samples_per_class = train_quota
+    args.synthetic_test_samples_per_class = test_quota
+    command = _batch_command_for_args(test_case, args, {"model_type": "copy"})
     return command[command.index("--number_samples_per_class") + 1]
 
 

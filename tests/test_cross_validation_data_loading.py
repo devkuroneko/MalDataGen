@@ -6,9 +6,11 @@ from types import SimpleNamespace
 import numpy
 
 from Engine.Evaluation.CrossValidation import _apply_bundle_to_owner
+from Engine.Evaluation.CrossValidation import _apply_stratified_split_selection
 from Engine.Evaluation.CrossValidation import _build_provided_split_folds
 from Engine.Evaluation.CrossValidation import StratifiedData
 from Engine.Evaluation.CrossValidation import load_dataset_from_args
+from Engine.DataIO.DatasetContracts import SplitData
 
 
 class DummyCsvOwner:
@@ -90,7 +92,7 @@ class CrossValidationDataLoadingTest(unittest.TestCase):
             self.assertEqual(bundle.schema.feature_type, "continuous")
             self.assertEqual(bundle.metadata["mmap_mode"], "r")
 
-    def test_provided_split_uses_valid_as_evaluation_without_kfold(self):
+    def test_provided_split_keeps_valid_for_internal_evaluation_but_requires_test_for_final(self):
         with tempfile.TemporaryDirectory() as directory:
             self._save_split(directory, "train", numpy.zeros((3, 2)), [0, 1, 2])
             self._save_split(directory, "valid", numpy.ones((2, 2)), [1, 2])
@@ -107,7 +109,34 @@ class CrossValidationDataLoadingTest(unittest.TestCase):
             self.assertEqual(fold["x_training_real"].shape, (3, 2))
             self.assertEqual(fold["x_evaluation_real"].shape, (2, 2))
             self.assertEqual(fold["evaluation_split_name"], "valid")
+            self.assertTrue(fold["evaluation_not_applicable"])
+            self.assertEqual(fold["validation_split_name"], "valid")
+            self.assertIsNone(fold["real_test_split"])
+            self.assertEqual(fold["training_source_indices"].tolist(), [0, 1, 2])
+            self.assertEqual(fold["evaluation_source_indices"].tolist(), [0, 1])
+
+    def test_provided_split_uses_test_as_final_real_split_when_valid_exists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self._save_split(directory, "train", numpy.zeros((3, 2)), [0, 1, 2])
+            self._save_split(directory, "valid", numpy.ones((2, 2)), [1, 2])
+            self._save_split(directory, "test", numpy.full((4, 2), 2.0), [0, 0, 1, 2])
+
+            args = npy_args(directory, split_mode="provided", with_valid=True, with_test=True)
+            bundle = load_dataset_from_args(args)
+            owner = SimpleNamespace(arguments=args, list_folds=[])
+
+            _apply_bundle_to_owner(owner, bundle)
+            _build_provided_split_folds(owner, bundle)
+
+            self.assertEqual(len(owner.list_folds), 1)
+            fold = owner.list_folds[0]
+            self.assertEqual(fold["evaluation_split_name"], "valid")
             self.assertFalse(fold["evaluation_not_applicable"])
+            self.assertEqual(fold["real_train_split"].name, "train")
+            self.assertEqual(fold["real_valid_split"].name, "valid")
+            self.assertEqual(fold["real_test_split"].name, "test")
+            self.assertEqual(fold["split_metadata"]["test"]["y_path"], str(Path(directory) / "test_y.npy"))
+            self.assertEqual(fold["split_metadata"]["test"]["minimum_class_count"], 1)
 
     def test_provided_train_only_marks_evaluation_not_applicable(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -145,6 +174,11 @@ class CrossValidationDataLoadingTest(unittest.TestCase):
             self.assertEqual(result, "done")
             self.assertEqual(owner._number_samples_per_class["number_classes"], 200)
             self.assertEqual(len(owner.list_folds), 2)
+            for fold in owner.list_folds:
+                self.assertEqual(fold["x_training_real"].shape[0], fold["y_training_real"].shape[0])
+                self.assertEqual(fold["x_evaluation_real"].shape[0], fold["y_evaluation_real"].shape[0])
+                self.assertEqual(fold["training_source_indices"].shape[0], fold["y_training_real"].shape[0])
+                self.assertEqual(fold["evaluation_source_indices"].shape[0], fold["y_evaluation_real"].shape[0])
 
     def test_batches_provided_split_uses_stratified_selection_for_train_and_valid(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -178,6 +212,68 @@ class CrossValidationDataLoadingTest(unittest.TestCase):
             self.assertEqual(valid_counts, {0: 1, 1: 1, 2: 1})
             self.assertTrue((Path(directory) / "SelectionReports" / "train_stratified_selection.json").is_file())
             self.assertTrue((Path(directory) / "SelectionReports" / "valid_stratified_selection.json").is_file())
+
+    def test_batches_provided_test_quota_uses_test_not_low_coverage_valid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self._save_split(
+                directory,
+                "train",
+                numpy.arange(18).reshape(9, 2),
+                [0, 0, 0, 1, 1, 1, 2, 2, 2],
+            )
+            self._save_split(
+                directory,
+                "valid",
+                numpy.arange(6).reshape(3, 2),
+                [0, 1, 2],
+            )
+            self._save_split(
+                directory,
+                "test",
+                numpy.arange(18).reshape(9, 2),
+                [0, 0, 0, 1, 1, 1, 2, 2, 2],
+            )
+
+            args = npy_args(directory, split_mode="provided", with_valid=True, with_test=True)
+            args.execution_mode = "batches"
+            args.num_classes = 3
+            args.train_samples_per_class = 2
+            args.test_samples_per_class = 2
+            args.strict_min_samples_per_class = True
+            owner = SimpleNamespace(arguments=args, list_folds=[], current_subdir=directory)
+            bundle = load_dataset_from_args(args)
+
+            _apply_bundle_to_owner(owner, bundle)
+            _build_provided_split_folds(owner, bundle)
+
+            valid_counts = dict(zip(*numpy.unique(bundle.valid.y, return_counts=True)))
+            test_counts = dict(zip(*numpy.unique(bundle.test.y, return_counts=True)))
+            self.assertEqual(valid_counts, {0: 1, 1: 1, 2: 1})
+            self.assertEqual(test_counts, {0: 2, 1: 2, 2: 2})
+            self.assertEqual(owner.list_folds[0]["real_test_split"].name, "test")
+
+    def test_batches_selection_rejects_y_path_from_different_split_before_indexing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            wrong_y_path = Path(directory) / "wrong_y.npy"
+            numpy.save(wrong_y_path, numpy.array([0, 0, 1, 1, 2, 2], dtype=numpy.int64))
+            owner = SimpleNamespace(
+                arguments=SimpleNamespace(
+                    num_classes=3,
+                    min_samples_per_class_required=1,
+                    strict_min_samples_per_class=False,
+                    mmap_npy=True,
+                ),
+                current_subdir=directory,
+                _dataset_bundle=SimpleNamespace(schema=SimpleNamespace(num_classes=3)),
+            )
+            split = SplitData(
+                X=numpy.zeros((3, 2), dtype=numpy.float32),
+                y=numpy.array([0, 1, 2], dtype=numpy.int64),
+                name="valid",
+            )
+
+            with self.assertRaisesRegex(ValueError, "y_path row mismatch.*split=valid"):
+                _apply_stratified_split_selection(owner, split, wrong_y_path, "valid", 1)
 
 
 if __name__ == "__main__":

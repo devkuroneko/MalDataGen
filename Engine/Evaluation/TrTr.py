@@ -39,6 +39,8 @@ try:
     from Engine.DataIO.LabelUtils import labels_to_1d_integer
     from Engine.Evaluation.EvaluationRunner import EvaluationMode
     from Engine.Evaluation.EvaluationRunner import EvaluationRunner
+    from Engine.Evaluation.EvaluationRunner import require_split_name
+    from Engine.Evaluation.EvaluationRunner import split_to_dictionary
 
 except ImportError as error:
     print(error)
@@ -46,7 +48,7 @@ except ImportError as error:
 
 class TrTr:
 
-    def evaluation_TR_TR(self, dictionary_data):
+    def evaluation_TR_TR(self, dictionary_data=None, *, real_train_data=None, real_test_data=None):
 
         """
         Evaluates the performance of classifiers trained on synthetic data and evaluated on real data.
@@ -58,8 +60,25 @@ class TrTr:
             dictionary_data (dict): A dictionary containing real evaluation data. The key 'x_evaluation_real'
                                     holds the features for evaluation, and the key 'y_evaluation_real' holds the true labels.
         """
+        if real_train_data is not None or real_test_data is not None:
+            require_split_name("TR-TR", real_train_data.name, "train")
+            require_split_name("TR-TR", real_test_data.name, "test")
+            dictionary_data = split_to_dictionary(real_train_data=real_train_data, real_test_data=real_test_data)
+        if dictionary_data is None:
+            raise ValueError("TR-TR requires real_train_data/real_test_data or dictionary_data.")
         # Logging the evaluation strategy
         logging.info(f"\tTR-TR: train on real, test on real")
+        split_metadata = dictionary_data.get("split_metadata", {})
+        logging.info(
+            "TR-TR routing: train_split=%s test_split=%s real_train_path=%s real_train_y_path=%s "
+            "real_test_path=%s real_test_y_path=%s",
+            split_metadata.get("train", {}).get("name", dictionary_data.get("training_split_name")),
+            split_metadata.get("test", {}).get("name", dictionary_data.get("evaluation_split_name")),
+            split_metadata.get("train", {}).get("x_path"),
+            split_metadata.get("train", {}).get("y_path"),
+            split_metadata.get("test", {}).get("x_path"),
+            split_metadata.get("test", {}).get("y_path"),
+        )
 
         # Initialize empty lists for labels and data
         labels, data = [], []
