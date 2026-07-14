@@ -41,6 +41,9 @@ try:
     from Engine.Classifiers.BatchClassifiers import iter_array_batches
     from Engine.Classifiers.BatchClassifiers import predict_synthetic_batches
     from Engine.Classifiers.BatchClassifiers import train_batch_classifier
+    from Engine.Evaluation.EvaluationRunner import EvaluationMode
+    from Engine.Evaluation.EvaluationRunner import EvaluationRunner
+    from Engine.Evaluation.EvaluationRunner import uses_strict_appclassnet_protocol
     from Engine.Preprocessing.FeatureTransformManager import ScaleGuard
 
     from sklearn.metrics.pairwise import euclidean_distances
@@ -71,9 +74,11 @@ class TrTs:
 
         arguments = getattr(self, "arguments", None)
         if getattr(arguments, "execution_mode", "normal") == "batches":
+            train_x_key = 'x_training_real' if uses_strict_appclassnet_protocol(arguments) else 'x_evaluation_real'
+            train_y_key = 'y_training_real' if uses_strict_appclassnet_protocol(arguments) else 'y_evaluation_real'
             if hasattr(synthetic_data, "manifest"):
                 ScaleGuard.validate_compatible_metadata(
-                    ScaleGuard.describe(dictionary_data['x_evaluation_real'], data_space="source"),
+                    ScaleGuard.describe(dictionary_data[train_x_key], data_space="source"),
                     {
                         "data_space": synthetic_data.manifest.get("data_space", "source"),
                         "transform_id": synthetic_data.manifest.get("transform_id"),
@@ -94,11 +99,11 @@ class TrTs:
             )
             classifier_name = get_batch_classifier_display_name(classifier_key)
             train_labels = labels_to_1d_integer(
-                dictionary_data['y_evaluation_real'],
-                context="TR-TS evaluation labels",
+                dictionary_data[train_y_key],
+                context="TR-TS training labels",
             )
             train_batches = iter_array_batches(
-                dictionary_data['x_evaluation_real'],
+                dictionary_data[train_x_key],
                 train_labels,
                 getattr(self.arguments, "batch_size", 8192),
             )
@@ -135,23 +140,20 @@ class TrTs:
             self.get_task_metrics(labels, predictions, "TR-TS", classifier_name, self.fold_number + 1)
             return
 
-        # Initialize empty lists for labels and data
-        labels, data = [], []
+        runner = EvaluationRunner(self, EvaluationMode.TR_TS)
+        try:
+            evaluation_dataset = runner.build_evaluation_dataset(dictionary_data, synthetic_data)
+            runner.validate(evaluation_dataset)
+            runner.save_results(evaluation_dataset, self.fold_number + 1)
+        except ValueError as error:
+            reason = f"TR-TS predictive evaluation skipped: {error}"
+            logging.warning("\t\t%s", reason)
+            self.mark_evaluation_classifiers_not_applicable("TR-TS", self.fold_number + 1, reason)
+            return
 
         # Logging the total number of generated synthetic samples to be processed
-        total_samples = sum(len(samples) for samples in self.data_generated.values())
+        total_samples = len(evaluation_dataset.y_test)
         logging.info(f"\t\tTR-TS: Total number of samples to be saved: {total_samples}")
-
-        # Iterate through each class and its corresponding generated synthetic samples
-        for label_class, generated_samples in synthetic_data.items():
-            
-            logging.info(f"\t\tTR-TS: Processing {len(generated_samples)} samples for label class {label_class}.")
-
-            # Add the label (class) for each generated sample
-            labels.extend([label_class] * len(generated_samples))
-
-            # Add generated samples to the data list
-            data.extend(generated_samples)
 
         if not getattr(self, '_labels_are_discrete', True):
             reason = "TR-TS predictive evaluation skipped because labels are not discrete."
@@ -159,48 +161,27 @@ class TrTs:
             self.mark_evaluation_classifiers_not_applicable("TR-TS", self.fold_number + 1, reason)
             return
 
-        if not data:
+        if total_samples == 0:
             reason = "TR-TS predictive evaluation skipped because no synthetic samples were generated."
             logging.warning("\t\t%s", reason)
             self.mark_evaluation_classifiers_not_applicable("TR-TS", self.fold_number + 1, reason)
             return
 
-        synthetic_array = numpy.asarray(data, dtype=numpy.float32)
-        synthetic_metadata = getattr(self, "_current_synthetic_metadata", None) or {
-            "data_space": "source",
-            "transform_id": None,
-            "transform_history": [],
-        }
-        real_metadata = getattr(self, "_current_real_source_metadata", None) or ScaleGuard.describe(
-            dictionary_data['x_evaluation_real'],
-            data_space="source",
-            transform_id=None,
-            transform_history=[],
-        )
-        ScaleGuard.validate_before_evaluation(
-            dictionary_data['x_evaluation_real'],
-            synthetic_array,
-            real_metadata,
-            synthetic_metadata,
-            context="TR-TS",
-        )
-
-        # Train classifiers using the real training data and corresponding labels
-        classifiers = self.get_trained_classifiers(dictionary_data['x_evaluation_real'],
-                                                    labels_to_1d_integer(
-                                                        dictionary_data['y_evaluation_real'],
-                                                        context="TR-TS evaluation labels"),
-                                                    numpy.float32, self.get_number_columns())
+        classifiers = runner.fit_classifier(evaluation_dataset)
 
         # Evaluate the classifiers on synthetic data for each classifier instance
         for classifier_name, classifier_instances in zip(self._dictionary_classifiers_name, classifiers):
             # Predict the labels using the trained classifier on the synthetic data
-            label_predicted = classifier_instances.predict(synthetic_array)
+            label_predicted = runner.predict(classifier_instances, evaluation_dataset)
             logging.info("")
             logging.info(f"\t\tTR-TS {classifier_name}")
             # Calculate and log the binary classification metrics (such as accuracy, precision, recall, etc.)
-            self.get_task_metrics(numpy.array(labels), numpy.array(label_predicted),
-                                    "TR-TS", classifier_name, self.fold_number + 1)
+            runner.calculate_metrics(
+                evaluation_dataset,
+                label_predicted,
+                classifier_name,
+                self.fold_number + 1,
+            )
         
         
         

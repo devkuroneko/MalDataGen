@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from Engine.Arguments.ArgumentsDataLoader import add_argument_data_load
 from Engine.Arguments.ArgumentsDataLoader import validate_data_load_arguments
 from Engine.Arguments.ArgumentsFramework import add_argument_framework
+from Engine.Arguments.Arguments import _normalize_preprocessing_arguments
 
 
 def build_parser():
@@ -64,6 +65,23 @@ class DataLoaderArgumentsTest(unittest.TestCase):
         parsed = validate_data_load_arguments(parser.parse_args([]))
 
         self.assertEqual(parsed.split_mode, "cross_validation")
+
+    def test_appclassnet_profile_uses_strict_evaluation_protocol_by_default(self):
+        parser = build_parser()
+        parsed = parser.parse_args(["--source_profile", "appclassnet_top200"])
+
+        normalized = _normalize_preprocessing_arguments(parsed)
+
+        self.assertEqual(normalized.evaluation_protocol, "appclassnet_strict")
+        self.assertEqual(normalized.feature_transform, "preserve")
+
+    def test_legacy_profile_keeps_legacy_evaluation_protocol(self):
+        parser = build_parser()
+        parsed = parser.parse_args([])
+
+        normalized = _normalize_preprocessing_arguments(parsed)
+
+        self.assertEqual(normalized.evaluation_protocol, "legacy")
 
     def test_multiclass_num_classes_updates_legacy_model_class_defaults_for_npy(self):
         arguments = SimpleNamespace(

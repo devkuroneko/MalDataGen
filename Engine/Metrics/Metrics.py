@@ -201,6 +201,10 @@ class Metrics:
 
         # Initialize the main metrics dictionary for different evaluation types and classifiers
         self._dictionary_metrics = self._dictionary_metrics  | {
+            "Schema": {
+                "version": "2.0",
+                "compatibility": "legacy_metrics_with_evaluation_metadata",
+            },
             "TS-TR": {
                 classifier: {
                     **{
@@ -276,6 +280,18 @@ class Metrics:
                         "use matching subset classifiers when comparing modes."
                     )
                 }
+            },
+            "EvaluationMetadata": {
+                **{
+                    f'{fold}-Fold': {} for fold in range(1, arguments.number_k_folds + 1)
+                },
+                "Summary": {},
+            },
+            "Diagnostics": {
+                **{
+                    f'{fold}-Fold': {} for fold in range(1, arguments.number_k_folds + 1)
+                },
+                "Summary": {},
             },
             "ResourceUsage": {
                 "current_memory_mb_by_stage": {},
@@ -365,6 +381,68 @@ class Metrics:
             "WeightedRecall": recall_score(real_labels, predict_labels, average="weighted", zero_division=0),
             "WeightedF1": f1_score(real_labels, predict_labels, average="weighted", zero_division=0),
             "BalancedAccuracy": balanced_accuracy_score(real_labels, predict_labels),
+        }
+
+    def _configured_num_classes_for_metrics(self):
+        arguments = getattr(self, "arguments", None)
+        value = getattr(arguments, "num_classes", None)
+        if value:
+            return int(value)
+
+        metadata = getattr(arguments, "number_samples_per_class", None)
+        if isinstance(metadata, dict) and metadata.get("number_classes"):
+            return int(metadata["number_classes"])
+
+        return None
+
+    def _record_predictive_diagnostics(self, real_labels, predict_labels, evaluation_type, classifier, fold, metric_values):
+        real_labels = self._labels_to_vector(real_labels)
+        predict_labels = self._labels_to_vector(predict_labels)
+        fold_key = f"{fold}-Fold"
+        num_classes = self._configured_num_classes_for_metrics()
+
+        observed_true = {int(label) for label in numpy.unique(real_labels)}
+        predicted_unique, predicted_counts = numpy.unique(predict_labels, return_counts=True)
+        observed_pred = {int(label) for label in predicted_unique}
+        if predicted_counts.size:
+            majority_index = int(numpy.argmax(predicted_counts))
+            most_predicted_class = int(predicted_unique[majority_index])
+            most_predicted_count = int(predicted_counts[majority_index])
+            most_predicted_rate = float(most_predicted_count / max(1, predict_labels.shape[0]))
+        else:
+            most_predicted_class = NOT_APPLICABLE
+            most_predicted_count = 0
+            most_predicted_rate = NOT_APPLICABLE
+        if num_classes is not None:
+            expected = set(range(num_classes))
+            missing_true = sorted(expected - observed_true)
+            missing_pred = sorted(expected - observed_pred)
+        else:
+            expected = observed_true | observed_pred
+            missing_true = []
+            missing_pred = []
+
+        accuracy = metric_values.get("Accuracy", NOT_APPLICABLE)
+        chance_level_suspected = False
+        if num_classes == 200:
+            try:
+                chance_level_suspected = 0.004 <= float(accuracy) <= 0.006
+            except (TypeError, ValueError):
+                chance_level_suspected = False
+
+        self._dictionary_metrics.setdefault("Diagnostics", {}).setdefault(fold_key, {}).setdefault(
+            evaluation_type, {}
+        )[classifier] = {
+            "num_classes": num_classes,
+            "observed_true_class_count": int(len(observed_true)),
+            "observed_pred_class_count": int(len(observed_pred)),
+            "predicted_class_count": int(len(observed_pred)),
+            "most_predicted_class": most_predicted_class,
+            "most_predicted_count": most_predicted_count,
+            "most_predicted_rate": most_predicted_rate,
+            "missing_true_classes": missing_true,
+            "missing_pred_classes": missing_pred,
+            "chance_level_suspected": bool(chance_level_suspected),
         }
 
 
@@ -669,6 +747,15 @@ class Metrics:
             self._dictionary_metrics[evaluation_type][classifier][f"{fold}-Fold"][metric_name] = (
                 self._numeric_metric_value(metric_values.get(metric_name, NOT_APPLICABLE))
             )
+
+        self._record_predictive_diagnostics(
+            real_labels,
+            predict_labels,
+            evaluation_type,
+            classifier,
+            fold,
+            metric_values,
+        )
 
     
     def get_distance_metrics(self, x_evaluation_real, x_evaluation_synthetic, evaluation_type, fold):

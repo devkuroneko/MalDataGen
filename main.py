@@ -498,8 +498,9 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                         self.mark_fold_not_applicable(self.fold_number + 1, reason)
                     else:
                         run_synthetic_evaluation_modes(self, dictionary_data, evaluation_synthetic)
+                        if getattr(self.arguments, "run_tr_tr", False):
+                            self.evaluation_TR_TR(dictionary_data)
                 
-                #self.evaluation_TR_TR(dictionary_data)
                 # self.calculate_sdv_metrics(dictionary_data, fold)
 
                 # End of fold, log the time taken for the current fold

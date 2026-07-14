@@ -37,6 +37,8 @@ try:
     import logging
 
     from Engine.DataIO.LabelUtils import labels_to_1d_integer
+    from Engine.Evaluation.EvaluationRunner import EvaluationMode
+    from Engine.Evaluation.EvaluationRunner import EvaluationRunner
 
 except ImportError as error:
     print(error)
@@ -81,25 +83,33 @@ class TrTr:
             #data.extend(generated_samples)
 
         if getattr(self, '_labels_are_discrete', True):
+            runner = EvaluationRunner(self, EvaluationMode.TR_TR)
+            try:
+                evaluation_dataset = runner.build_evaluation_dataset(dictionary_data)
+                runner.validate(evaluation_dataset)
+                runner.save_results(evaluation_dataset, self.fold_number + 1)
+            except ValueError as error:
+                reason = f"TR-TR predictive evaluation skipped: {error}"
+                logging.warning("\t\t%s", reason)
+                self.mark_evaluation_classifiers_not_applicable("TR-TR", self.fold_number + 1, reason)
+                return
+
             # Train classifiers using the real training data and corresponding labels
-            classifiers = self.get_trained_classifiers(dictionary_data['x_training_real'],
-                                                        labels_to_1d_integer(
-                                                            dictionary_data['y_training_real'],
-                                                            context="TR-TR training labels"),
-                                                        numpy.float32, self.get_number_columns())
+            classifiers = runner.fit_classifier(evaluation_dataset)
 
             # Evaluate the classifiers on synthetic data for each classifier instancevaluation
             for classifier_name, classifier_instances in zip(self._dictionary_classifiers_name, classifiers):
                 # Predict the labels using the trained classifier on the synthetic data
-                label_predicted = classifier_instances.predict(dictionary_data['x_evaluation_real'])
+                label_predicted = runner.predict(classifier_instances, evaluation_dataset)
                 logging.info("")
                 logging.info(f"\t\t\t TR-TR {classifier_name}")
                 # Calculate and log metrics selected by data_type.
-                self.get_task_metrics(labels_to_1d_integer(
-                                            dictionary_data['y_evaluation_real'],
-                                            context="TR-TR evaluation labels"),
-                                        numpy.array(label_predicted),
-                                        "TR-TR", classifier_name, self.fold_number + 1)
+                runner.calculate_metrics(
+                    evaluation_dataset,
+                    label_predicted,
+                    classifier_name,
+                    self.fold_number + 1,
+                )
         else:
             reason = "TR-TR predictive evaluation skipped because labels are not discrete."
             logging.warning("\t\t%s", reason)

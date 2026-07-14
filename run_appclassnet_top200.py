@@ -1598,6 +1598,8 @@ def build_main_command(
         parsed_arguments.evaluation_space,
         "--evaluation_mode",
         parsed_arguments.evaluation_mode,
+        "--random_state",
+        str(getattr(parsed_arguments, "random_state", 0)),
     ])
     if parsed_arguments.allow_double_transform:
         command.append("--allow_double_transform")
@@ -1692,6 +1694,8 @@ def build_batch_main_command(python_executable, raw_root, output_dir_run, combin
         parsed_arguments.evaluation_space,
         "--evaluation_mode",
         parsed_arguments.evaluation_mode,
+        "--random_state",
+        str(getattr(parsed_arguments, "random_state", 0)),
     ]
 
     if parsed_arguments.use_mmap:
@@ -2195,6 +2199,12 @@ def build_parser():
         default=DEFAULT_DATA_TYPE,
         choices=["binary", "multiclass", "continuous"],
         help="forwarded to main.py; continuous is required to preserve AppClassNet feature values",
+    )
+    parser.add_argument(
+        "--random_state",
+        default=0,
+        type=int,
+        help="random seed forwarded to deterministic evaluators and subset classifiers",
     )
 
     return parser

@@ -68,6 +68,7 @@ class DecisionTree:
         self._decision_tree_max_depth = arguments.decision_tree_max_depth
         self._decision_tree_max_feature = arguments.decision_tree_max_features
         self._decision_tree_max_leaf = arguments.decision_tree_max_leaf_nodes
+        self._random_state = getattr(arguments, "random_state", 0)
 
         logging.debug(f"DecisionTree initialized with criterion={self._decision_tree_criterion}, "
                       f"max_depth={self._decision_tree_max_depth}, max_features={self._decision_tree_max_feature}, "
@@ -111,7 +112,8 @@ class DecisionTree:
                 criterion=self._decision_tree_criterion,
                 max_depth=self._decision_tree_max_depth,
                 max_features=self._decision_tree_max_feature,
-                max_leaf_nodes=self._decision_tree_max_leaf
+                max_leaf_nodes=self._decision_tree_max_leaf,
+                random_state=self._random_state,
             )
 
             logging.info("Fitting the Decision Tree model to the training data.")

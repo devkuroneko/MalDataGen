@@ -164,6 +164,15 @@ def add_argument_framework():
                         choices=["none", "tr_ts", "ts_tr", "both"],
                         help='Synthetic evaluation mode: none, TR-TS, TS-TR, or both. Default: both.')
 
+    parser.add_argument('--run_tr_tr', action='store_true', default=False,
+                        help=('Also execute the pipeline TR-TR evaluator. Default false preserves the original '
+                              'synthetic pipeline output; use --baseline_real_only for the AppClassNet golden.'))
+
+    parser.add_argument('--evaluation_protocol', type=str, default="legacy",
+                        choices=["legacy", "appclassnet_strict"],
+                        help=('Evaluation protocol. legacy preserves the original MalDataGen evaluator semantics; '
+                              'appclassnet_strict uses train real for TR-TS and full real evaluation for TS-TR.'))
+
     parser.add_argument('--batch_classifier_subset_size', type=int, default=100000,
                         help='Maximum rows loaded for *_subset batch classifiers. Default: 100000.')
 
@@ -216,6 +225,10 @@ def add_argument_framework():
     parser.add_argument('--number_k_folds', type=int,
                         default=DEFAULT_NUMBER_STRATIFICATION_FOLD,
                         help='Number of folds for cross-validation.')
+
+    parser.add_argument('--random_state', type=int,
+                        default=0,
+                        help='Random seed used by deterministic evaluators and subset sampling.')
 
     parser.add_argument('--use_gpu', action='store_true',
                         default=False,

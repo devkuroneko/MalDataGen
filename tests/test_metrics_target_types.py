@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 from Engine.Metrics.Metrics import Metrics
 from Engine.Metrics.Metrics import NOT_APPLICABLE
@@ -18,6 +19,7 @@ class MetricsTargetTypesTest(unittest.TestCase):
         metrics = Metrics.__new__(Metrics)
         metrics._target_type = target_type
         metrics._data_type = "binary"
+        metrics.arguments = SimpleNamespace(num_classes=None, number_samples_per_class=None)
         metrics._dictionary_classifiers_name = ["DummyClassifier"]
         metrics._dictionary_binary_metrics = {
             "Accuracy": ConstantMetric(1.0),
@@ -37,6 +39,7 @@ class MetricsTargetTypesTest(unittest.TestCase):
             "TS-TR": {"DummyClassifier": {"1-Fold": {}, "Summary": {}}},
             "TR-TR": {"DummyClassifier": {"1-Fold": {}, "Summary": {}}},
             "DistanceMetrics": {"R-S": {"1-Fold": {}, "Summary": {}}, "R-R": {"1-Fold": {}, "Summary": {}}},
+            "Diagnostics": {"1-Fold": {}, "Summary": {}},
         }
         return metrics
 
@@ -82,6 +85,22 @@ class MetricsTargetTypesTest(unittest.TestCase):
         fold = metrics._dictionary_metrics["TR-TS"]["DummyClassifier"]["1-Fold"]
         self.assertTrue(all(value == NOT_APPLICABLE for value in fold.values()))
         self.assertIn("TR-TS:DummyClassifier", metrics._dictionary_metrics["NotApplicable"]["1-Fold"])
+
+    def test_multiclass_chance_level_suspected_for_top_200(self):
+        metrics = self._metrics("multiclass")
+        metrics.arguments = SimpleNamespace(num_classes=200, number_samples_per_class=None)
+
+        metrics.get_task_metrics(
+            list(range(200)),
+            [0] * 200,
+            "TR-TS",
+            "DummyClassifier",
+            1,
+        )
+
+        diagnostics = metrics._dictionary_metrics["Diagnostics"]["1-Fold"]["TR-TS"]["DummyClassifier"]
+        self.assertTrue(diagnostics["chance_level_suspected"])
+        self.assertEqual(diagnostics["num_classes"], 200)
 
 
 if __name__ == "__main__":

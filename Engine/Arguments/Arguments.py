@@ -173,6 +173,12 @@ def _normalize_preprocessing_arguments(parsed_arguments):
     if not getattr(parsed_arguments, "inverse_transform_synthetic", False):
         parsed_arguments.inverse_transform_synthetic = True
 
+    if (
+        getattr(parsed_arguments, "evaluation_protocol", "legacy") == "legacy"
+        and not _option_was_provided("--evaluation_protocol")
+    ):
+        parsed_arguments.evaluation_protocol = "appclassnet_strict"
+
     return parsed_arguments
 
 

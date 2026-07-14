@@ -32,6 +32,10 @@ PARTIAL_FIT_CLASSIFIERS = {"sgd", "passive_aggressive", "naive_bayes", "mlp_smal
 SUBSET_CLASSIFIERS = {"decision_tree_subset", "extra_trees_subset", "random_forest_light", "random_forest_subset"}
 
 
+def _random_state(arguments):
+    return int(getattr(arguments, "random_state", 0))
+
+
 def get_batch_classifier_display_name(classifier_key):
     return BATCH_CLASSIFIER_DISPLAY_NAMES[classifier_key]
 
@@ -39,21 +43,22 @@ def get_batch_classifier_display_name(classifier_key):
 def make_batch_classifier(classifier_key, arguments):
     if classifier_key == "random_forest_subset":
         classifier_key = "random_forest_light"
+    random_state = _random_state(arguments)
     if classifier_key == "sgd":
-        return SGDClassifier(loss="log_loss", random_state=42)
+        return SGDClassifier(loss="log_loss", random_state=random_state)
     if classifier_key == "passive_aggressive":
-        return PassiveAggressiveClassifier(random_state=42)
+        return PassiveAggressiveClassifier(random_state=random_state)
     if classifier_key == "naive_bayes":
         return GaussianNB()
     if classifier_key == "mlp_small":
-        return MLPClassifier(hidden_layer_sizes=(64,), max_iter=1, random_state=42)
+        return MLPClassifier(hidden_layer_sizes=(64,), max_iter=1, random_state=random_state)
     if classifier_key == "decision_tree_subset":
         return DecisionTreeClassifier(
             criterion=getattr(arguments, "decision_tree_criterion", "gini"),
             max_depth=getattr(arguments, "max_depth", getattr(arguments, "decision_tree_max_depth", None)),
             max_features=getattr(arguments, "decision_tree_max_features", None),
             max_leaf_nodes=getattr(arguments, "decision_tree_max_leaf_nodes", None),
-            random_state=42,
+            random_state=random_state,
         )
     if classifier_key == "extra_trees_subset":
         return ExtraTreesClassifier(
@@ -61,7 +66,7 @@ def make_batch_classifier(classifier_key, arguments):
             max_depth=getattr(arguments, "max_depth", None),
             class_weight=getattr(arguments, "class_weight", None),
             n_jobs=-1,
-            random_state=42,
+            random_state=random_state,
         )
     if classifier_key == "random_forest_light":
         return RandomForestClassifier(
@@ -71,7 +76,7 @@ def make_batch_classifier(classifier_key, arguments):
             max_samples=getattr(arguments, "max_samples", None),
             class_weight=getattr(arguments, "class_weight", None),
             n_jobs=-1,
-            random_state=42,
+            random_state=random_state,
         )
     raise ValueError(f"Unsupported batch classifier: {classifier_key}")
 
@@ -113,7 +118,7 @@ def _subset_quota(arguments, num_classes):
 
 def _collect_stratified_subset(train_batches, arguments, num_classes):
     quota_per_class = _subset_quota(arguments, num_classes)
-    random_generator = numpy.random.default_rng(42)
+    random_generator = numpy.random.default_rng(_random_state(arguments))
     reservoirs = {class_id: [] for class_id in range(int(num_classes))}
     seen_by_class = {class_id: 0 for class_id in range(int(num_classes))}
     train_batches_seen = 0
