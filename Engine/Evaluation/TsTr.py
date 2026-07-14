@@ -38,6 +38,7 @@ try:
 
     from Engine.DataIO.LabelUtils import labels_to_1d_integer
     from Engine.DataIO.DatasetContracts import validate_xy_alignment
+    from Engine.DataIO.RealClassCountPolicy import select_stratified_indices_from_labels
     from Engine.Classifiers.BatchClassifiers import get_batch_classifier_display_name
     from Engine.Classifiers.BatchClassifiers import iter_synthetic_labeled_batches
     from Engine.Classifiers.BatchClassifiers import predict_array_batches
@@ -60,24 +61,38 @@ def _counts_by_class(labels):
     return {str(int(label)): int(count) for label, count in zip(unique_labels, counts)}
 
 
-def _select_stratified_array_subset(x_values, y_values, samples_per_class, seed=42):
+def _select_stratified_array_subset(
+        x_values,
+        y_values,
+        samples_per_class,
+        seed=42,
+        num_classes=None,
+        split_name="test",
+        real_class_count_policy="strict"):
     x_values, y_values = validate_xy_alignment(x_values, y_values, "TS-TR stratified real evaluation subset")
     if samples_per_class is None:
-        return x_values, y_values
+        return x_values, y_values, {
+            "requested_samples_per_class": None,
+            "minimum_available_per_class": None,
+            "effective_samples_per_class": None,
+            "real_class_count_policy": real_class_count_policy,
+        }
 
     y_values = numpy.asarray(y_values, dtype=numpy.int64)
-    random_generator = numpy.random.default_rng(seed)
-    selected = []
-    for label in numpy.unique(y_values):
-        label_indices = numpy.flatnonzero(y_values == label)
-        take = min(int(samples_per_class), int(label_indices.shape[0]))
-        if take > 0:
-            selected.append(random_generator.choice(label_indices, size=take, replace=False))
-    if not selected:
-        return x_values[:0], y_values[:0]
-    indices = numpy.concatenate(selected).astype(numpy.int64, copy=False)
-    random_generator.shuffle(indices)
-    return x_values[indices], y_values[indices]
+    if num_classes is None:
+        num_classes = int(numpy.max(y_values)) + 1 if y_values.size else 0
+    indices, report, _ = select_stratified_indices_from_labels(
+        y_values,
+        samples_per_class,
+        int(num_classes),
+        seed,
+        split_name,
+        real_class_count_policy,
+        require_all_classes=True,
+    )
+    if indices.size == 0:
+        return x_values[:0], y_values[:0], report
+    return x_values[indices], y_values[indices], report
 
 
 class TsTr:
@@ -110,21 +125,17 @@ class TsTr:
         split_metadata = dictionary_data.get("split_metadata", {}).get("test", {})
         requested_test_samples = getattr(getattr(self, "arguments", None), "test_samples_per_class", None)
         available_minimum = split_metadata.get("minimum_class_count")
-        effective_test_samples = (
-            None if requested_test_samples is None
-            else min(int(requested_test_samples), int(available_minimum))
-            if available_minimum is not None
-            else int(requested_test_samples)
-        )
         logging.info(
             "TS-TR routing: train_split=synthetic_train test_split=%s real_test_path=%s real_test_y_path=%s "
-            "real_test_minimum_class_count=%s requested_test_samples_per_class=%s effective_test_samples_per_class=%s",
+            "real_test_minimum_class_count=%s requested_test_samples_per_class=%s "
+            "real_class_count_policy=%s samples_per_class_scope=%s",
             split_metadata.get("name", dictionary_data.get("evaluation_split_name")),
             split_metadata.get("x_path"),
             split_metadata.get("y_path"),
             available_minimum,
             requested_test_samples,
-            effective_test_samples,
+            getattr(getattr(self, "arguments", None), "real_class_count_policy", "strict"),
+            getattr(getattr(self, "arguments", None), "samples_per_class_scope", "split"),
         )
 
         arguments = getattr(self, "arguments", None)
@@ -173,6 +184,27 @@ class TsTr:
                 "TS-TR",
                 expected_num_classes=expected_classes,
                 samples_per_class=getattr(self.arguments, "test_samples_per_class", None),
+                real_class_count_policy=getattr(self.arguments, "real_class_count_policy", "strict"),
+                samples_per_class_scope=getattr(self.arguments, "samples_per_class_scope", "split"),
+            )
+            evaluation_x, evaluation_y, real_subset_report = _select_stratified_array_subset(
+                dictionary_data['x_evaluation_real'],
+                evaluation_labels,
+                getattr(self.arguments, "test_samples_per_class", None),
+                num_classes=expected_classes,
+                split_name=split_metadata.get("name", dictionary_data.get("evaluation_split_name", "test")),
+                real_class_count_policy=getattr(self.arguments, "real_class_count_policy", "strict"),
+            )
+            logging.info(
+                "TS-TR real subset: real_test_split=%s requested_samples_per_class=%s "
+                "minimum_available_per_class=%s effective_samples_per_class=%s "
+                "real_class_count_policy=%s samples_per_class_scope=%s",
+                split_metadata.get("name", dictionary_data.get("evaluation_split_name")),
+                real_subset_report.get("requested_samples_per_class"),
+                real_subset_report.get("minimum_available_per_class"),
+                real_subset_report.get("effective_samples_per_class"),
+                real_subset_report.get("real_class_count_policy"),
+                getattr(self.arguments, "samples_per_class_scope", "split"),
             )
             train_batches = iter_synthetic_labeled_batches(synthetic_data)
             classifier_instance, metadata = train_batch_classifier(
@@ -181,11 +213,6 @@ class TsTr:
                 expected_classes,
                 self.arguments,
                 batch_recorder=self.record_batch_processed,
-            )
-            evaluation_x, evaluation_y = _select_stratified_array_subset(
-                dictionary_data['x_evaluation_real'],
-                evaluation_labels,
-                getattr(self.arguments, "test_samples_per_class", None),
             )
             real_labels, predicted_labels, evaluation_time = predict_array_batches(
                 classifier_instance,
@@ -198,6 +225,12 @@ class TsTr:
             metadata["evaluation_time"] = float(evaluation_time)
             metadata["synthetic_samples_used_by_class"] = metadata.get("train_class_counts", {})
             metadata["real_samples_used_by_class"] = _counts_by_class(real_labels) if real_labels.size else {}
+            metadata["real_class_count_policy"] = getattr(self.arguments, "real_class_count_policy", "strict")
+            metadata["samples_per_class_scope"] = getattr(self.arguments, "samples_per_class_scope", "split")
+            metadata["real_test_split"] = split_metadata.get("name", dictionary_data.get("evaluation_split_name"))
+            metadata["requested_samples_per_class"] = real_subset_report.get("requested_samples_per_class")
+            metadata["minimum_available_per_class"] = real_subset_report.get("minimum_available_per_class")
+            metadata["effective_samples_per_class"] = real_subset_report.get("effective_samples_per_class")
             self.record_batch_classifier_metadata("TS-TR", classifier_name, self.fold_number + 1, metadata)
 
             if real_labels.size == 0:

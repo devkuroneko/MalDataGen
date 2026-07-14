@@ -166,7 +166,86 @@ class AppClassNetEvaluationModeTest(unittest.TestCase):
         )
         self.assertIn("--synthetic_train_samples_per_class", command)
         self.assertIn("--synthetic_test_samples_per_class", command)
+        self.assertIn("--real_class_count_policy", command)
+        self.assertEqual(command[command.index("--real_class_count_policy") + 1], "strict")
+        self.assertIn("--samples_per_class_scope", command)
+        self.assertEqual(command[command.index("--samples_per_class_scope") + 1], "split")
         self.assertEqual(command[command.index("--number_samples_per_class") + 1], build_number_samples_per_class_plan(28))
+
+    def test_wrapper_help_lists_real_class_count_arguments(self):
+        help_text = runner.build_parser().format_help()
+
+        self.assertIn("--real_class_count_policy", help_text)
+        self.assertIn("--samples_per_class_scope", help_text)
+
+    def test_real_class_count_policy_strict_is_propagated(self):
+        args = _batch_args()
+        args.real_class_count_policy = "strict"
+
+        command = _batch_command_for_args(self, args, {"model_type": "copy"})
+
+        self.assertEqual(command[command.index("--real_class_count_policy") + 1], "strict")
+
+    def test_real_class_count_policy_uniform_min_is_propagated(self):
+        args = _batch_args()
+        args.real_class_count_policy = "uniform_min"
+
+        command = _batch_command_for_args(self, args, {"model_type": "copy"})
+
+        self.assertEqual(command[command.index("--real_class_count_policy") + 1], "uniform_min")
+
+    def test_samples_per_class_scope_split_is_propagated(self):
+        args = _batch_args()
+        args.samples_per_class_scope = "split"
+
+        command = _batch_command_for_args(self, args, {"model_type": "copy"})
+
+        self.assertEqual(command[command.index("--samples_per_class_scope") + 1], "split")
+
+    def test_real_class_count_cli_precedes_campaign(self):
+        args = _batch_args()
+        args.real_class_count_policy = "available_cap"
+
+        command = _batch_command_for_args(
+            self,
+            args,
+            {"model_type": "copy", "real_class_count_policy": "uniform_min"},
+        )
+
+        self.assertEqual(command[command.index("--real_class_count_policy") + 1], "available_cap")
+
+    def test_real_class_count_arguments_are_not_duplicated(self):
+        args = _batch_args()
+        command = _batch_command_for_args(
+            self,
+            args,
+            {
+                "model_type": "copy",
+                "real_class_count_policy": "uniform_min",
+                "samples_per_class_scope": "split",
+            },
+        )
+
+        self.assertEqual(command.count("--real_class_count_policy"), 1)
+        self.assertEqual(command.count("--samples_per_class_scope"), 1)
+
+    def test_strict_test_minimum_1539_accepts_request_500(self):
+        labels = numpy.repeat(numpy.arange(APPCLASSNET_NUM_CLASSES, dtype=numpy.int64), 1539)
+
+        indices, counts, short = runner.select_stratified_indices(
+            numpy,
+            labels,
+            500,
+            APPCLASSNET_NUM_CLASSES,
+            seed=7,
+            split_name="test",
+            real_class_count_policy="strict",
+            samples_per_class_scope="split",
+        )
+
+        self.assertEqual(indices.shape[0], APPCLASSNET_NUM_CLASSES * 500)
+        self.assertFalse(short)
+        self.assertEqual(min(counts.values()), 500)
 
     def test_no_sample_arguments_use_defaults(self):
         command = _batch_command_for_args(self, _batch_args(), {"model_type": "copy"})
@@ -356,6 +435,8 @@ class AppClassNetEvaluationModeTest(unittest.TestCase):
         self.assertIsNone(parsed.synthetic_train_samples_per_class)
         self.assertIsNone(parsed.synthetic_test_samples_per_class)
         self.assertIsNone(parsed.generated_samples_per_class)
+        self.assertIsNone(parsed.real_class_count_policy)
+        self.assertIsNone(parsed.samples_per_class_scope)
 
     def test_evaluation_mode_none(self):
         _, payload = runner.write_batches_metrics(
@@ -620,6 +701,8 @@ def _batch_args(evaluation_mode="both"):
         synthetic_train_samples_per_class=None,
         synthetic_test_samples_per_class=None,
         generated_samples_per_class=None,
+        real_class_count_policy=None,
+        samples_per_class_scope=None,
         n_estimators=None,
         max_depth=None,
         max_samples=None,

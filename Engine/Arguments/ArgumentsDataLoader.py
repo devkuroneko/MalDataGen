@@ -57,6 +57,8 @@ DEFAULT_CLASSIFIER_TRANSFORM = 'preserve'
 DEFAULT_EVALUATION_SPACE = 'source'
 DEFAULT_MIN_SAMPLES_PER_CLASS_REQUIRED = 1
 DEFAULT_LEGACY_NUMBER_SAMPLES_PER_CLASS = "1:256,2:256"
+DEFAULT_REAL_CLASS_COUNT_POLICY = "strict"
+DEFAULT_SAMPLES_PER_CLASS_SCOPE = "split"
 MODEL_CLASS_COUNT_ARGUMENTS = (
     'autoencoder_number_classes',
     'variational_autoencoder_number_classes',
@@ -72,6 +74,14 @@ def validate_data_load_arguments(arguments):
     )
     if getattr(arguments, 'min_samples_per_class_required', 1) < 0:
         raise ValueError("--min_samples_per_class_required must be non-negative.")
+    if getattr(arguments, 'real_class_count_policy', DEFAULT_REAL_CLASS_COUNT_POLICY) not in {
+        'strict',
+        'uniform_min',
+        'available_cap',
+    }:
+        raise ValueError("--real_class_count_policy must be one of: strict, uniform_min, available_cap.")
+    if getattr(arguments, 'samples_per_class_scope', DEFAULT_SAMPLES_PER_CLASS_SCOPE) not in {'split', 'fold'}:
+        raise ValueError("--samples_per_class_scope must be one of: split, fold.")
 
     if arguments.data_format == 'csv':
         return arguments
@@ -287,6 +297,18 @@ def add_argument_data_load(parser):
 
     parser.add_argument('--strict_min_samples_per_class', action='store_true', default=False,
                         help='Raise an error instead of warning when batches stratified selection is below the minimum.')
+
+    parser.add_argument('--real_class_count_policy', type=str,
+                        default=DEFAULT_REAL_CLASS_COUNT_POLICY,
+                        choices=['strict', 'uniform_min', 'available_cap'],
+                        help=('Policy applied after selecting the real split for per-class real evaluation quotas. '
+                              'strict requires the requested count; uniform_min uses a common capped count; '
+                              'available_cap caps each class independently.'))
+
+    parser.add_argument('--samples_per_class_scope', type=str,
+                        default=DEFAULT_SAMPLES_PER_CLASS_SCOPE,
+                        choices=['split', 'fold'],
+                        help='Scope used when interpreting per-class real quotas. AppClassNet provided splits use split.')
 
     parser.add_argument('--dry_run_memory', action='store_true', default=False,
                         help='Load metadata, log shapes/memory estimates, and skip experiment execution.')

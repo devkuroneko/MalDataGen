@@ -26,6 +26,9 @@ from pathlib import Path
 from Engine.Preprocessing.FeatureTransformManager import FeatureTransformManager
 from Engine.Preprocessing.FeatureTransformManager import FeatureTransformPolicy
 from Engine.Preprocessing.FeatureTransformManager import TransformManifest
+from Engine.DataIO.RealClassCountPolicy import select_stratified_indices_from_labels
+from Engine.DataIO.RealClassCountPolicy import validate_real_class_count_policy
+from Engine.DataIO.RealClassCountPolicy import validate_samples_per_class_scope
 
 
 DEFAULT_VERBOSITY_LEVEL = logging.INFO
@@ -43,6 +46,8 @@ DEFAULT_BASELINE_TRAIN_SAMPLES_PER_CLASS = 100_000
 DEFAULT_BASELINE_TEST_SAMPLES_PER_CLASS = 5_000
 DEFAULT_SYNTHETIC_SAMPLES_PER_CLASS = 50
 DEFAULT_SCALER = "none"
+DEFAULT_REAL_CLASS_COUNT_POLICY = "strict"
+DEFAULT_SAMPLES_PER_CLASS_SCOPE = "split"
 TIME_FORMAT = "%Y-%m-%d_%H:%M:%S"
 
 APPCLASSNET_NUM_CLASSES = 200
@@ -745,34 +750,40 @@ def _validate_samples_per_class(value, field_name):
     return value
 
 
-def select_stratified_indices(numpy, labels, samples_per_class, num_classes, seed, split_name):
+def select_stratified_indices(
+        numpy,
+        labels,
+        samples_per_class,
+        num_classes,
+        seed,
+        split_name,
+        real_class_count_policy=DEFAULT_REAL_CLASS_COUNT_POLICY,
+        samples_per_class_scope=DEFAULT_SAMPLES_PER_CLASS_SCOPE):
     samples_per_class = _validate_samples_per_class(samples_per_class, f"{split_name}_samples_per_class")
-    labels_array = numpy.asarray(labels).reshape(-1)
-    random_generator = numpy.random.default_rng(seed)
-    selected_by_class = {}
-    counts_by_class = {}
-    missing_classes = []
-    short_classes = {}
-
-    for class_id in range(num_classes):
-        class_indices = numpy.flatnonzero(labels_array == class_id)
-        if class_indices.shape[0] == 0:
-            missing_classes.append(class_id)
-            selected = numpy.array([], dtype=numpy.int64)
-        else:
-            sample_count = min(samples_per_class, int(class_indices.shape[0]))
-            if sample_count < samples_per_class:
-                short_classes[class_id] = int(class_indices.shape[0])
-            selected = random_generator.choice(class_indices, size=sample_count, replace=False)
-        selected_by_class[class_id] = selected
-        counts_by_class[str(class_id)] = int(selected.shape[0])
-
-    if missing_classes:
-        raise ValueError(f"{split_name} split is missing class(es): {missing_classes}")
-
-    selected_indices = numpy.concatenate([selected_by_class[class_id] for class_id in range(num_classes)])
-    random_generator.shuffle(selected_indices)
-    return selected_indices.astype(numpy.int64, copy=False), counts_by_class, short_classes
+    policy = validate_real_class_count_policy(real_class_count_policy)
+    scope = validate_samples_per_class_scope(samples_per_class_scope)
+    selected_indices, report, short_classes = select_stratified_indices_from_labels(
+        labels,
+        samples_per_class,
+        num_classes,
+        seed,
+        split_name,
+        policy,
+        require_all_classes=True,
+    )
+    logging.info(
+        "Real class count policy: real_%s_split=%s requested_samples_per_class=%s "
+        "minimum_available_per_class=%s effective_samples_per_class=%s "
+        "real_class_count_policy=%s samples_per_class_scope=%s",
+        "test" if split_name == "test" else split_name,
+        split_name,
+        report.get("requested_samples_per_class"),
+        report.get("minimum_available_per_class"),
+        report.get("effective_samples_per_class"),
+        policy,
+        scope,
+    )
+    return selected_indices, report["selected_counts_by_class"], short_classes
 
 
 def load_selected_rows(numpy, x_values, y_values, indices, seed):
@@ -1053,6 +1064,8 @@ def run_real_real_baseline(parsed_arguments, raw_root, output_dir):
         APPCLASSNET_NUM_CLASSES,
         seed=0,
         split_name="train",
+        real_class_count_policy=getattr(parsed_arguments, "real_class_count_policy", DEFAULT_REAL_CLASS_COUNT_POLICY),
+        samples_per_class_scope=getattr(parsed_arguments, "samples_per_class_scope", DEFAULT_SAMPLES_PER_CLASS_SCOPE),
     )
     logging.info("Baseline real-real: selecting test samples per class=%s", parsed_arguments.test_samples_per_class)
     test_indices, test_counts, test_short_classes = select_stratified_indices(
@@ -1062,6 +1075,8 @@ def run_real_real_baseline(parsed_arguments, raw_root, output_dir):
         APPCLASSNET_NUM_CLASSES,
         seed=1,
         split_name="test",
+        real_class_count_policy=getattr(parsed_arguments, "real_class_count_policy", DEFAULT_REAL_CLASS_COUNT_POLICY),
+        samples_per_class_scope=getattr(parsed_arguments, "samples_per_class_scope", DEFAULT_SAMPLES_PER_CLASS_SCOPE),
     )
 
     train_x, train_y = load_selected_rows(numpy, train_x_values, train_y_values, train_indices, seed=2)
@@ -1100,6 +1115,8 @@ def run_real_real_baseline(parsed_arguments, raw_root, output_dir):
         "test_shape": list(test_x.shape),
         "train_samples_per_class_requested": parsed_arguments.train_samples_per_class,
         "test_samples_per_class_requested": parsed_arguments.test_samples_per_class,
+        "real_class_count_policy": getattr(parsed_arguments, "real_class_count_policy", DEFAULT_REAL_CLASS_COUNT_POLICY),
+        "samples_per_class_scope": getattr(parsed_arguments, "samples_per_class_scope", DEFAULT_SAMPLES_PER_CLASS_SCOPE),
         "train_class_counts": train_counts,
         "test_class_counts": test_counts,
         "data_space": "source",
@@ -1843,6 +1860,44 @@ def resolve_effective_sample_arguments(parsed_arguments, combination):
     }
 
 
+def resolve_effective_real_class_count_arguments(parsed_arguments, combination):
+    values = {}
+    origins = {}
+    details = {}
+    defaults = {
+        "real_class_count_policy": DEFAULT_REAL_CLASS_COUNT_POLICY,
+        "samples_per_class_scope": DEFAULT_SAMPLES_PER_CLASS_SCOPE,
+    }
+    validators = {
+        "real_class_count_policy": validate_real_class_count_policy,
+        "samples_per_class_scope": validate_samples_per_class_scope,
+    }
+    for parameter, default_value in defaults.items():
+        cli_value = getattr(parsed_arguments, parameter, None)
+        campaign_value = combination.get(parameter)
+        effective_value, origin = resolve_argument(cli_value, campaign_value, default_value)
+        effective_value = validators[parameter](effective_value)
+        values[parameter] = effective_value
+        origins[parameter] = origin
+        details[parameter] = {
+            "cli": cli_value,
+            "campaign": campaign_value,
+            "default": default_value,
+            "effective": effective_value,
+            "origin": origin,
+        }
+        logging.info(
+            "Argument resolution: %s cli=%s campaign=%s default=%s effective=%s origin=%s",
+            parameter,
+            cli_value,
+            campaign_value,
+            default_value,
+            effective_value,
+            origin,
+        )
+    return {"values": values, "origins": origins, "details": details}
+
+
 def resolve_effective_argument(parsed_arguments, combination, parameter):
     plan = resolve_effective_sample_arguments(parsed_arguments, combination)
     return plan["values"][parameter], plan["origins"][parameter]
@@ -1910,6 +1965,8 @@ GENERATION_QUOTA_PARAMETERS = {
     "synthetic_train_samples_per_class",
     "synthetic_test_samples_per_class",
     "generated_samples_per_class",
+    "real_class_count_policy",
+    "samples_per_class_scope",
 }
 
 
@@ -1969,12 +2026,16 @@ def build_main_command(
         command.append("--inverse_transform_synthetic")
     sample_arguments = resolve_effective_sample_arguments(parsed_arguments, combination)
     sample_values = sample_arguments["values"]
+    real_count_arguments = resolve_effective_real_class_count_arguments(parsed_arguments, combination)
+    real_count_values = real_count_arguments["values"]
     for parameter in (
             "train_samples_per_class",
             "test_samples_per_class",
             "synthetic_train_samples_per_class",
             "synthetic_test_samples_per_class"):
         command.extend([f"--{parameter}", str(sample_values[parameter])])
+    for parameter in ("real_class_count_policy", "samples_per_class_scope"):
+        command.extend([f"--{parameter}", str(real_count_values[parameter])])
 
     command.extend([
         "--number_samples_per_class",
@@ -2078,12 +2139,16 @@ def build_batch_main_command(python_executable, raw_root, output_dir_run, combin
 
     sample_arguments = resolve_effective_sample_arguments(parsed_arguments, combination)
     sample_values = sample_arguments["values"]
+    real_count_arguments = resolve_effective_real_class_count_arguments(parsed_arguments, combination)
+    real_count_values = real_count_arguments["values"]
     for parameter in (
             "train_samples_per_class",
             "test_samples_per_class",
             "synthetic_train_samples_per_class",
             "synthetic_test_samples_per_class"):
         command.extend([f"--{parameter}", str(sample_values[parameter])])
+    for parameter in ("real_class_count_policy", "samples_per_class_scope"):
+        command.extend([f"--{parameter}", str(real_count_values[parameter])])
 
     command.extend([
         "--sample_plan",
@@ -2570,6 +2635,19 @@ def build_parser():
         help="per-class synthetic rows generated before splitting synthetic train/test quotas",
     )
     parser.add_argument(
+        "--real_class_count_policy",
+        choices=["strict", "uniform_min", "available_cap"],
+        default=None,
+        help=("real split quota policy; default is strict for AppClassNet after campaign resolution. "
+              "strict requires the request, uniform_min uses a common cap, available_cap caps per class."),
+    )
+    parser.add_argument(
+        "--samples_per_class_scope",
+        choices=["split", "fold"],
+        default=None,
+        help="scope for per-class real quotas; default is split for AppClassNet after campaign resolution",
+    )
+    parser.add_argument(
         "--max_depth",
         default=None,
         type=int,
@@ -2684,6 +2762,9 @@ def main():
         arguments.evaluation_mode = effective_evaluation_mode(arguments)
         baseline_sample_arguments = resolve_effective_sample_arguments(arguments, {})
         for parameter, value in baseline_sample_arguments["values"].items():
+            setattr(arguments, parameter, value)
+        baseline_real_count_arguments = resolve_effective_real_class_count_arguments(arguments, {})
+        for parameter, value in baseline_real_count_arguments["values"].items():
             setattr(arguments, parameter, value)
     print_all_settings(arguments)
     warn_prepare_limit_if_needed(arguments, campaigns_chosen)

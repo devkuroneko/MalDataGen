@@ -17,6 +17,7 @@ from sklearn.neural_network import MLPClassifier
 from sklearn.tree import DecisionTreeClassifier
 
 from Engine.DataIO.DatasetContracts import validate_xy_alignment
+from Engine.DataIO.RealClassCountPolicy import resolve_effective_class_counts
 
 
 BATCH_CLASSIFIER_DISPLAY_NAMES = {
@@ -114,7 +115,12 @@ def _require_finite(name, values):
         raise ValueError(f"{name} contains NaN or inf values.")
 
 
-def _validate_class_counts(name, counts_by_class, expected_num_classes=None, samples_per_class=None):
+def _validate_class_counts(
+        name,
+        counts_by_class,
+        expected_num_classes=None,
+        samples_per_class=None,
+        real_class_count_policy="strict"):
     if expected_num_classes is not None:
         expected = {str(class_id) for class_id in range(int(expected_num_classes))}
         observed = set(counts_by_class)
@@ -128,7 +134,7 @@ def _validate_class_counts(name, counts_by_class, expected_num_classes=None, sam
                 details.append(f"unexpected classes={extra[:20]}")
             raise ValueError(f"{name} must contain exactly {expected_num_classes} classes; " + ", ".join(details))
 
-    if samples_per_class is not None:
+    if samples_per_class is not None and real_class_count_policy == "strict":
         short = {
             class_id: count
             for class_id, count in counts_by_class.items()
@@ -138,6 +144,18 @@ def _validate_class_counts(name, counts_by_class, expected_num_classes=None, sam
             raise ValueError(
                 f"{name} has fewer than requested {samples_per_class} samples per class: {short}."
             )
+    elif samples_per_class is not None and expected_num_classes is not None:
+        ordered_counts = numpy.asarray(
+            [int(counts_by_class.get(str(class_id), 0)) for class_id in range(int(expected_num_classes))],
+            dtype=numpy.int64,
+        )
+        resolve_effective_class_counts(
+            ordered_counts,
+            samples_per_class,
+            real_class_count_policy,
+            name,
+            require_all_classes=True,
+        )
 
 
 def validate_real_array_for_batch_evaluation(
@@ -145,7 +163,9 @@ def validate_real_array_for_batch_evaluation(
         y_values,
         context,
         expected_num_classes=None,
-        samples_per_class=None):
+        samples_per_class=None,
+        real_class_count_policy="strict",
+        samples_per_class_scope="split"):
     if x_values is None or y_values is None:
         raise ValueError(f"{context} requires real X/y arrays.")
     x_values, y_values = validate_xy_alignment(x_values, y_values, f"{context} real data")
@@ -159,6 +179,7 @@ def validate_real_array_for_batch_evaluation(
         counts,
         expected_num_classes=expected_num_classes,
         samples_per_class=samples_per_class,
+        real_class_count_policy=real_class_count_policy,
     )
     return counts
 

@@ -166,8 +166,23 @@ def _apply_stratified_split_selection(owner, split, y_path, split_name, samples_
             num_classes,
             seed=42,
             mmap_mode=_mmap_mode_for_npy(owner.arguments) or "r",
+            real_class_count_policy=getattr(owner.arguments, "real_class_count_policy", "strict"),
+            samples_per_class_scope=getattr(owner.arguments, "samples_per_class_scope", "split"),
+            require_all_classes=True,
         )
         selection_report = get_last_stratified_selection_report() or {}
+        logging.info(
+            "Real class count policy: real_%s_split=%s requested_samples_per_class=%s "
+            "minimum_available_per_class=%s effective_samples_per_class=%s "
+            "real_class_count_policy=%s samples_per_class_scope=%s",
+            "test" if split_name == "test" else split_name,
+            split_name,
+            selection_report.get("requested_samples_per_class"),
+            selection_report.get("minimum_available_per_class"),
+            selection_report.get("effective_samples_per_class"),
+            selection_report.get("real_class_count_policy"),
+            selection_report.get("samples_per_class_scope"),
+        )
         coverage_report = build_minimum_coverage_report(
             selection_report,
             int(getattr(owner.arguments, "min_samples_per_class_required", 1)),

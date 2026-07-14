@@ -20,11 +20,19 @@ class DataLoaderArgumentsTest(unittest.TestCase):
 
         self.assertEqual(parsed.data_format, "csv")
         self.assertEqual(parsed.split_mode, "cross_validation")
+        self.assertEqual(parsed.real_class_count_policy, "strict")
+        self.assertEqual(parsed.samples_per_class_scope, "split")
         self.assertIsNone(parsed.train_x_path)
         self.assertIsNone(parsed.train_y_path)
         self.assertEqual(parsed.data_load_path_file_input, "Datasets/converted/train_x.csv")
         self.assertEqual(parsed.number_samples_per_class, "1:256,2:256")
         self.assertFalse(parsed._legacy_number_samples_per_class_explicit)
+
+    def test_main_help_lists_real_class_count_arguments(self):
+        help_text = build_parser().format_help()
+
+        self.assertIn("--real_class_count_policy", help_text)
+        self.assertIn("--samples_per_class_scope", help_text)
 
     def test_npy_xy_with_train_paths_parses(self):
         parser = build_parser()

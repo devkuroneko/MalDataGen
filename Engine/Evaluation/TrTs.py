@@ -135,6 +135,8 @@ class TrTs:
                 "TR-TS",
                 expected_num_classes=expected_classes,
                 samples_per_class=getattr(self.arguments, "train_samples_per_class", None),
+                real_class_count_policy=getattr(self.arguments, "real_class_count_policy", "strict"),
+                samples_per_class_scope=getattr(self.arguments, "samples_per_class_scope", "split"),
             )
             validate_synthetic_batches_for_evaluation(
                 synthetic_data,
