@@ -40,6 +40,42 @@ def _normalize_optional_labels(class_labels: Iterable[Any] | None) -> tuple[Any,
     return tuple(class_labels)
 
 
+def validate_xy_alignment(x, y, dataset_name: str):
+    """Validate that a feature matrix and label vector describe the same rows."""
+    x_array = numpy.asarray(x)
+    y_array = numpy.asarray(y).reshape(-1)
+    if x_array.ndim != 2:
+        raise ValueError(
+            f"{dataset_name} X/y alignment error: X must be 2D; got X shape={x_array.shape}."
+        )
+    if x_array.shape[0] != y_array.shape[0]:
+        raise ValueError(
+            f"{dataset_name} X/y alignment error: X has {x_array.shape[0]} rows, "
+            f"y has {y_array.shape[0]} rows. X shape={x_array.shape}, y shape={y_array.shape}."
+        )
+    if not numpy.all(numpy.isfinite(y_array)):
+        raise ValueError(f"{dataset_name} X/y alignment error: y contains NaN or inf labels.")
+    return x_array, y_array
+
+
+@dataclass(slots=True)
+class AlignedDataset:
+    X: Any
+    y: Any
+    split_name: str
+    fold_id: int | None = None
+    source_indices: Any | None = None
+    data_space: str = "source"
+    transform_id: str | None = None
+
+    def __post_init__(self) -> None:
+        self.X, self.y = validate_xy_alignment(
+            self.X,
+            self.y,
+            f"AlignedDataset split={self.split_name!r} fold={self.fold_id}",
+        )
+
+
 @dataclass(slots=True)
 class DatasetSchema:
     """Schema metadata shared by dataset loaders.

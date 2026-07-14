@@ -9,6 +9,8 @@ import numpy
 from Engine.DataIO.SyntheticSanityChecks import NON_CLASS_CONDITIONAL_WARNING
 from Engine.DataIO.SyntheticSanityChecks import SCALE_WARNING
 from Engine.DataIO.SyntheticSanityChecks import SyntheticSanityChecker
+from Engine.DataIO.SyntheticSanityChecks import _stratified_real_subset
+from main import SynDataGen
 
 
 class SyntheticSanityChecksTest(unittest.TestCase):
@@ -80,6 +82,56 @@ class SyntheticSanityChecksTest(unittest.TestCase):
 
             self.assertIn(NON_CLASS_CONDITIONAL_WARNING, report["warnings"])
             self.assertEqual(report["real_to_synthetic_classifier"]["dominant_predicted_class_fraction"], 1.0)
+
+    def test_real_x_smaller_than_real_y_raises_value_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            real_x = numpy.zeros((2, 2), dtype=numpy.float32)
+            real_y = numpy.array([0, 1, 1], dtype=numpy.int64)
+
+            with self.assertRaisesRegex(ValueError, "X has 2 rows, y has 3 rows"):
+                self._checker(directory, real_x, real_y, {0: real_x, 1: real_x}).run()
+
+    def test_real_y_smaller_than_real_x_raises_value_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            real_x = numpy.zeros((3, 2), dtype=numpy.float32)
+            real_y = numpy.array([0, 1], dtype=numpy.int64)
+
+            with self.assertRaisesRegex(ValueError, "X has 3 rows, y has 2 rows"):
+                self._checker(directory, real_x, real_y, {0: real_x[:1], 1: real_x[:1]}).run()
+
+    def test_fold_x_uses_fold_y(self):
+        with tempfile.TemporaryDirectory() as directory:
+            owner = SynDataGen.__new__(SynDataGen)
+            owner.fold_number = 0
+            fold_x = numpy.zeros((4, 2), dtype=numpy.float32)
+            fold_y = numpy.array([0, 0, 1, 1], dtype=numpy.int64)
+
+            aligned = owner._aligned_sanity_real_dataset(fold_x, fold_y, "valid")
+
+            self.assertEqual(aligned.X.shape[0], 4)
+            self.assertEqual(aligned.y.tolist(), [0, 0, 1, 1])
+
+    def test_subset_x_y_uses_same_indices(self):
+        real_x = numpy.arange(20, dtype=numpy.float32).reshape(10, 2)
+        real_y = numpy.array([0, 0, 0, 0, 0, 1, 1, 1, 1, 1], dtype=numpy.int64)
+
+        subset_x, subset_y, subset_counts = _stratified_real_subset(real_x, real_y, 2, 2)
+
+        self.assertEqual(subset_x.shape[0], subset_y.shape[0])
+        self.assertEqual(subset_counts.tolist(), [2, 2])
+
+    def test_insufficient_synthetic_generation_plan_fails_fast(self):
+        owner = SynDataGen.__new__(SynDataGen)
+        owner.arguments = SimpleNamespace(
+            synthetic_train_samples_per_class=500,
+            synthetic_test_samples_per_class=500,
+        )
+
+        with self.assertRaisesRegex(ValueError, "InsufficientSyntheticGenerationPlan: class=0 required=1000 planned=256"):
+            owner._validate_synthetic_generation_plan({
+                "classes": {0: 256, 1: 1000},
+                "number_classes": 2,
+            })
 
 
 if __name__ == "__main__":

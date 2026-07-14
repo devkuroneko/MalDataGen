@@ -18,6 +18,7 @@ from typing import Any
 import numpy
 
 from Engine.DataIO.LabelUtils import labels_to_1d_integer
+from Engine.DataIO.DatasetContracts import validate_xy_alignment
 from Engine.Preprocessing.FeatureTransformManager import ScaleGuard
 
 
@@ -137,16 +138,16 @@ class EvaluationRunner:
         raise ValueError(f"Unsupported evaluation mode: {self.mode}")
 
     def validate(self, dataset: EvaluationDataset):
-        if len(dataset.X_train) != len(dataset.y_train):
-            raise ValueError(
-                f"{self.mode.value} train X/y length mismatch: "
-                f"{len(dataset.X_train)} != {len(dataset.y_train)}"
-            )
-        if len(dataset.X_test) != len(dataset.y_test):
-            raise ValueError(
-                f"{self.mode.value} test X/y length mismatch: "
-                f"{len(dataset.X_test)} != {len(dataset.y_test)}"
-            )
+        dataset.X_train, dataset.y_train = validate_xy_alignment(
+            dataset.X_train,
+            dataset.y_train,
+            f"{self.mode.value} train origin={dataset.train_origin}",
+        )
+        dataset.X_test, dataset.y_test = validate_xy_alignment(
+            dataset.X_test,
+            dataset.y_test,
+            f"{self.mode.value} test origin={dataset.test_origin}",
+        )
         if len(dataset.X_train) == 0 or len(dataset.X_test) == 0:
             raise ValueError(f"{self.mode.value} requires non-empty train and test datasets.")
 

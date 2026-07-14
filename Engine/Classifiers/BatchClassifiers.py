@@ -16,6 +16,8 @@ from sklearn.naive_bayes import GaussianNB
 from sklearn.neural_network import MLPClassifier
 from sklearn.tree import DecisionTreeClassifier
 
+from Engine.DataIO.DatasetContracts import validate_xy_alignment
+
 
 BATCH_CLASSIFIER_DISPLAY_NAMES = {
     "sgd": "SGDClassifier",
@@ -82,7 +84,7 @@ def make_batch_classifier(classifier_key, arguments):
 
 
 def iter_array_batches(x_values, y_values, batch_size):
-    y_values = numpy.ravel(numpy.asarray(y_values))
+    x_values, y_values = validate_xy_alignment(x_values, y_values, "array batch iterator")
     for start in range(0, y_values.shape[0], int(batch_size)):
         end = min(start + int(batch_size), y_values.shape[0])
         yield numpy.asarray(x_values[start:end], dtype=numpy.float32), y_values[start:end].astype(numpy.int64)
@@ -105,6 +107,114 @@ def iter_synthetic_labeled_batches(synthetic_data):
 def _counts_by_class(labels):
     unique_labels, counts = numpy.unique(numpy.asarray(labels, dtype=numpy.int64), return_counts=True)
     return {str(int(label)): int(count) for label, count in zip(unique_labels, counts)}
+
+
+def _require_finite(name, values):
+    if not numpy.all(numpy.isfinite(numpy.asarray(values))):
+        raise ValueError(f"{name} contains NaN or inf values.")
+
+
+def _validate_class_counts(name, counts_by_class, expected_num_classes=None, samples_per_class=None):
+    if expected_num_classes is not None:
+        expected = {str(class_id) for class_id in range(int(expected_num_classes))}
+        observed = set(counts_by_class)
+        missing = sorted(int(class_id) for class_id in expected - observed)
+        extra = sorted(int(class_id) for class_id in observed - expected)
+        if missing or extra:
+            details = []
+            if missing:
+                details.append(f"missing classes={missing[:20]}")
+            if extra:
+                details.append(f"unexpected classes={extra[:20]}")
+            raise ValueError(f"{name} must contain exactly {expected_num_classes} classes; " + ", ".join(details))
+
+    if samples_per_class is not None:
+        short = {
+            class_id: count
+            for class_id, count in counts_by_class.items()
+            if int(count) < int(samples_per_class)
+        }
+        if short:
+            raise ValueError(
+                f"{name} has fewer than requested {samples_per_class} samples per class: {short}."
+            )
+
+
+def validate_real_array_for_batch_evaluation(
+        x_values,
+        y_values,
+        context,
+        expected_num_classes=None,
+        samples_per_class=None):
+    if x_values is None or y_values is None:
+        raise ValueError(f"{context} requires real X/y arrays.")
+    x_values, y_values = validate_xy_alignment(x_values, y_values, f"{context} real data")
+    if x_values.shape[0] == 0:
+        raise ValueError(f"{context} real data is empty.")
+    _require_finite(f"{context} real X", x_values)
+    _require_finite(f"{context} real y", y_values)
+    counts = _counts_by_class(y_values)
+    _validate_class_counts(
+        f"{context} real data",
+        counts,
+        expected_num_classes=expected_num_classes,
+        samples_per_class=samples_per_class,
+    )
+    return counts
+
+
+def validate_synthetic_batches_for_evaluation(
+        synthetic_data,
+        context,
+        expected_num_classes=None,
+        samples_per_class=None,
+        expected_num_features=None,
+        expected_data_space="source"):
+    if synthetic_data is None:
+        raise ValueError(f"{context} requires synthetic data.")
+
+    if hasattr(synthetic_data, "manifest"):
+        manifest = synthetic_data.manifest
+        data_space = manifest.get("data_space", "source")
+        if expected_data_space is not None and data_space != expected_data_space:
+            raise ValueError(
+                f"{context} real and synthetic data_space differ: real={expected_data_space} synthetic={data_space}."
+            )
+        if expected_num_classes is not None and int(manifest.get("num_classes", expected_num_classes)) != int(expected_num_classes):
+            raise ValueError(
+                f"{context} synthetic manifest num_classes={manifest.get('num_classes')} "
+                f"does not match expected {expected_num_classes}."
+            )
+
+    counts = {}
+    feature_count = expected_num_features
+    total_rows = 0
+    for x_batch, y_batch in iter_synthetic_labeled_batches(synthetic_data):
+        if x_batch.ndim != 2:
+            raise ValueError(f"{context} synthetic X must be two-dimensional; got shape {x_batch.shape}.")
+        if y_batch.ndim != 1 or x_batch.shape[0] != y_batch.shape[0]:
+            raise ValueError(f"{context} synthetic X/y are not aligned: X={x_batch.shape} y={y_batch.shape}.")
+        if feature_count is None:
+            feature_count = int(x_batch.shape[1])
+        elif int(x_batch.shape[1]) != int(feature_count):
+            raise ValueError(
+                f"{context} synthetic feature count mismatch: expected {feature_count}, got {x_batch.shape[1]}."
+            )
+        _require_finite(f"{context} synthetic X", x_batch)
+        _require_finite(f"{context} synthetic y", y_batch)
+        total_rows += int(x_batch.shape[0])
+        for label, count in _counts_by_class(y_batch).items():
+            counts[label] = int(counts.get(label, 0)) + int(count)
+
+    if total_rows == 0:
+        raise ValueError(f"{context} synthetic data is empty.")
+    _validate_class_counts(
+        f"{context} synthetic data",
+        counts,
+        expected_num_classes=expected_num_classes,
+        samples_per_class=samples_per_class,
+    )
+    return counts
 
 
 def _subset_quota(arguments, num_classes):

@@ -18,6 +18,7 @@ import math
 import shlex
 import subprocess
 import sys
+from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -77,6 +78,20 @@ DEFAULT_CLASSIFIER = [
 SAMPLES_TOP200 = ",".join(f"{class_id}:{DEFAULT_SAMPLES_PER_CLASS}" for class_id in range(APPCLASSNET_NUM_CLASSES))
 
 arguments = None
+
+
+@dataclass(frozen=True)
+class RunArtifacts:
+    model_name: str
+    fold: int | None
+    combination_dir: Path
+    results_json_path: Path
+    synthetic_train_manifest_path: Path | None
+    synthetic_test_manifest_path: Path | None
+    generated_data_dir: Path
+    monitor_dir: Path
+    data_space: str | None = None
+    transform_id: str | None = None
 
 
 def _list(value):
@@ -1130,7 +1145,6 @@ def run_real_real_baseline(parsed_arguments, raw_root, output_dir):
         "duration_seconds": (datetime.datetime.now() - time_start).total_seconds(),
     }
 
-    print(json.dumps(metrics, indent=2, sort_keys=True))
     with metrics_path.open("w", encoding="utf-8") as metrics_file:
         json.dump(metrics, metrics_file, indent=2, sort_keys=True)
         metrics_file.write("\n")
@@ -1201,16 +1215,22 @@ def _extract_batch_metadata(results_data, evaluation_name):
     return {}
 
 
-def _synthetic_manifest_summary(output_dir_run, max_batches=200):
+def _synthetic_manifest_summary(output_dir_run=None, manifest_path=None, max_batches=200):
     try:
         import numpy
     except ImportError:
         return {"data_space": "unknown", "feature_range": None, "manifest_path": None}
 
-    manifests = sorted(Path(output_dir_run).rglob("synthetic_batches/manifest.json"))
+    if manifest_path is not None:
+        manifests = [Path(manifest_path)]
+    else:
+        manifests = sorted(Path(output_dir_run).rglob("synthetic_batches/manifest.json"))
+        if not manifests:
+            manifests = sorted(Path(output_dir_run).rglob("synthetic_batches/*/manifest.json"))
+    manifests = [path for path in manifests if path and Path(path).is_file()]
     if not manifests:
         return {"data_space": "unknown", "feature_range": None, "manifest_path": None}
-    manifest_path = manifests[0]
+    manifest_path = Path(manifests[0])
     manifest = _load_json_file(manifest_path) or {}
     feature_min = None
     feature_max = None
@@ -1258,14 +1278,17 @@ def _empty_evaluation_summary(status, reason):
         "status": status,
         "reason": reason,
         "classifier": None,
+        "classifier_params": None,
         "real_samples_by_class": {},
         "synthetic_samples_by_class": {},
         "data_space": None,
         "feature_range": None,
+        "synthetic_manifest": None,
         "Accuracy": None,
         "MacroF1": None,
         "WeightedF1": None,
         "BalancedAccuracy": None,
+        "duration_seconds": None,
     }
 
 
@@ -1274,10 +1297,29 @@ def _build_method_summary(results_data, evaluation_name, output_dir_run, synthet
         return _empty_evaluation_summary("not_run", f"Skipped by evaluation_mode.")
     classifier_name, metric_values = _extract_evaluation_metrics(results_data, evaluation_name)
     metadata = _extract_batch_metadata(results_data, evaluation_name)
-    status = "completed" if classifier_name and metric_values else "not_available"
+    required_metrics = ("Accuracy", "BalancedAccuracy", "MacroF1", "WeightedF1")
+    missing_metrics = [metric for metric in required_metrics if metric_values.get(metric) is None]
+    status = "completed" if classifier_name and not missing_metrics else "not_run"
+    reason = None
+    if status != "completed":
+        if not classifier_name:
+            reason = f"{evaluation_name} requested but no classifier metrics were found in Results.json."
+        else:
+            reason = f"{evaluation_name} requested but missing metric(s): {', '.join(missing_metrics)}."
+    duration_seconds = None
+    if metadata:
+        duration_seconds = float(metadata.get("training_time_seconds", 0.0) or 0.0) + float(
+            metadata.get("evaluation_time_seconds", 0.0) or 0.0
+        )
     return {
         "status": status,
+        "reason": reason,
         "classifier": classifier_name or metadata.get("classifier"),
+        "classifier_params": {
+            key: value
+            for key, value in metadata.items()
+            if key in {"n_estimators", "max_depth", "max_samples", "class_weight", "subset_quota_per_class"}
+        } if metadata else None,
         "real_samples_by_class": metadata.get("real_samples_used_by_class", {}),
         "synthetic_samples_by_class": metadata.get("synthetic_samples_used_by_class", {}),
         "data_space": synthetic_summary.get("data_space", "source"),
@@ -1287,7 +1329,58 @@ def _build_method_summary(results_data, evaluation_name, output_dir_run, synthet
         "MacroF1": metric_values.get("MacroF1"),
         "WeightedF1": metric_values.get("WeightedF1"),
         "BalancedAccuracy": metric_values.get("BalancedAccuracy"),
+        "duration_seconds": duration_seconds,
     }
+
+
+def _artifact_results_path(artifact_or_path):
+    return Path(getattr(artifact_or_path, "results_json_path", artifact_or_path))
+
+
+def _artifact_combination_dir(artifact_or_path, results_path):
+    return Path(getattr(artifact_or_path, "combination_dir", Path(results_path).parents[1]))
+
+
+def _artifact_manifest_path(artifact_or_path, evaluation_name):
+    if evaluation_name == "TR-TS":
+        return getattr(artifact_or_path, "synthetic_test_manifest_path", None)
+    if evaluation_name == "TS-TR":
+        return getattr(artifact_or_path, "synthetic_train_manifest_path", None)
+    return None
+
+
+def _requested_evaluations(evaluation_mode):
+    return {
+        "TR-TS": evaluation_mode in {"tr_ts", "both"},
+        "TS-TR": evaluation_mode in {"ts_tr", "both"},
+    }
+
+
+def validate_requested_evaluations_completed(payload, parsed_arguments, results_paths, stopped_function):
+    for evaluation_name, requested in _requested_evaluations(parsed_arguments.evaluation_mode).items():
+        if not requested:
+            continue
+        summary = payload.get(evaluation_name, {})
+        if summary.get("status") == "completed":
+            continue
+        missing_artifacts = []
+        normalized_results_paths = [_artifact_results_path(item) for item in results_paths]
+        if not normalized_results_paths:
+            missing_artifacts.append("EvaluationResults/Results.json")
+        else:
+            missing_artifacts.extend(str(path) for path in normalized_results_paths if not Path(path).is_file())
+        if not summary.get("synthetic_manifest"):
+            expected_split = "test" if evaluation_name == "TR-TS" else "train"
+            missing_artifacts.append(f"synthetic_batches/{expected_split}/manifest.json")
+        raise RuntimeError(
+            f"Requested evaluation {evaluation_name} was not completed; "
+            f"status={summary.get('status')}; reason={summary.get('reason')}; "
+            f"missing_artifact={missing_artifacts or None}; stopped_function={stopped_function}."
+        )
+
+
+def print_results_payload(payload):
+    print(json.dumps(payload, indent=2, sort_keys=True))
 
 
 def write_baseline_batches_metrics(metrics, output_path):
@@ -1296,7 +1389,9 @@ def write_baseline_batches_metrics(metrics, output_path):
     payload = {
         "TR-TR": {
             "status": "completed",
+            "reason": None,
             "classifier": metrics.get("classifier"),
+            "classifier_params": metrics.get("classifier_params"),
             "real_samples_by_class": {
                 "train": metrics.get("train_class_counts", {}),
                 "test": metrics.get("test_class_counts", {}),
@@ -1304,6 +1399,8 @@ def write_baseline_batches_metrics(metrics, output_path):
             "synthetic_samples_by_class": {},
             "data_space": metrics.get("data_space", "source"),
             "feature_range": metrics.get("feature_range", {}),
+            "synthetic_manifest": None,
+            "duration_seconds": metrics.get("duration_seconds"),
             **metrics.get("metrics", {}),
         },
         "TR-TS": _empty_evaluation_summary("not_run", "baseline_real_only executes only TR-TR."),
@@ -1313,7 +1410,7 @@ def write_baseline_batches_metrics(metrics, output_path):
         json.dump(payload, metrics_file, indent=2, sort_keys=True)
         metrics_file.write("\n")
     logging.info("AppClassNet batches metrics saved to %s", output_path)
-    return output_path
+    return output_path, payload
 
 
 def write_batches_metrics(results_paths, output_path, parsed_arguments):
@@ -1321,28 +1418,49 @@ def write_batches_metrics(results_paths, output_path, parsed_arguments):
     output_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "TR-TR": _empty_evaluation_summary("not_run", "Synthetic run does not execute TR-TR."),
-        "TR-TS": _empty_evaluation_summary("not_run", f"evaluation_mode={parsed_arguments.evaluation_mode}."),
-        "TS-TR": _empty_evaluation_summary("not_run", f"evaluation_mode={parsed_arguments.evaluation_mode}."),
+        "TR-TS": _empty_evaluation_summary("not_run", "TR-TS was not requested."),
+        "TS-TR": _empty_evaluation_summary("not_run", "TS-TR was not requested."),
     }
-    active_tr_ts = parsed_arguments.evaluation_mode in {"tr_ts", "both"}
-    active_ts_tr = parsed_arguments.evaluation_mode in {"ts_tr", "both"}
-    for results_path in results_paths:
+    run_tr_ts = parsed_arguments.evaluation_mode in {"tr_ts", "both"}
+    run_ts_tr = parsed_arguments.evaluation_mode in {"ts_tr", "both"}
+    if run_tr_ts:
+        payload["TR-TS"] = _empty_evaluation_summary("not_run", "TR-TS requested but not yet executed.")
+    if run_ts_tr:
+        payload["TS-TR"] = _empty_evaluation_summary("not_run", "TS-TR requested but not yet executed.")
+    for artifact_or_path in results_paths:
+        results_path = _artifact_results_path(artifact_or_path)
         results_data = _load_json_file(results_path)
         if not isinstance(results_data, dict):
             continue
-        output_dir_run = Path(results_path).parents[1]
-        synthetic_summary = _synthetic_manifest_summary(output_dir_run)
+        output_dir_run = _artifact_combination_dir(artifact_or_path, results_path)
+        tr_ts_manifest = _artifact_manifest_path(artifact_or_path, "TR-TS")
+        ts_tr_manifest = _artifact_manifest_path(artifact_or_path, "TS-TR")
+        if tr_ts_manifest is None:
+            candidate = output_dir_run / "DataGenerated" / "synthetic_batches" / "test" / "manifest.json"
+            tr_ts_manifest = candidate if candidate.is_file() else None
+        if ts_tr_manifest is None:
+            candidate = output_dir_run / "DataGenerated" / "synthetic_batches" / "train" / "manifest.json"
+            ts_tr_manifest = candidate if candidate.is_file() else None
+        tr_ts_synthetic_summary = _synthetic_manifest_summary(
+            output_dir_run,
+            tr_ts_manifest,
+        )
+        ts_tr_synthetic_summary = _synthetic_manifest_summary(
+            output_dir_run,
+            ts_tr_manifest,
+        )
         payload["TR-TS"] = _build_method_summary(
-            results_data, "TR-TS", output_dir_run, synthetic_summary, active_tr_ts
+            results_data, "TR-TS", output_dir_run, tr_ts_synthetic_summary, run_tr_ts
         )
         payload["TS-TR"] = _build_method_summary(
-            results_data, "TS-TR", output_dir_run, synthetic_summary, active_ts_tr
+            results_data, "TS-TR", output_dir_run, ts_tr_synthetic_summary, run_ts_tr
         )
+    validate_requested_evaluations_completed(payload, parsed_arguments, results_paths, "write_batches_metrics")
     with output_path.open("w", encoding="utf-8") as metrics_file:
         json.dump(payload, metrics_file, indent=2, sort_keys=True)
         metrics_file.write("\n")
     logging.info("AppClassNet batches metrics saved to %s", output_path)
-    return output_path
+    return output_path, payload
 
 
 def log_appclassnet_memory_plan(parsed_arguments, raw_root):
@@ -1553,6 +1671,111 @@ def append_cli_value(command, parameter, value):
         command.append(str(value))
 
 
+def annotate_explicit_cli_arguments(parsed_arguments, raw_args):
+    explicit = set()
+    for index, argument in enumerate(raw_args):
+        if not argument.startswith("--"):
+            continue
+        option = argument.split("=", 1)[0]
+        explicit.add(option[2:].replace("-", "_"))
+    parsed_arguments._explicit_cli_options = explicit
+    return parsed_arguments
+
+
+def resolve_effective_argument(parsed_arguments, combination, parameter):
+    explicit = set(getattr(parsed_arguments, "_explicit_cli_options", set()))
+    requested_value = getattr(parsed_arguments, parameter, None)
+    campaign_has_value = parameter in combination
+    campaign_value = combination.get(parameter)
+
+    if parameter in explicit:
+        effective_value = requested_value
+        source = "cli"
+    elif campaign_has_value:
+        effective_value = campaign_value
+        source = "campaign"
+    else:
+        effective_value = requested_value
+        source = "default"
+
+    logging.info(
+        "Argument resolution: %s requested=%s campaign=%s effective=%s source=%s",
+        parameter,
+        requested_value,
+        campaign_value,
+        effective_value,
+        source,
+    )
+    return effective_value, source
+
+
+def synthetic_required_samples_per_class(parsed_arguments, combination):
+    train_value, _ = resolve_effective_argument(parsed_arguments, combination, "synthetic_train_samples_per_class")
+    test_value, _ = resolve_effective_argument(parsed_arguments, combination, "synthetic_test_samples_per_class")
+    if train_value is None and test_value is None:
+        return None
+    return int(train_value or 0) + int(test_value or 0)
+
+
+def build_number_samples_per_class_plan(samples_per_class):
+    return ",".join(f"{class_id}:{int(samples_per_class)}" for class_id in range(APPCLASSNET_NUM_CLASSES))
+
+
+def _remove_command_option(command, parameter):
+    option = f"--{parameter}"
+    cleaned = []
+    index = 0
+    while index < len(command):
+        token = command[index]
+        if token == option:
+            index += 1
+            while index < len(command) and not str(command[index]).startswith("--"):
+                index += 1
+            continue
+        cleaned.append(token)
+        index += 1
+    command[:] = cleaned
+
+
+def deduplicate_command_options(command):
+    seen = {}
+    prefix = []
+    option_parts = []
+    index = 0
+    while index < len(command):
+        token = str(command[index])
+        if not token.startswith("--"):
+            prefix.append(command[index])
+            index += 1
+            continue
+        option = token
+        values = []
+        index += 1
+        while index < len(command) and not str(command[index]).startswith("--"):
+            values.append(str(command[index]))
+            index += 1
+        values_tuple = tuple(values)
+        if option in seen:
+            if seen[option] != values_tuple:
+                raise ValueError(
+                    f"DuplicateCommandArgumentConflict: {option} values={seen[option]} and {values_tuple}"
+                )
+            continue
+        seen[option] = values_tuple
+        option_parts.extend([option, *values])
+    return [*prefix, *option_parts]
+
+
+GENERATION_QUOTA_PARAMETERS = {
+    "number_samples_per_class",
+    "sample_plan",
+    "train_samples_per_class",
+    "test_samples_per_class",
+    "synthetic_train_samples_per_class",
+    "synthetic_test_samples_per_class",
+}
+
+
 def build_main_command(
     python_executable,
     dataset_path,
@@ -1607,14 +1830,22 @@ def build_main_command(
         command.append("--allow_scaler_refit")
     if parsed_arguments.inverse_transform_synthetic:
         command.append("--inverse_transform_synthetic")
-    if parsed_arguments.synthetic_train_samples_per_class is not None:
-        command.extend(["--synthetic_train_samples_per_class", str(parsed_arguments.synthetic_train_samples_per_class)])
-        command.extend(["--train_samples_per_class", str(parsed_arguments.synthetic_train_samples_per_class)])
-    if parsed_arguments.synthetic_test_samples_per_class is not None:
-        command.extend(["--synthetic_test_samples_per_class", str(parsed_arguments.synthetic_test_samples_per_class)])
-        command.extend(["--test_samples_per_class", str(parsed_arguments.synthetic_test_samples_per_class)])
+    for parameter in (
+            "train_samples_per_class",
+            "test_samples_per_class",
+            "synthetic_train_samples_per_class",
+            "synthetic_test_samples_per_class"):
+        effective_value, _ = resolve_effective_argument(parsed_arguments, combination, parameter)
+        if effective_value is not None:
+            command.extend([f"--{parameter}", str(effective_value)])
+
+    required_synthetic = synthetic_required_samples_per_class(parsed_arguments, combination)
+    if required_synthetic is not None:
+        command.extend(["--number_samples_per_class", build_number_samples_per_class_plan(required_synthetic)])
 
     for parameter, value in combination.items():
+        if parameter in GENERATION_QUOTA_PARAMETERS:
+            continue
         append_cli_value(command, parameter, value)
 
         if (
@@ -1624,7 +1855,7 @@ def build_main_command(
             layers = str(value).split()[::-1]
             command.extend(["--variational_autoencoder_dense_layer_sizes_decoder", *layers])
 
-    return command
+    return deduplicate_command_options(command)
 
 
 def build_batch_main_command(python_executable, raw_root, output_dir_run, combination, verbosity, data_type, parsed_arguments):
@@ -1707,24 +1938,23 @@ def build_batch_main_command(python_executable, raw_root, output_dir_run, combin
     if parsed_arguments.max_samples_per_class is not None:
         command.extend(["--max_samples_per_class", str(parsed_arguments.max_samples_per_class)])
 
-    synthetic_train_quota = (
-        parsed_arguments.synthetic_train_samples_per_class
-        if parsed_arguments.synthetic_train_samples_per_class is not None
-        else parsed_arguments.train_samples_per_class
-    )
-    synthetic_test_quota = (
-        parsed_arguments.synthetic_test_samples_per_class
-        if parsed_arguments.synthetic_test_samples_per_class is not None
-        else parsed_arguments.test_samples_per_class
-    )
-    if synthetic_train_quota is not None:
-        command.extend(["--train_samples_per_class", str(synthetic_train_quota)])
-    if synthetic_test_quota is not None:
-        command.extend(["--test_samples_per_class", str(synthetic_test_quota)])
-    if parsed_arguments.synthetic_train_samples_per_class is not None:
-        command.extend(["--synthetic_train_samples_per_class", str(parsed_arguments.synthetic_train_samples_per_class)])
-    if parsed_arguments.synthetic_test_samples_per_class is not None:
-        command.extend(["--synthetic_test_samples_per_class", str(parsed_arguments.synthetic_test_samples_per_class)])
+    for parameter in (
+            "train_samples_per_class",
+            "test_samples_per_class",
+            "synthetic_train_samples_per_class",
+            "synthetic_test_samples_per_class"):
+        effective_value, _ = resolve_effective_argument(parsed_arguments, combination, parameter)
+        if effective_value is not None:
+            command.extend([f"--{parameter}", str(effective_value)])
+
+    required_synthetic = synthetic_required_samples_per_class(parsed_arguments, combination)
+    if required_synthetic is not None:
+        command.extend([
+            "--sample_plan",
+            "class_counts",
+            "--number_samples_per_class",
+            build_number_samples_per_class_plan(required_synthetic),
+        ])
 
     if parsed_arguments.n_estimators is not None:
         command.extend(["--n_estimators", str(parsed_arguments.n_estimators)])
@@ -1756,6 +1986,8 @@ def build_batch_main_command(python_executable, raw_root, output_dir_run, combin
         command.append("--inverse_transform_synthetic")
 
     for parameter, value in combination.items():
+        if parameter in GENERATION_QUOTA_PARAMETERS:
+            continue
         append_cli_value(command, parameter, value)
 
         if (
@@ -1781,9 +2013,10 @@ def build_batch_main_command(python_executable, raw_root, output_dir_run, combin
         "denoising_diffusion": ["denoising_diffusion_unet_batch_size"],
     }
     for parameter in batch_overrides.get(model_type, []):
+        _remove_command_option(command, parameter)
         command.extend([f"--{parameter}", str(parsed_arguments.batch_size)])
 
-    return command
+    return deduplicate_command_options(command)
 
 
 def build_plot_command(python_executable, dataset_path, output_dir_run, combination, plot_title, results_paths, final_plot):
@@ -1818,9 +2051,51 @@ def build_plot_command(python_executable, dataset_path, output_dir_run, combinat
 
 
 def run_cmd(command):
+    command = deduplicate_command_options(command)
     logging.info("Command line: %s", shlex.join(map(str, command)))
     if not arguments.dryrun:
         subprocess.run(command, check=True)
+
+
+def resolve_actual_run_dir(requested_output_dir):
+    requested_output_dir = Path(requested_output_dir)
+    if (requested_output_dir / "EvaluationResults" / "Results.json").is_file():
+        return requested_output_dir
+
+    candidates = [
+        path
+        for path in requested_output_dir.parent.glob(f"{requested_output_dir.name}*")
+        if path.is_dir() and (path / "EvaluationResults" / "Results.json").is_file()
+    ]
+    if not candidates:
+        return requested_output_dir
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def build_run_artifacts(requested_output_dir, combination):
+    combination_dir = resolve_actual_run_dir(requested_output_dir)
+    generated_data_dir = combination_dir / "DataGenerated"
+    train_manifest = generated_data_dir / "synthetic_batches" / "train" / "manifest.json"
+    test_manifest = generated_data_dir / "synthetic_batches" / "test" / "manifest.json"
+    legacy_manifest = generated_data_dir / "synthetic_batches" / "manifest.json"
+    if not train_manifest.is_file() and legacy_manifest.is_file():
+        train_manifest = legacy_manifest
+    if not test_manifest.is_file() and legacy_manifest.is_file():
+        test_manifest = legacy_manifest
+
+    manifest_data = _load_json_file(train_manifest) if train_manifest.is_file() else {}
+    return RunArtifacts(
+        model_name=str(combination.get("model_type")),
+        fold=None,
+        combination_dir=combination_dir,
+        results_json_path=combination_dir / "EvaluationResults" / "Results.json",
+        synthetic_train_manifest_path=train_manifest if train_manifest.is_file() else None,
+        synthetic_test_manifest_path=test_manifest if test_manifest.is_file() else None,
+        generated_data_dir=generated_data_dir,
+        monitor_dir=combination_dir / "Monitor",
+        data_space=manifest_data.get("data_space") if isinstance(manifest_data, dict) else None,
+        transform_id=manifest_data.get("transform_id") if isinstance(manifest_data, dict) else None,
+    )
 
 
 def _args_without_option(raw_args, option_names, option_takes_value):
@@ -2214,6 +2489,7 @@ def main():
     global arguments
     parser = build_parser()
     arguments = parser.parse_args()
+    annotate_explicit_cli_arguments(arguments, sys.argv[1:])
     if arguments.batch_classifier:
         arguments.eval_classifier = (
             "random_forest_light"
@@ -2279,7 +2555,9 @@ def main():
 
     if arguments.baseline_real_only:
         metrics_path, metrics = run_real_real_baseline(arguments, raw_root, output_dir)
-        write_baseline_batches_metrics(metrics, REPO_ROOT / RESULTS_ROOT / "batches" / "metrics.json")
+        write_result = write_baseline_batches_metrics(metrics, REPO_ROOT / RESULTS_ROOT / "batches" / "metrics.json")
+        payload = write_result[1] if isinstance(write_result, tuple) else metrics
+        print_results_payload(payload)
         logging.info("Baseline real-only mode completed. Metrics: %s", metrics_path)
         return 0
 
@@ -2366,6 +2644,7 @@ def main():
 
     dataset_name = dataset_path.stem
     results_grouping = []
+    pending_plot_commands = []
 
     for count_campaign, campaign_name in enumerate(campaigns_chosen, start=1):
         logging.info("\tCampaign %s %d/%d", campaign_name, count_campaign, len(campaigns_chosen))
@@ -2412,29 +2691,42 @@ def main():
             logging.info("\t\t\tEnd                : %s", time_end_experiment.strftime(TIME_FORMAT))
             logging.info("\t\t\tExperiment duration: %s", time_end_experiment - time_start_experiment)
 
-            results_path = output_dir_run / "EvaluationResults" / "Results.json"
-            results_grouping.append(results_path)
+            if arguments.execution_mode == "batches":
+                run_artifacts = build_run_artifacts(output_dir_run, combination)
+                results_grouping.append(run_artifacts)
+                actual_output_dir_run = run_artifacts.combination_dir
+            else:
+                actual_output_dir_run = output_dir_run
+                results_path = output_dir_run / "EvaluationResults" / "Results.json"
+                results_grouping.append(results_path)
 
             if arguments.skip_plots:
                 continue
 
             final_plot = count_campaign == len(campaigns_chosen)
             plot_title = f"{combination['model_type']} {dataset_name}"
+            plot_results_paths = [_artifact_results_path(item) for item in results_grouping]
             plot_command = build_plot_command(
                 child_python,
                 dataset_path,
-                output_dir_run,
+                actual_output_dir_run,
                 combination,
                 plot_title,
-                results_grouping,
+                plot_results_paths,
                 final_plot,
             )
             if arguments.pipenv:
                 plot_command = ["pipenv", "run", *plot_command]
+            if arguments.execution_mode == "batches":
+                pending_plot_commands.append(plot_command)
+                continue
 
             time_start_plot = datetime.datetime.now()
             logging.info("\t\t\tBegin Plot: %s", time_start_plot.strftime(TIME_FORMAT))
-            run_cmd(plot_command)
+            try:
+                run_cmd(plot_command)
+            except subprocess.CalledProcessError as error:
+                logging.warning("Optional plot command failed and results remain valid: %s", error)
             time_end_plot = datetime.datetime.now()
             logging.info("\t\t\tEnd Plot     : %s", time_end_plot.strftime(TIME_FORMAT))
             logging.info("\t\t\tPlot duration: %s", time_end_plot - time_start_plot)
@@ -2444,11 +2736,23 @@ def main():
 
     time_end_evaluation = datetime.datetime.now()
     if arguments.execution_mode == "batches":
-        write_batches_metrics(
+        write_result = write_batches_metrics(
             results_grouping,
             REPO_ROOT / RESULTS_ROOT / "batches" / "metrics.json",
             arguments,
         )
+        payload = write_result[1] if isinstance(write_result, tuple) else write_result
+        print_results_payload(payload)
+        for plot_command in pending_plot_commands:
+            time_start_plot = datetime.datetime.now()
+            logging.info("\t\t\tBegin Plot: %s", time_start_plot.strftime(TIME_FORMAT))
+            try:
+                run_cmd(plot_command)
+            except subprocess.CalledProcessError as error:
+                logging.warning("Optional plot command failed and metrics remain valid: %s", error)
+            time_end_plot = datetime.datetime.now()
+            logging.info("\t\t\tEnd Plot     : %s", time_end_plot.strftime(TIME_FORMAT))
+            logging.info("\t\t\tPlot duration: %s", time_end_plot - time_start_plot)
     logging.info("Evaluation duration: %s", time_end_evaluation - time_start_evaluation)
     return 0
 

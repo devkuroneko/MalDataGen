@@ -27,7 +27,9 @@ class SyntheticBatchWriter:
             output_format="npy_batches",
             data_space="source",
             transform_id=None,
-            transform_history=None):
+            transform_history=None,
+            split_name=None,
+            fold_number=None):
         self.root_dir = Path(root_dir)
         self.num_classes = int(num_classes)
         self.num_features = int(num_features)
@@ -38,7 +40,11 @@ class SyntheticBatchWriter:
         self.data_space = data_space
         self.transform_id = transform_id
         self.transform_history = list(transform_history or [])
+        self.split_name = split_name
+        self.fold_number = fold_number
         self.batch_dir = self.root_dir / "synthetic_batches"
+        if self.split_name:
+            self.batch_dir = self.batch_dir / str(self.split_name)
         self.batch_dir.mkdir(parents=True, exist_ok=True)
         self._single_npy_path = self.batch_dir / "synthetic.npy"
         self._single_npy = None
@@ -56,6 +62,8 @@ class SyntheticBatchWriter:
             "data_space": self.data_space,
             "transform_id": self.transform_id,
             "transform_history": self.transform_history,
+            "split": self.split_name,
+            "fold": self.fold_number,
         }
 
     def initialize_single_npy(self, total_rows, dtype=numpy.float32):
@@ -85,6 +93,7 @@ class SyntheticBatchWriter:
             batch_entry = {
                 "path": str(file_path),
                 "shape": [int(x_batch.shape[0]), int(x_batch.shape[1])],
+                "dtype": str(x_batch.dtype),
             }
         elif self.output_format == "csv_batches":
             file_path = class_dir / f"batch_{batch_index:06d}.csv"
@@ -94,6 +103,7 @@ class SyntheticBatchWriter:
             batch_entry = {
                 "path": str(file_path),
                 "shape": [int(x_batch.shape[0]), int(x_batch.shape[1])],
+                "dtype": str(x_batch.dtype),
             }
         elif self.output_format == "single_npy":
             if self._single_npy is None:
@@ -106,6 +116,7 @@ class SyntheticBatchWriter:
             batch_entry = {
                 "path": str(file_path),
                 "shape": [int(x_batch.shape[0]), int(x_batch.shape[1])],
+                "dtype": str(x_batch.dtype),
                 "offset_start": int(offset_start),
                 "offset_end": int(end),
             }
@@ -169,3 +180,25 @@ class SyntheticBatchReader:
         if path.suffix == ".csv":
             return numpy.loadtxt(path, delimiter=",", dtype=numpy.float32)
         raise ValueError(f"Unsupported synthetic batch file: {path}")
+
+
+class SyntheticSplitBatchReaders:
+    """Container for separate train/test synthetic batch manifests."""
+
+    def __init__(self, train_reader, test_reader):
+        self.train_reader = train_reader
+        self.test_reader = test_reader
+
+    @property
+    def manifest_path(self):
+        return {
+            "train": str(self.train_reader.manifest_path),
+            "test": str(self.test_reader.manifest_path),
+        }
+
+    @property
+    def manifest(self):
+        return {
+            "train": self.train_reader.manifest,
+            "test": self.test_reader.manifest,
+        }

@@ -32,9 +32,11 @@ try:
     import argparse
     import logging
     import numpy
+    from pathlib import Path
     from dataclasses import dataclass
 
     from Engine.DataIO.CSVLoader import CSVDataProcessor
+    from Engine.DataIO.SyntheticBatchIO import SyntheticBatchReader
     from Tools.PlotHeatMap import HeatmapComparator
 
     from Tools.PlotTrainingCurve import PlotTrainingCurve
@@ -96,7 +98,23 @@ class Arguments:
     data_type: str = 'continuous'
 
 
+class NpyDatasetProcessor:
+    def __init__(self, path):
+        self._data_loaded = numpy.load(path, mmap_mode="r", allow_pickle=False)
+        if self._data_loaded.ndim != 2:
+            raise ValueError(f"NPY dataset must be a 2D feature matrix. Got {self._data_loaded.shape}.")
+        self._data_loaded_labels = numpy.zeros(self._data_loaded.shape[0], dtype=numpy.int64)
+
+    def get_features_by_label(self, label):
+        return self._data_loaded
+
+    def get_number_columns(self):
+        return int(self._data_loaded.shape[1])
+
+
 def load_dataset_processor(path: str):
+    if Path(path).suffix == ".npy":
+        return NpyDatasetProcessor(path)
     processor = CSVDataProcessor(Arguments(data_load_path_file_input=path,
                                            data_load_path_file_output=''))
     processor.load_csv()
@@ -148,6 +166,9 @@ def plot_optional(description, callback):
         logging.warning("Skipping %s: %s", description, error)
 
 def plot_heatmaps_from_dataset_comparison(dataset_path: str, synthetic_path: str, output_file: str):
+    if Path(synthetic_path).suffix == ".npy":
+        logging.warning("Skipping comparison heatmap for NPY synthetic file %s.", synthetic_path)
+        return
     real_processor = load_dataset_processor(dataset_path)
     synthetic_processor = load_dataset_processor(synthetic_path)
 
@@ -323,15 +344,34 @@ def main():
                       args.dataset[0],
                       f'{args.output_dir[0]}/EvaluationResults/heat_map_original_data.pdf'))
 
-    for k in range(args.folds[0]):
-        path = f'{args.output_dir[0]}/DataGenerated/DataOutput_K_fold_{k}_{args.model[0]}.txt'
-        plot_optional(f'synthetic dataset heatmap fold {k}',
-                      lambda path=path, k=k: plot_heatmaps_from_dataset(
-                          path, f'{args.output_dir[0]}/EvaluationResults/heat_map_k_{k}.pdf'))
-        plot_optional(f'comparison heatmap fold {k}',
-                      lambda path=path, k=k: plot_heatmaps_from_dataset_comparison(
-                          args.dataset[0], path,
-                          f'{args.output_dir[0]}/EvaluationResults/Comparison_heat_map_k_{k}'))
+    synthetic_batches_dir = Path(args.output_dir[0]) / "DataGenerated" / "synthetic_batches"
+    if synthetic_batches_dir.is_dir():
+        train_manifest = synthetic_batches_dir / "train" / "manifest.json"
+        test_manifest = synthetic_batches_dir / "test" / "manifest.json"
+        manifests = [path for path in (train_manifest, test_manifest) if path.is_file()]
+        if not manifests and (synthetic_batches_dir / "manifest.json").is_file():
+            manifests = [synthetic_batches_dir / "manifest.json"]
+        for manifest_path in manifests:
+            try:
+                reader = SyntheticBatchReader(manifest_path)
+                logging.warning(
+                    "Skipping global synthetic heatmaps for batch manifest %s with %d rows; "
+                    "npy_batches are not materialized as DataOutput_K_fold_*.txt.",
+                    manifest_path,
+                    reader.total_rows,
+                )
+            except Exception as error:
+                logging.warning("Skipping batch synthetic plot discovery for %s: %s", manifest_path, error)
+    else:
+        for k in range(args.folds[0]):
+            path = f'{args.output_dir[0]}/DataGenerated/DataOutput_K_fold_{k}_{args.model[0]}.txt'
+            plot_optional(f'synthetic dataset heatmap fold {k}',
+                          lambda path=path, k=k: plot_heatmaps_from_dataset(
+                              path, f'{args.output_dir[0]}/EvaluationResults/heat_map_k_{k}.pdf'))
+            plot_optional(f'comparison heatmap fold {k}',
+                          lambda path=path, k=k: plot_heatmaps_from_dataset_comparison(
+                              args.dataset[0], path,
+                              f'{args.output_dir[0]}/EvaluationResults/Comparison_heat_map_k_{k}'))
 
     plot_optional("cluster plot",
                   lambda: plot_clusters_from_dataset(

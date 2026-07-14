@@ -47,6 +47,7 @@ try:
     from Engine.DataIO.CSVLoader import CSVDataProcessor
     from Engine.DataIO.LabelUtils import build_class_metadata
     from Engine.DataIO.LabelUtils import validate_zero_based_labels
+    from Engine.DataIO.DatasetContracts import validate_xy_alignment
     from Engine.DataIO.NpyXYLoader import NpyXYLoader
     from Engine.DataIO.StratifiedNpySelection import build_minimum_coverage_report
     from Engine.DataIO.StratifiedNpySelection import get_last_stratified_selection_report
@@ -199,8 +200,21 @@ def _apply_stratified_split_selection(owner, split, y_path, split_name, samples_
             int(samples_per_class),
             report_path,
         )
+        split.X, split.y = validate_xy_alignment(
+            split.X,
+            split.y,
+            f"batches split before stratified selection split={split_name}",
+        )
+        if indices.size:
+            max_selected_index = int(indices.max())
+            if max_selected_index >= split.X.shape[0]:
+                raise ValueError(
+                    f"Batches stratified selection produced index {max_selected_index} outside "
+                    f"{split_name} X rows={split.X.shape[0]}; y_path={y_path} does not match this split X."
+                )
         split.X = numpy.asarray(split.X[indices], dtype=numpy.float32)
         split.y = numpy.asarray(split.y[indices])
+        validate_xy_alignment(split.X, split.y, f"batches split after stratified selection split={split_name}")
         _log_array_memory(f"Limited {split_name} X", split.X)
         _log_array_memory(f"Limited {split_name} y", split.y)
 
@@ -328,6 +342,8 @@ def _number_samples_per_class_from_schema(schema, labels):
 
 def _create_fold(training_split, evaluation_split, evaluation_name=None, evaluation_not_applicable=False):
         evaluation_source = evaluation_split if evaluation_split is not None else training_split
+        validate_xy_alignment(training_split.X, training_split.y, f"fold training split={training_split.name}")
+        validate_xy_alignment(evaluation_source.X, evaluation_source.y, f"fold evaluation split={evaluation_source.name}")
         return {
             'x_training_real': numpy.asarray(training_split.X, dtype=numpy.float32),
             'y_training_real': validate_zero_based_labels(training_split.y, context=f"{training_split.name} y"),

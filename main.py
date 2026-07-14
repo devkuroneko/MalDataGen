@@ -60,6 +60,9 @@ try:
 
     from Engine.DataIO.CSVLoader import CSVDataProcessor
     from Engine.DataIO.SyntheticBatchIO import SyntheticBatchWriter
+    from Engine.DataIO.SyntheticBatchIO import SyntheticSplitBatchReaders
+    from Engine.DataIO.DatasetContracts import AlignedDataset
+    from Engine.DataIO.DatasetContracts import validate_xy_alignment
     from Engine.DataIO.SyntheticLabelAudit import SyntheticLabelGenerationAudit
     from Engine.DataIO.SyntheticLabelAudit import audit_synthetic_label_generation
     from Engine.DataIO.SyntheticSanityChecks import run_synthetic_sanity_checks
@@ -109,17 +112,26 @@ PARTITIONED_GENERATION_SUPPORTED_MODELS = {
 
 def run_synthetic_evaluation_modes(owner, dictionary_data, evaluation_synthetic):
     evaluation_mode = getattr(owner.arguments, "evaluation_mode", "both")
-    owner._guard_current_evaluation_space(dictionary_data, evaluation_synthetic)
-    if evaluation_mode in {"tr_ts", "both"}:
-        owner.evaluation_TR_TS(dictionary_data, evaluation_synthetic)
+    run_tr_ts = evaluation_mode in {"tr_ts", "both"}
+    run_ts_tr = evaluation_mode in {"ts_tr", "both"}
+    synthetic_for_tr_ts = getattr(evaluation_synthetic, "test_reader", evaluation_synthetic)
+    synthetic_for_ts_tr = getattr(evaluation_synthetic, "train_reader", evaluation_synthetic)
+    if run_tr_ts:
+        owner._guard_current_evaluation_space(dictionary_data, synthetic_for_tr_ts)
+    if run_ts_tr and synthetic_for_ts_tr is not synthetic_for_tr_ts:
+        owner._guard_current_evaluation_space(dictionary_data, synthetic_for_ts_tr)
+    elif run_ts_tr and not run_tr_ts:
+        owner._guard_current_evaluation_space(dictionary_data, synthetic_for_ts_tr)
+    if run_tr_ts:
+        owner.evaluation_TR_TS(dictionary_data, synthetic_for_tr_ts)
     else:
         owner.mark_evaluation_classifiers_not_applicable(
             "TR-TS",
             owner.fold_number + 1,
             f"TR-TS skipped because evaluation_mode={evaluation_mode}.",
         )
-    if evaluation_mode in {"ts_tr", "both"}:
-        owner.evaluation_TS_TR(dictionary_data, evaluation_synthetic)
+    if run_ts_tr:
+        owner.evaluation_TS_TR(dictionary_data, synthetic_for_ts_tr)
     else:
         owner.mark_evaluation_classifiers_not_applicable(
             "TS-TR",
@@ -507,7 +519,8 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                 fold_end_time = time.time()
                 logging.info("Fold %d experiment completed in %.2f seconds.", fold + 1, fold_end_time - fold_start_time)
                 logging.info("------\n\n")
-                self.save_dictionary_to_json(self.get_evaluation_results_path()+"/Results.json")
+                if fold + 1 < int(getattr(self.arguments, "number_k_folds", 1)):
+                    self.save_dictionary_to_json(self.get_evaluation_results_path()+"/Results.json")
                 # sys.exit(0)
 
             # Update and log the mean and standard deviation of the evaluation results
@@ -573,6 +586,7 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
             data_type=getattr(self, '_data_type', getattr(self.arguments, 'data_type', 'binary')),
         )
         generation_metadata["generation_batch_size"] = int(getattr(self.arguments, "generation_batch_size", 8192))
+        self._validate_synthetic_generation_plan(generation_metadata)
 
         if len(generation_metadata["classes"]) != number_classes:
             logging.info(
@@ -580,6 +594,38 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                 len(generation_metadata["classes"]), number_classes)
 
         return generation_metadata
+
+    def _validate_synthetic_generation_plan(self, generation_metadata):
+        train_quota = getattr(self.arguments, "synthetic_train_samples_per_class", None)
+        test_quota = getattr(self.arguments, "synthetic_test_samples_per_class", None)
+        if train_quota is None and test_quota is None:
+            return
+
+        required_per_class = int(train_quota or 0) + int(test_quota or 0)
+        if required_per_class <= 0:
+            return
+
+        for class_id in range(int(generation_metadata["number_classes"])):
+            planned = int(generation_metadata["classes"].get(int(class_id), 0))
+            if planned < required_per_class:
+                raise ValueError(
+                    "InsufficientSyntheticGenerationPlan: "
+                    f"class={class_id} required={required_per_class} planned={planned}"
+                )
+
+    def _aligned_sanity_real_dataset(self, real_x, real_y, split_name):
+        real_x, real_y = validate_xy_alignment(
+            real_x,
+            real_y,
+            f"sanity check source split={split_name} fold={self.fold_number + 1}",
+        )
+        return AlignedDataset(
+            X=real_x,
+            y=real_y,
+            split_name=split_name,
+            fold_id=self.fold_number + 1,
+            data_space="source",
+        )
 
     def _get_label_mapping_for_audit(self):
         label_mapping = getattr(self, '_label_mapping', None)
@@ -840,11 +886,40 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                 getattr(self.arguments, "execution_mode", "normal") == "batches"
                 and not getattr(self.arguments, "materialize_synthetic", False)
             ):
-                self.data_generated = self._synthesize_data_incremental(
-                    number_samples_per_class,
-                    x_real_samples,
-                    y_real_samples,
-                )
+                if x_training_real is not None and y_training_real is not None:
+                    train_plan = self._generation_metadata_for_split(
+                        number_samples_per_class,
+                        getattr(self.arguments, "synthetic_train_samples_per_class", None)
+                        or getattr(self.arguments, "train_samples_per_class", None),
+                        "train",
+                    )
+                    test_plan = self._generation_metadata_for_split(
+                        number_samples_per_class,
+                        getattr(self.arguments, "synthetic_test_samples_per_class", None)
+                        or getattr(self.arguments, "test_samples_per_class", None),
+                        "test",
+                    )
+                    train_reader = self._synthesize_data_incremental(
+                        train_plan,
+                        x_training_real,
+                        y_training_real,
+                        split_name="train",
+                        seed=42,
+                    )
+                    test_reader = self._synthesize_data_incremental(
+                        test_plan,
+                        x_real_samples,
+                        y_real_samples,
+                        split_name="test",
+                        seed=43,
+                    )
+                    self.data_generated = SyntheticSplitBatchReaders(train_reader, test_reader)
+                else:
+                    self.data_generated = self._synthesize_data_incremental(
+                        number_samples_per_class,
+                        x_real_samples,
+                        y_real_samples,
+                    )
                 return self.data_generated
 
             if (
@@ -975,8 +1050,12 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
             logging.info("Synthetic label generation audit passed: %s", audit_path)
 
             sanity_path, _ = run_synthetic_sanity_checks(
-                self._current_evaluation_source_x if self._current_evaluation_source_x is not None else x_real_samples,
-                y_real_samples,
+                self._aligned_sanity_real_dataset(
+                    self._current_evaluation_source_x if self._current_evaluation_source_x is not None else x_real_samples,
+                    y_real_samples,
+                    "evaluation",
+                ),
+                None,
                 self.data_generated,
                 number_classes=number_samples_per_class["number_classes"],
                 execution_mode=getattr(self.arguments, "execution_mode", "normal"),
@@ -1155,8 +1234,12 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
             audit_path, _ = audit.finalize()
             logging.info("Synthetic label generation audit passed: %s", audit_path)
             sanity_path, _ = run_synthetic_sanity_checks(
-                self._current_evaluation_source_x if self._current_evaluation_source_x is not None else x_evaluation_real,
-                y_evaluation_real,
+                self._aligned_sanity_real_dataset(
+                    self._current_evaluation_source_x if self._current_evaluation_source_x is not None else x_evaluation_real,
+                    y_evaluation_real,
+                    "evaluation",
+                ),
+                None,
                 reader,
                 number_classes=number_samples_per_class["number_classes"],
                 execution_mode=getattr(self.arguments, "execution_mode", "normal"),
@@ -1206,7 +1289,30 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                 f"Incremental synthetic generation is not implemented for model_type={self.arguments.model_type!r}."
             )
 
-    def _synthesize_data_incremental(self, number_samples_per_class, x_real_samples, y_real_samples):
+    def _generation_metadata_for_split(self, number_samples_per_class, samples_per_class, split_name):
+            split_metadata = {
+                key: value
+                for key, value in number_samples_per_class.items()
+                if key != "classes"
+            }
+            if samples_per_class is None:
+                split_metadata["classes"] = dict(number_samples_per_class["classes"])
+            else:
+                split_metadata["classes"] = {
+                    int(class_label): int(samples_per_class)
+                    for class_label in range(int(number_samples_per_class["number_classes"]))
+                }
+                split_metadata["samples_per_class"] = int(samples_per_class)
+            split_metadata["split"] = split_name
+            return split_metadata
+
+    def _synthesize_data_incremental(
+            self,
+            number_samples_per_class,
+            x_real_samples,
+            y_real_samples,
+            split_name=None,
+            seed=42):
             generator = self._get_active_generator()
             output_format = getattr(self.arguments, "save_synthetic_format", "npy_batches")
             if output_format == "legacy":
@@ -1218,7 +1324,7 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                 root_dir=self.directory_output_data,
                 num_classes=number_samples_per_class["number_classes"],
                 num_features=self.get_number_columns(),
-                seed=42,
+                seed=seed,
                 model_name=self.arguments.model_type,
                 execution_mode=getattr(self.arguments, "execution_mode", "normal"),
                 output_format=output_format,
@@ -1236,6 +1342,8 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                     self._model_input_adapter.generator_manager.transform_history
                     if self._model_input_adapter is not None else []
                 ),
+                split_name=split_name,
+                fold_number=self.fold_number + 1,
             )
             if output_format == "single_npy":
                 writer.initialize_single_npy(sum(number_samples_per_class["classes"].values()))
@@ -1282,8 +1390,12 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
             audit_path, _ = audit.finalize()
             logging.info("Synthetic label generation audit passed: %s", audit_path)
             sanity_path, _ = run_synthetic_sanity_checks(
-                self._current_evaluation_source_x if self._current_evaluation_source_x is not None else x_real_samples,
-                y_real_samples,
+                self._aligned_sanity_real_dataset(
+                    self._current_evaluation_source_x if self._current_evaluation_source_x is not None else x_real_samples,
+                    y_real_samples,
+                    split_name or "evaluation",
+                ),
+                None,
                 reader,
                 number_classes=number_samples_per_class["number_classes"],
                 execution_mode=getattr(self.arguments, "execution_mode", "normal"),

@@ -37,10 +37,13 @@ try:
     import logging
 
     from Engine.DataIO.LabelUtils import labels_to_1d_integer
+    from Engine.DataIO.DatasetContracts import validate_xy_alignment
     from Engine.Classifiers.BatchClassifiers import get_batch_classifier_display_name
     from Engine.Classifiers.BatchClassifiers import iter_array_batches
     from Engine.Classifiers.BatchClassifiers import predict_synthetic_batches
     from Engine.Classifiers.BatchClassifiers import train_batch_classifier
+    from Engine.Classifiers.BatchClassifiers import validate_real_array_for_batch_evaluation
+    from Engine.Classifiers.BatchClassifiers import validate_synthetic_batches_for_evaluation
     from Engine.Evaluation.EvaluationRunner import EvaluationMode
     from Engine.Evaluation.EvaluationRunner import EvaluationRunner
     from Engine.Evaluation.EvaluationRunner import uses_strict_appclassnet_protocol
@@ -102,6 +105,30 @@ class TrTs:
                 dictionary_data[train_y_key],
                 context="TR-TS training labels",
             )
+            validate_xy_alignment(
+                dictionary_data[train_x_key],
+                train_labels,
+                f"TR-TS training split={train_x_key}",
+            )
+            expected_classes = self._get_configured_number_classes(train_labels)
+            validate_real_array_for_batch_evaluation(
+                dictionary_data[train_x_key],
+                train_labels,
+                "TR-TS",
+                expected_num_classes=expected_classes,
+                samples_per_class=getattr(self.arguments, "train_samples_per_class", None),
+            )
+            validate_synthetic_batches_for_evaluation(
+                synthetic_data,
+                "TR-TS",
+                expected_num_classes=expected_classes,
+                samples_per_class=(
+                    getattr(self.arguments, "synthetic_test_samples_per_class", None)
+                    or getattr(self.arguments, "test_samples_per_class", None)
+                ),
+                expected_num_features=dictionary_data[train_x_key].shape[1],
+                expected_data_space="source",
+            )
             train_batches = iter_array_batches(
                 dictionary_data[train_x_key],
                 train_labels,
@@ -110,7 +137,7 @@ class TrTs:
             classifier_instance, metadata = train_batch_classifier(
                 classifier_key,
                 train_batches,
-                self._get_configured_number_classes(train_labels),
+                expected_classes,
                 self.arguments,
                 batch_recorder=self.record_batch_processed,
             )
@@ -118,7 +145,10 @@ class TrTs:
                 classifier_instance,
                 synthetic_data,
                 batch_recorder=self.record_batch_processed,
-                max_samples_per_class=getattr(self.arguments, "test_samples_per_class", None),
+                max_samples_per_class=(
+                    getattr(self.arguments, "synthetic_test_samples_per_class", None)
+                    or getattr(self.arguments, "test_samples_per_class", None)
+                ),
             )
             metadata["evaluation_time_seconds"] = float(evaluation_time)
             metadata["evaluation_time"] = float(evaluation_time)

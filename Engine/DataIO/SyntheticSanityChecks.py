@@ -6,12 +6,15 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import numpy
 from sklearn.tree import DecisionTreeClassifier
 
 from Engine.Classifiers.BatchClassifiers import iter_synthetic_labeled_batches
+from Engine.DataIO.DatasetContracts import AlignedDataset
+from Engine.DataIO.DatasetContracts import validate_xy_alignment
 from Engine.DataIO.LabelUtils import labels_to_1d_integer
 
 
@@ -31,6 +34,19 @@ def run_synthetic_sanity_checks(
         fold_number=None,
         model_type=None,
         experiment_directory=None):
+    if isinstance(real_x, AlignedDataset):
+        aligned_real = real_x
+        real_x = aligned_real.X
+        real_y = aligned_real.y
+    else:
+        aligned_real = AlignedDataset(
+            X=real_x,
+            y=real_y,
+            split_name="synthetic_sanity_real",
+            fold_id=fold_number,
+        )
+        real_x = aligned_real.X
+        real_y = aligned_real.y
     checker = SyntheticSanityChecker(
         real_x=real_x,
         real_y=real_y,
@@ -54,12 +70,21 @@ class SyntheticSanityChecker:
             synthetic_data,
             number_classes,
             execution_mode,
-            arguments=None,
-            fold_number=None,
-            model_type=None,
-            experiment_directory=None):
-        self.real_x = numpy.asarray(real_x)
-        self.real_y = labels_to_1d_integer(real_y, context="synthetic sanity real labels")
+        arguments=None,
+        fold_number=None,
+        model_type=None,
+        experiment_directory=None):
+        self.real_x, aligned_real_y = validate_xy_alignment(
+            real_x,
+            real_y,
+            f"SyntheticSanityChecks real split fold={fold_number} experiment={experiment_directory}",
+        )
+        self.real_y = labels_to_1d_integer(aligned_real_y, context="synthetic sanity real labels")
+        self.real_x, self.real_y = validate_xy_alignment(
+            self.real_x,
+            self.real_y,
+            f"SyntheticSanityChecks normalized real split fold={fold_number} experiment={experiment_directory}",
+        )
         self.synthetic_data = synthetic_data
         self.number_classes = int(number_classes)
         self.execution_mode = execution_mode or "normal"
@@ -78,6 +103,7 @@ class SyntheticSanityChecker:
         self.warnings = []
 
     def run(self):
+        self._log_preflight_shapes()
         real_stats = self._real_feature_and_class_stats()
         classifier, classifier_metadata = self._train_real_decision_tree_subset(real_stats["feature_mean"])
         synthetic_stats = self._synthetic_stats_and_predictions(classifier, real_stats)
@@ -104,6 +130,30 @@ class SyntheticSanityChecker:
         with self.output_path.open("w") as output_file:
             json.dump(report, output_file, indent=2)
         return self.output_path, report
+
+    def _log_preflight_shapes(self):
+        synthetic_rows = 0
+        synthetic_shape = None
+        synthetic_y_rows = 0
+        for x_batch, y_batch in iter_synthetic_labeled_batches(self.synthetic_data):
+            synthetic_rows += int(x_batch.shape[0])
+            synthetic_y_rows += int(y_batch.shape[0])
+            if synthetic_shape is None:
+                synthetic_shape = (0, int(x_batch.shape[1])) if x_batch.ndim == 2 else x_batch.shape
+        if synthetic_shape is None:
+            synthetic_shape = (0, self.num_features)
+        else:
+            synthetic_shape = (synthetic_rows, synthetic_shape[1])
+        logging.info(
+            "SyntheticSanityChecks preflight: fold=%s split=%s real_x.shape=%s real_y.shape=%s "
+            "synthetic_x.shape=%s synthetic_y.shape=%s",
+            self.fold_number,
+            "evaluation",
+            self.real_x.shape,
+            self.real_y.shape,
+            synthetic_shape,
+            (synthetic_y_rows,),
+        )
 
     def _real_feature_and_class_stats(self):
         real_x = self.real_x.astype(numpy.float64, copy=False)
@@ -315,6 +365,7 @@ def _subset_quota(arguments, number_classes):
 
 
 def _stratified_real_subset(real_x, real_y, number_classes, quota_per_class):
+    real_x, real_y = validate_xy_alignment(real_x, real_y, "SyntheticSanityChecks stratified real subset")
     random_generator = numpy.random.default_rng(42)
     selected_indices = []
     subset_counts = numpy.zeros(int(number_classes), dtype=numpy.int64)
@@ -333,6 +384,12 @@ def _stratified_real_subset(real_x, real_y, number_classes, quota_per_class):
 
     indices = numpy.concatenate(selected_indices).astype(numpy.int64, copy=False)
     random_generator.shuffle(indices)
+    logging.info(
+        "SyntheticSanityChecks stratified subset: real_x.shape=%s real_y.shape=%s max_selected_index=%s",
+        real_x.shape,
+        real_y.shape,
+        int(indices.max()) if indices.size else None,
+    )
     return (
         numpy.asarray(real_x[indices], dtype=numpy.float32),
         real_y[indices],

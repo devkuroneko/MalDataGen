@@ -125,11 +125,6 @@ def _configure_classifier_arguments(parsed_arguments):
     if int(getattr(parsed_arguments, "classes_per_group", 10)) <= 0:
         raise ValueError("--classes_per_group must be a positive integer.")
 
-    if getattr(parsed_arguments, "synthetic_train_samples_per_class", None) is not None:
-        parsed_arguments.train_samples_per_class = parsed_arguments.synthetic_train_samples_per_class
-    if getattr(parsed_arguments, "synthetic_test_samples_per_class", None) is not None:
-        parsed_arguments.test_samples_per_class = parsed_arguments.synthetic_test_samples_per_class
-
     if getattr(parsed_arguments, "execution_mode", "normal") == "batches":
         if getattr(parsed_arguments, "batch_classifier", None):
             parsed_arguments.eval_classifier = parsed_arguments.batch_classifier

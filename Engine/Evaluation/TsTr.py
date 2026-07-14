@@ -37,10 +37,13 @@ try:
     import logging
 
     from Engine.DataIO.LabelUtils import labels_to_1d_integer
+    from Engine.DataIO.DatasetContracts import validate_xy_alignment
     from Engine.Classifiers.BatchClassifiers import get_batch_classifier_display_name
     from Engine.Classifiers.BatchClassifiers import iter_synthetic_labeled_batches
     from Engine.Classifiers.BatchClassifiers import predict_array_batches
     from Engine.Classifiers.BatchClassifiers import train_batch_classifier
+    from Engine.Classifiers.BatchClassifiers import validate_real_array_for_batch_evaluation
+    from Engine.Classifiers.BatchClassifiers import validate_synthetic_batches_for_evaluation
     from Engine.Evaluation.EvaluationRunner import EvaluationMode
     from Engine.Evaluation.EvaluationRunner import EvaluationRunner
     from Engine.Preprocessing.FeatureTransformManager import ScaleGuard
@@ -56,6 +59,7 @@ def _counts_by_class(labels):
 
 
 def _select_stratified_array_subset(x_values, y_values, samples_per_class, seed=42):
+    x_values, y_values = validate_xy_alignment(x_values, y_values, "TS-TR stratified real evaluation subset")
     if samples_per_class is None:
         return x_values, y_values
 
@@ -119,17 +123,40 @@ class TsTr:
                 getattr(self.arguments, "batch_classifier", "decision_tree_subset"),
             )
             classifier_name = get_batch_classifier_display_name(classifier_key)
+            evaluation_labels = labels_to_1d_integer(
+                dictionary_data['y_evaluation_real'],
+                context="TS-TR evaluation labels",
+            )
+            expected_classes = self._get_configured_number_classes(evaluation_labels)
+            validate_synthetic_batches_for_evaluation(
+                synthetic_data,
+                "TS-TR",
+                expected_num_classes=expected_classes,
+                samples_per_class=(
+                    getattr(self.arguments, "synthetic_train_samples_per_class", None)
+                    or getattr(self.arguments, "train_samples_per_class", None)
+                ),
+                expected_num_features=dictionary_data['x_evaluation_real'].shape[1],
+                expected_data_space="source",
+            )
+            validate_real_array_for_batch_evaluation(
+                dictionary_data['x_evaluation_real'],
+                evaluation_labels,
+                "TS-TR",
+                expected_num_classes=expected_classes,
+                samples_per_class=getattr(self.arguments, "test_samples_per_class", None),
+            )
             train_batches = iter_synthetic_labeled_batches(synthetic_data)
             classifier_instance, metadata = train_batch_classifier(
                 classifier_key,
                 train_batches,
-                self._get_configured_number_classes(dictionary_data['y_evaluation_real']),
+                expected_classes,
                 self.arguments,
                 batch_recorder=self.record_batch_processed,
             )
             evaluation_x, evaluation_y = _select_stratified_array_subset(
                 dictionary_data['x_evaluation_real'],
-                labels_to_1d_integer(dictionary_data['y_evaluation_real'], context="TS-TR evaluation labels"),
+                evaluation_labels,
                 getattr(self.arguments, "test_samples_per_class", None),
             )
             real_labels, predicted_labels, evaluation_time = predict_array_batches(
