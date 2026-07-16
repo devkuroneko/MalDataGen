@@ -389,3 +389,8 @@ results/
 Datasets/
 local_documentation/
 docs/
+!docs/
+docs/*
+!docs/audits/
+docs/audits/*
+!docs/audits/*.md

@@ -60,11 +60,9 @@ try:
 
     from Engine.Evaluation.Evaluation import Evaluation
     from Engine.Evaluation.ExperimentProtocol import CANONICAL_PROTOCOLS
-    from Engine.Evaluation.ExperimentProtocol import is_canonical_protocol_selector
     from Engine.Evaluation.ExperimentProtocol import legacy_name_for_protocol_id
-    from Engine.Evaluation.ExperimentProtocol import protocol_ids_from_legacy_mode
     from Engine.Evaluation.ExperimentProtocol import protocol_metadata
-    from Engine.Evaluation.ExperimentProtocol import selected_protocol_ids
+    from Engine.Evaluation.ExperimentProtocol import resolve_evaluation_protocol_plan
     from sklearn.model_selection import StratifiedKFold
 
     from Engine.DataIO.CSVLoader import CSVDataProcessor
@@ -80,6 +78,7 @@ try:
     from Engine.DataIO.SyntheticQualityAudit import assert_real_resample_control_metrics
     from Engine.DataIO.SyntheticQualityAudit import run_synthetic_quality_audit
     from Engine.DataIO.SyntheticSanityChecks import run_synthetic_sanity_checks
+    from Engine.DataIO.JsonIO import atomic_write_json
     from Engine.Utils.ResourceMonitor import get_current_memory_mb
     from Engine.Preprocessing.FeatureTransformManager import FeatureTransformPolicy
     from Engine.Preprocessing.FeatureTransformManager import ModelInputAdapter
@@ -176,11 +175,11 @@ def _legacy_dictionary_for_real_splits(real_train_data, real_test_data):
 
 
 def run_synthetic_evaluation_modes(owner, dictionary_data, evaluation_synthetic):
-    evaluation_mode = getattr(owner.arguments, "evaluation_mode", "both")
-    selected_protocols = set(selected_protocol_ids(owner.arguments))
-    run_tr_ts = "TR_TS" in selected_protocols
-    run_ts_tr = "TS_TR" in selected_protocols
-    run_tr_ts_tr = "TR_PLUS_TS_TR" in selected_protocols
+    protocol_plan = resolve_evaluation_protocol_plan(owner.arguments)
+    evaluation_mode = getattr(owner.arguments, "evaluation_mode", protocol_plan.protocol)
+    run_tr_ts = protocol_plan.run_tr_ts
+    run_ts_tr = protocol_plan.run_ts_tr
+    run_tr_ts_tr = protocol_plan.run_tr_plus_ts_tr
     synthetic_for_tr_ts = getattr(evaluation_synthetic, "test_reader", evaluation_synthetic)
     synthetic_for_ts_tr = getattr(evaluation_synthetic, "train_reader", evaluation_synthetic)
     dataset_bundle = _dataset_bundle_from_evaluation_input(owner, dictionary_data)
@@ -258,13 +257,7 @@ def _json_ready(value):
 
 
 def _protocol_selection_for_arguments(arguments):
-    protocol = getattr(arguments, "evaluation_protocol", "legacy")
-    if is_canonical_protocol_selector(protocol):
-        return selected_protocol_ids(arguments)
-    return protocol_ids_from_legacy_mode(
-        getattr(arguments, "evaluation_mode", "both"),
-        run_tr_tr=bool(getattr(arguments, "run_tr_tr", False)),
-    )
+    return list(resolve_evaluation_protocol_plan(arguments).active_protocol_ids)
 
 
 
@@ -627,7 +620,8 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
 
     def _write_experiment_protocol_artifacts(self):
         output_dir = Path(self.current_subdir)
-        selected_protocols = _protocol_selection_for_arguments(self.arguments)
+        protocol_plan = resolve_evaluation_protocol_plan(self.arguments)
+        selected_protocols = list(protocol_plan.active_protocol_ids)
         protocol_id = (
             selected_protocols[0]
             if len(selected_protocols) == 1
@@ -656,6 +650,7 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
         }
         protocol_payload = {
             "protocol_id": protocol_id,
+            "protocol_plan": protocol_plan.as_dict(),
             "requested_protocols": selected_protocols,
             "train_sources": {
                 protocol_key: protocol_metadata(protocol_key)["train_sources"]
@@ -715,7 +710,13 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
             "run_id": output_dir.name,
         }
         protocol_path = output_dir / "experiment_protocol.json"
-        protocol_path.write_text(json.dumps(_json_ready(protocol_payload), indent=2, sort_keys=True), encoding="utf-8")
+        atomic_write_json(
+            protocol_payload,
+            protocol_path,
+            run_id=output_dir.name,
+            protocol=protocol_plan.protocol,
+            model=getattr(self.arguments, "model_type", None),
+        )
 
         summary_payload = {
             **summaries,
@@ -727,7 +728,13 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
             },
         }
         summary_path = output_dir / "results_summary.json"
-        summary_path.write_text(json.dumps(_json_ready(summary_payload), indent=2, sort_keys=True), encoding="utf-8")
+        atomic_write_json(
+            summary_payload,
+            summary_path,
+            run_id=output_dir.name,
+            protocol=protocol_plan.protocol,
+            model=getattr(self.arguments, "model_type", None),
+        )
         self._dictionary_metrics["ExperimentProtocol"] = protocol_payload
         self._dictionary_metrics["ResultsSummary"] = summary_payload
         logging.info("Experiment protocol manifest saved to %s", protocol_path)
@@ -901,12 +908,14 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                             number_classes=self._get_configured_number_classes(dictionary_data["y_training_real"]),
                             synthetic_control=getattr(self.arguments, "synthetic_control", "none"),
                             fold=self.fold_number + 1,
+                            protocol_plan=resolve_evaluation_protocol_plan(self.arguments),
                         )
                         assert_label_permutation_control_metrics(
                             self._dictionary_metrics,
                             number_classes=self._get_configured_number_classes(dictionary_data["y_training_real"]),
                             synthetic_control=getattr(self.arguments, "synthetic_control", "none"),
                             fold=self.fold_number + 1,
+                            protocol_plan=resolve_evaluation_protocol_plan(self.arguments),
                         )
                         if getattr(self.arguments, "run_tr_tr", False):
                             dataset_bundle = dictionary_data.get("dataset_bundle") or getattr(self, "_dataset_bundle", None)

@@ -195,6 +195,26 @@ class AppClassNetEvaluationModeTest(unittest.TestCase):
 
         self.assertEqual(runner.choose_campaigns(args.campaign, full=False), runner.DEMO_CAMPAIGNS)
 
+    def test_real_resample_sf_uses_single_control_campaign(self):
+        args = _parsed_runner_args(["-c", "sf", "--synthetic_control", "real_resample"])
+        campaigns = runner.choose_campaigns(args.campaign, full=False)
+
+        self.assertEqual(runner.canonicalize_control_campaigns(campaigns, args), [runner.CONTROL_CAMPAIGN])
+
+    def test_real_resample_preserves_explicit_legacy_campaign(self):
+        args = _parsed_runner_args(["-c", "variational_demo", "--synthetic_control", "real_resample"])
+        campaigns = runner.choose_campaigns(args.campaign, full=False)
+
+        self.assertEqual(runner.canonicalize_control_campaigns(campaigns, args), ["variational_demo"])
+
+    def test_control_campaign_runs_copy_model_and_records_control_artifact(self):
+        campaign = runner.campaigns_available[runner.CONTROL_CAMPAIGN]
+        params, values = zip(*campaign.items())
+        combination = dict(zip(params, (value[0] for value in values)))
+
+        self.assertEqual(combination["model_type"], "copy")
+        self.assertEqual(combination["artifact_model_type"], "control")
+
     def test_legacy_csv_command_still_works(self):
         args = _parsed_runner_args(["--run_mode", "full", "--pipeline", "synthetic"])
         command = build_main_command(
@@ -894,8 +914,8 @@ class AppClassNetEvaluationModeTest(unittest.TestCase):
         )
 
         self.assertEqual(payload["TR-TS"]["status"], "completed")
-        self.assertEqual(payload["TS-TR"]["status"], "not_run")
-        self.assertEqual(payload["TR+TS-TR"]["status"], "not_run")
+        self.assertEqual(payload["TS-TR"]["status"], "not_applicable")
+        self.assertEqual(payload["TR+TS-TR"]["status"], "not_applicable")
         self.assertIsNotNone(payload["TR-TS"]["Accuracy"])
 
     def test_evaluation_mode_ts_tr(self):
@@ -907,9 +927,9 @@ class AppClassNetEvaluationModeTest(unittest.TestCase):
             SimpleNamespace(evaluation_mode="ts_tr"),
         )
 
-        self.assertEqual(payload["TR-TS"]["status"], "not_run")
+        self.assertEqual(payload["TR-TS"]["status"], "not_applicable")
         self.assertEqual(payload["TS-TR"]["status"], "completed")
-        self.assertEqual(payload["TR+TS-TR"]["status"], "not_run")
+        self.assertEqual(payload["TR+TS-TR"]["status"], "not_applicable")
         self.assertIsNotNone(payload["TS-TR"]["Accuracy"])
 
     def test_evaluation_mode_both(self):
@@ -924,7 +944,7 @@ class AppClassNetEvaluationModeTest(unittest.TestCase):
         self.assertEqual(payload["TR-TR"]["status"], "not_run")
         self.assertEqual(payload["TR-TS"]["status"], "completed")
         self.assertEqual(payload["TS-TR"]["status"], "completed")
-        self.assertEqual(payload["TR+TS-TR"]["status"], "not_run")
+        self.assertEqual(payload["TR+TS-TR"]["status"], "not_applicable")
         self.assertIsNotNone(payload["TR-TS"]["MacroF1"])
         self.assertIsNotNone(payload["TS-TR"]["WeightedF1"])
 
@@ -942,8 +962,8 @@ class AppClassNetEvaluationModeTest(unittest.TestCase):
             SimpleNamespace(evaluation_mode="tr_ts_tr"),
         )
 
-        self.assertEqual(payload["TR-TS"]["status"], "not_run")
-        self.assertEqual(payload["TS-TR"]["status"], "not_run")
+        self.assertEqual(payload["TR-TS"]["status"], "not_applicable")
+        self.assertEqual(payload["TS-TR"]["status"], "not_applicable")
         self.assertEqual(payload["TR+TS-TR"]["status"], "completed")
         self.assertIsNotNone(payload["TR+TS-TR"]["Accuracy"])
 
@@ -981,6 +1001,17 @@ class AppClassNetEvaluationModeTest(unittest.TestCase):
                 _temp_metrics_path(self),
                 SimpleNamespace(evaluation_mode="tr_ts"),
             )
+
+    def test_requested_incomplete_evaluation_is_failed_not_not_run(self):
+        summary = runner._build_method_summary(
+            {"TR-TS": {}},
+            "TR-TS",
+            Path("/tmp/run"),
+            {},
+            active=True,
+        )
+
+        self.assertEqual(summary["status"], "failed")
 
     def test_result_is_serialized_once(self):
         with mock.patch("builtins.print") as print_mock:

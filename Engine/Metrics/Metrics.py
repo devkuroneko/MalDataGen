@@ -39,6 +39,7 @@ try:
     import pandas as pd 
      
     import time 
+    from pathlib import Path
     from sklearn.metrics import accuracy_score
     from sklearn.metrics import balanced_accuracy_score
     from sklearn.metrics import f1_score
@@ -80,13 +81,77 @@ try:
     from Engine.Utils.ResourceMonitor import get_current_memory_mb
     from Engine.Utils.ResourceMonitor import psutil
     from Engine.Utils.ResourceMonitor import NOT_AVAILABLE
+    from Engine.Evaluation.ExperimentProtocol import resolve_evaluation_protocol_plan
+    from Engine.DataIO.JsonIO import ResultSchemaValidationError
+    from Engine.DataIO.JsonIO import atomic_write_json
 
 
 except ImportError as error:
     print(error)
     sys.exit(-1)
 
-NOT_APPLICABLE = "not_applicable"
+NOT_APPLICABLE = None
+STATUS_NOT_APPLICABLE = "not_applicable"
+
+
+def _protocol_fold_status(metrics, evaluation_name):
+    block = metrics.get(evaluation_name, {})
+    if not isinstance(block, dict):
+        return "not_run"
+    statuses = []
+    for classifier, classifier_block in block.items():
+        if classifier == "Summary" or not isinstance(classifier_block, dict):
+            continue
+        for fold_key, fold_block in classifier_block.items():
+            if fold_key.endswith("-Fold") and isinstance(fold_block, dict):
+                statuses.append(fold_block.get("status"))
+    if any(status == "completed" for status in statuses):
+        return "completed"
+    if any(status == STATUS_NOT_APPLICABLE for status in statuses):
+        return STATUS_NOT_APPLICABLE
+    if any(status == "failed" for status in statuses):
+        return "failed"
+    return "not_run"
+
+
+def _synthetic_manifest_path_from_generated(data_generated, split_name):
+    if data_generated is None:
+        return None
+    reader = getattr(data_generated, f"{split_name}_reader", None)
+    manifest_path = getattr(reader, "manifest_path", None)
+    if manifest_path is not None:
+        return str(manifest_path)
+    manifest_paths = getattr(data_generated, "manifest_path", None)
+    if isinstance(manifest_paths, dict):
+        return manifest_paths.get(split_name)
+    return None
+
+
+def _num_classes_from_plan(number_samples_per_class):
+    if isinstance(number_samples_per_class, dict):
+        value = number_samples_per_class.get("number_classes")
+        if value is not None:
+            return int(value)
+    return None
+
+
+def _validate_result_payload_schema(payload):
+    required = (
+        "schema_version",
+        "run_id",
+        "protocol_plan",
+        "protocol_statuses",
+        "artifact_paths",
+        "control_type",
+        "random_state",
+    )
+    missing = [key for key in required if key not in payload]
+    if missing:
+        raise ResultSchemaValidationError(f"Missing required result field(s): {', '.join(missing)}")
+    if not isinstance(payload.get("protocol_plan"), dict):
+        raise ResultSchemaValidationError("protocol_plan must be an object.")
+    if not isinstance(payload.get("protocol_statuses"), dict):
+        raise ResultSchemaValidationError("protocol_statuses must be an object.")
 
 def import_metrics(function):
     """
@@ -200,15 +265,24 @@ class Metrics:
         self.list_sdv_metrics = ["diagnostic", "quality"]
 
         # Initialize the main metrics dictionary for different evaluation types and classifiers
+        protocol_plan = resolve_evaluation_protocol_plan(arguments)
+        def fold_classifier_metrics():
+            return {
+                **{metric: NOT_APPLICABLE for metric in self.list_classifier_metrics},
+                "status": "not_run",
+                "reason": None,
+            }
+
         self._dictionary_metrics = self._dictionary_metrics  | {
             "Schema": {
                 "version": "2.0",
                 "compatibility": "legacy_metrics_with_evaluation_metadata",
             },
+            "EvaluationProtocolPlan": protocol_plan.as_dict(),
             "TS-TR": {
                 classifier: {
                     **{
-                        f'{fold}-Fold': {metric: NOT_APPLICABLE for metric in self.list_classifier_metrics}
+                        f'{fold}-Fold': fold_classifier_metrics()
                         for fold in range(1, arguments.number_k_folds + 1)
                     },
                     'Summary': {
@@ -219,7 +293,7 @@ class Metrics:
             "TR-TS": {
                 classifier: {
                     **{
-                        f"{fold}-Fold": {metric: NOT_APPLICABLE for metric in self.list_classifier_metrics}
+                        f"{fold}-Fold": fold_classifier_metrics()
                         for fold in range(1, arguments.number_k_folds + 1)
                     },
                     "Summary": {
@@ -230,7 +304,7 @@ class Metrics:
            "TR-TR": {
                classifier: {
                    **{
-                       f'{fold}-Fold': {metric: NOT_APPLICABLE for metric in self.list_classifier_metrics}
+                       f'{fold}-Fold': fold_classifier_metrics()
                        for fold in range(1, arguments.number_k_folds + 1)
                    },
                    'Summary': {
@@ -241,7 +315,7 @@ class Metrics:
            "TR+TS-TR": {
                classifier: {
                    **{
-                       f'{fold}-Fold': {metric: NOT_APPLICABLE for metric in self.list_classifier_metrics}
+                       f'{fold}-Fold': fold_classifier_metrics()
                        for fold in range(1, arguments.number_k_folds + 1)
                    },
                    'Summary': {
@@ -521,20 +595,52 @@ class Metrics:
             output_file_results (str): The file path where the JSON will be saved.
         """
 
-        try:
-            with Timer("saving") as timer:
-                with open(output_file_results, 'w') as json_file:
-                    json.dump(self._dictionary_metrics, json_file, indent=4, cls=NumpyEncoder)
-                    print(f"Dictionary successfully saved to {output_file_results}")
-            self.record_resource_usage("saving", timer.elapsed_seconds)
-            metrics_json_path = output_file_results.rsplit('/', 1)[0] + "/metrics.json"
-            if metrics_json_path != output_file_results:
-                with open(metrics_json_path, 'w') as json_file:
-                    json.dump(self._dictionary_metrics, json_file, indent=4, cls=NumpyEncoder)
+        output_file_results = Path(output_file_results)
+        with Timer("saving") as timer:
+            self._prepare_result_metadata(output_file_results)
+            _validate_result_payload_schema(self._dictionary_metrics)
+            protocol_plan = resolve_evaluation_protocol_plan(self.arguments)
+            atomic_write_json(
+                self._dictionary_metrics,
+                output_file_results,
+                indent=4,
+                run_id=self._dictionary_metrics.get("run_id"),
+                protocol=protocol_plan.protocol,
+                model=getattr(self.arguments, "model_type", None),
+            )
+            print(f"Dictionary successfully saved to {output_file_results}")
+        self.record_resource_usage("saving", timer.elapsed_seconds)
+        metrics_json_path = output_file_results.parent / "metrics.json"
+        if metrics_json_path != output_file_results:
+            atomic_write_json(
+                self._dictionary_metrics,
+                metrics_json_path,
+                indent=4,
+                run_id=self._dictionary_metrics.get("run_id"),
+                protocol=resolve_evaluation_protocol_plan(self.arguments).protocol,
+                model=getattr(self.arguments, "model_type", None),
+            )
 
-        except Exception as e:
-            # Print an error message if saving fails
-            print(f"Error saving the dictionary: {e}")
+    def _prepare_result_metadata(self, output_file_results):
+        protocol_plan = resolve_evaluation_protocol_plan(self.arguments)
+        self._dictionary_metrics["schema_version"] = "3.0"
+        self._dictionary_metrics["run_id"] = Path(output_file_results).parents[1].name if len(Path(output_file_results).parents) > 1 else Path(output_file_results).stem
+        self._dictionary_metrics["protocol_plan"] = protocol_plan.to_dict()
+        self._dictionary_metrics["protocol_statuses"] = {
+            "TR-TR": _protocol_fold_status(self._dictionary_metrics, "TR-TR"),
+            "TR-TS": _protocol_fold_status(self._dictionary_metrics, "TR-TS"),
+            "TS-TR": _protocol_fold_status(self._dictionary_metrics, "TS-TR"),
+            "TR+TS-TR": _protocol_fold_status(self._dictionary_metrics, "TR+TS-TR"),
+        }
+        self._dictionary_metrics["artifact_paths"] = {
+            "results_json": str(output_file_results),
+            "synthetic_train_manifest": _synthetic_manifest_path_from_generated(getattr(self, "data_generated", None), "train"),
+            "synthetic_test_manifest": _synthetic_manifest_path_from_generated(getattr(self, "data_generated", None), "test"),
+        }
+        self._dictionary_metrics["control_type"] = getattr(self.arguments, "synthetic_control", "none")
+        self._dictionary_metrics["effective_num_classes"] = getattr(self.arguments, "num_classes", None) or _num_classes_from_plan(getattr(self.arguments, "number_samples_per_class", None))
+        self._dictionary_metrics["feature_count"] = getattr(self.arguments, "num_features", None) or getattr(self, "num_features", None)
+        self._dictionary_metrics["random_state"] = getattr(self.arguments, "random_state", None)
 
     def record_resource_usage(self, stage_name, elapsed_seconds=None):
         stage_key = self._resource_stage_key(stage_name)
@@ -663,8 +769,9 @@ class Metrics:
             for classifier in self._dictionary_classifiers_name:
                 fold_key = f"{fold}-Fold"
                 if fold_key in self._dictionary_metrics[methodology][classifier]:
-                    for metric in self._dictionary_metrics[methodology][classifier][fold_key]:
+                    for metric in self.list_classifier_metrics:
                         self._dictionary_metrics[methodology][classifier][fold_key][metric] = NOT_APPLICABLE
+                    self._set_classifier_status(methodology, classifier, fold, STATUS_NOT_APPLICABLE, reason)
 
         for methodology in ["R-S", "R-R"]:
             fold_key = f"{fold}-Fold"
@@ -678,14 +785,22 @@ class Metrics:
         fold_key = f"{fold}-Fold"
         metric_block = self._dictionary_metrics.get(evaluation_type, {}).get(classifier, {})
         if fold_key in metric_block:
-            for metric in metric_block[fold_key]:
+            for metric in self.list_classifier_metrics:
                 metric_block[fold_key][metric] = NOT_APPLICABLE
+            self._set_classifier_status(evaluation_type, classifier, fold, STATUS_NOT_APPLICABLE, reason)
         self._dictionary_metrics.setdefault("NotApplicable", {}).setdefault(fold_key, {})[
             f"{evaluation_type}:{classifier}"
         ] = reason
 
+    def _set_classifier_status(self, evaluation_type, classifier, fold, status, reason=None):
+        fold_key = f"{fold}-Fold"
+        fold_block = self._dictionary_metrics.get(evaluation_type, {}).get(classifier, {}).get(fold_key)
+        if isinstance(fold_block, dict):
+            fold_block["status"] = status
+            fold_block["reason"] = reason
+
     def mark_evaluation_classifiers_not_applicable(self, evaluation_type, fold, reason):
-        logging.warning("%s Marking %s classifier metrics for fold %s as %s.", reason, evaluation_type, fold, NOT_APPLICABLE)
+        logging.warning("%s Marking %s classifier metrics for fold %s as %s.", reason, evaluation_type, fold, STATUS_NOT_APPLICABLE)
         for classifier in self._dictionary_classifiers_name:
             self.mark_classifier_metrics_not_applicable(evaluation_type, classifier, fold, reason)
 
@@ -737,12 +852,13 @@ class Metrics:
         """
         if not self._is_classification_applicable():
             reason = f"target_type={self._target_type} has no classification metrics in this evaluator."
-            logging.warning("%s Marking %s/%s fold %s as %s.", reason, evaluation_type, classifier, fold, NOT_APPLICABLE)
+            logging.warning("%s Marking %s/%s fold %s as %s.", reason, evaluation_type, classifier, fold, STATUS_NOT_APPLICABLE)
             self.mark_classifier_metrics_not_applicable(evaluation_type, classifier, fold, reason)
             return
 
         if self._is_binary_task():
             self.get_binary_metrics(real_labels, predict_labels, evaluation_type, classifier, fold)
+            self._set_classifier_status(evaluation_type, classifier, fold, "completed", None)
             return
 
         logging.info(f"\t\t\t {self._target_type} predictive metrics")
@@ -761,6 +877,14 @@ class Metrics:
             self._dictionary_metrics[evaluation_type][classifier][f"{fold}-Fold"][metric_name] = (
                 self._numeric_metric_value(metric_values.get(metric_name, NOT_APPLICABLE))
             )
+
+        status = "completed"
+        reason = None
+        if any(self._dictionary_metrics[evaluation_type][classifier][f"{fold}-Fold"][metric] == NOT_APPLICABLE
+               for metric in self.list_classifier_metrics):
+            status = "failed"
+            reason = "one or more predictive metrics are not_applicable"
+        self._set_classifier_status(evaluation_type, classifier, fold, status, reason)
 
         self._record_predictive_diagnostics(
             real_labels,

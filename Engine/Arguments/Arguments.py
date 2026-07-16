@@ -86,7 +86,9 @@ try:
 
     from Engine.Arguments.Classifiers.ArgumentsQuadraticDiscriminantAnalysis import add_argument_quadratic_discriminant_analysis
     from Engine.Evaluation.ExperimentProtocol import is_canonical_protocol_selector
+    from Engine.Evaluation.ExperimentProtocol import legacy_evaluation_for_plan
     from Engine.Evaluation.ExperimentProtocol import normalize_protocol_selector
+    from Engine.Evaluation.ExperimentProtocol import resolve_evaluation_protocol_plan
 
 except ImportError as error:
     print(error)
@@ -198,6 +200,8 @@ def _normalize_evaluation_protocol_arguments(parsed_arguments):
         elif protocol == "all":
             parsed_arguments.evaluation_mode = "all"
             parsed_arguments.run_tr_tr = True
+    parsed_arguments.evaluation_protocol_plan = resolve_evaluation_protocol_plan(parsed_arguments)
+    parsed_arguments.evaluation = legacy_evaluation_for_plan(parsed_arguments.evaluation_protocol_plan)
     return parsed_arguments
 
 

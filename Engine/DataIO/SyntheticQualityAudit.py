@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from pathlib import Path
 
 import numpy
@@ -21,7 +20,12 @@ from sklearn.tree import DecisionTreeClassifier
 from Engine.Classifiers.BatchClassifiers import iter_synthetic_labeled_batches
 from Engine.DataIO.DatasetContracts import compute_schema_hash
 from Engine.DataIO.DatasetContracts import validate_xy_alignment
+from Engine.DataIO.JsonIO import atomic_write_json
 from Engine.DataIO.LabelUtils import labels_to_1d_integer
+from Engine.Evaluation.ExperimentProtocol import SYNTHETIC_RESULT_KEYS
+from Engine.Evaluation.ExperimentProtocol import canonical_result_key
+from Engine.Evaluation.ExperimentProtocol import normalize_results_keys
+from Engine.Evaluation.ExperimentProtocol import resolve_evaluation_protocol_plan
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -82,26 +86,39 @@ def run_synthetic_quality_audit(
     return path, report
 
 
-def assert_real_resample_control_metrics(metrics, *, number_classes, synthetic_control, fold=1):
+def assert_real_resample_control_metrics(metrics, *, number_classes, synthetic_control, fold=1, protocol_plan=None):
     if synthetic_control != "real_resample":
         return
+    protocol_plan = protocol_plan or _plan_from_metrics(metrics)
+    metrics = normalize_results_keys(metrics)
     chance = 1.0 / float(number_classes)
     failures = []
-    for mode in ("TR-TS", "TS-TR"):
-        mode_block = metrics.get(mode, {})
-        for classifier, classifier_block in mode_block.items():
-            if classifier == "Summary" or not isinstance(classifier_block, dict):
-                continue
-            fold_metrics = classifier_block.get(f"{fold}-Fold", {})
-            accuracy = _safe_float(fold_metrics.get("Accuracy"))
-            balanced = _safe_float(fold_metrics.get("BalancedAccuracy"))
-            if accuracy is None or balanced is None:
-                failures.append(f"{mode}/{classifier} missing Accuracy or BalancedAccuracy")
-            elif accuracy <= chance * 3.0 and balanced <= chance * 3.0:
-                failures.append(
-                    f"{mode}/{classifier} near chance for real_resample "
-                    f"(Accuracy={accuracy:.6f}, BalancedAccuracy={balanced:.6f}, chance={chance:.6f})"
-                )
+    required_modes = set(protocol_plan.required_result_keys)
+    for mode in SYNTHETIC_RESULT_KEYS:
+        if mode not in required_modes:
+            failures.extend(_validate_inactive_control_mode(metrics, mode, fold))
+            continue
+        classifier, fold_metrics, metadata = _effective_classifier_fold(metrics, mode, fold)
+        if not classifier:
+            failures.append(f"{mode} missing classifier metrics")
+            continue
+        status = fold_metrics.get("status")
+        if status is not None and status != "completed":
+            failures.append(f"{mode}/{classifier} status is {status}, expected completed")
+        accuracy = _safe_float(fold_metrics.get("Accuracy"))
+        balanced = _safe_float(fold_metrics.get("BalancedAccuracy"))
+        if accuracy is None:
+            failures.append(f"{mode}/{classifier} missing finite Accuracy")
+        if balanced is None:
+            failures.append(f"{mode}/{classifier} missing finite BalancedAccuracy")
+        effective_fit_rows = _safe_positive_int(metadata.get("effective_fit_rows"))
+        if metadata and effective_fit_rows is None:
+            failures.append(f"{mode}/{classifier} missing positive effective_fit_rows")
+        if accuracy is not None and balanced is not None and accuracy <= chance * 3.0 and balanced <= chance * 3.0:
+            failures.append(
+                f"{mode}/{classifier} near chance for real_resample "
+                f"(Accuracy={accuracy:.6f}, BalancedAccuracy={balanced:.6f}, chance={chance:.6f})"
+            )
     if failures:
         raise SyntheticEvaluationPipelineError(
             "real_resample synthetic control failed; the issue is in the synthetic reader, manifest, "
@@ -109,26 +126,118 @@ def assert_real_resample_control_metrics(metrics, *, number_classes, synthetic_c
         )
 
 
-def assert_label_permutation_control_metrics(metrics, *, number_classes, synthetic_control, fold=1):
+def _plan_from_metrics(metrics):
+    plan_payload = metrics.get("EvaluationProtocolPlan") if isinstance(metrics, dict) else None
+    if isinstance(plan_payload, dict):
+        return resolve_evaluation_protocol_plan(
+            type(
+                "ProtocolArguments",
+                (),
+                {
+                    "evaluation_protocol": plan_payload.get("protocol", "legacy"),
+                    "evaluation_mode": plan_payload.get("protocol", "both"),
+                    "run_tr_tr": bool(plan_payload.get("run_tr_tr", False)),
+                },
+            )()
+        )
+    return resolve_evaluation_protocol_plan(
+        type(
+            "ProtocolArguments",
+            (),
+            {"evaluation_protocol": "legacy", "evaluation_mode": "both", "run_tr_tr": False},
+        )()
+    )
+
+
+def _validate_inactive_control_mode(metrics, mode, fold):
+    failures = []
+    mode_block = metrics.get(mode, {})
+    if not isinstance(mode_block, dict):
+        return failures
+    for classifier, classifier_block in mode_block.items():
+        if classifier == "Summary" or not isinstance(classifier_block, dict):
+            continue
+        fold_metrics = classifier_block.get(f"{fold}-Fold", {})
+        if not isinstance(fold_metrics, dict):
+            continue
+        status = fold_metrics.get("status")
+        if status not in {None, "not_applicable", "not_run"}:
+            failures.append(f"{mode}/{classifier} inactive status is {status}, expected not_applicable or not_run")
+        for metric in ("Accuracy", "BalancedAccuracy"):
+            if fold_metrics.get(metric) is not None:
+                failures.append(f"{mode}/{classifier} inactive {metric} must be null")
+    return failures
+
+
+def _effective_classifier_fold(metrics, mode, fold):
+    mode = canonical_result_key(mode)
+    fold_key = f"{fold}-Fold"
+    metadata = metrics.get("BatchClassifier", {}).get(fold_key, {}).get(mode, {})
+    effective_names = [
+        metadata.get("classifier_name") if isinstance(metadata, dict) else None,
+        metadata.get("classifier") if isinstance(metadata, dict) else None,
+        metadata.get("effective_classifier") if isinstance(metadata, dict) else None,
+    ]
+    mode_block = metrics.get(mode, {})
+    if not isinstance(mode_block, dict):
+        return None, {}, metadata if isinstance(metadata, dict) else {}
+
+    for name in effective_names:
+        if name in mode_block and isinstance(mode_block[name], dict):
+            return name, mode_block[name].get(fold_key, {}), metadata
+
+    normalized_effective_names = {_normalize_classifier_name(name) for name in effective_names if name}
+    for classifier, classifier_block in mode_block.items():
+        if classifier == "Summary" or not isinstance(classifier_block, dict):
+            continue
+        if normalized_effective_names and _normalize_classifier_name(classifier) not in normalized_effective_names:
+            continue
+        fold_metrics = classifier_block.get(fold_key, {})
+        if isinstance(fold_metrics, dict):
+            return classifier, fold_metrics, metadata if isinstance(metadata, dict) else {}
+
+    return None, {}, metadata if isinstance(metadata, dict) else {}
+
+
+def _normalize_classifier_name(value):
+    return str(value or "").replace("_", "").replace("-", "").lower()
+
+
+def _safe_positive_int(value):
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    return value
+
+
+def assert_label_permutation_control_metrics(metrics, *, number_classes, synthetic_control, fold=1, protocol_plan=None):
     if synthetic_control != "label_permutation":
         return
+    protocol_plan = protocol_plan or _plan_from_metrics(metrics)
+    metrics = normalize_results_keys(metrics)
     chance = 1.0 / float(number_classes)
     failures = []
-    for mode in ("TR-TS", "TS-TR"):
-        mode_block = metrics.get(mode, {})
-        for classifier, classifier_block in mode_block.items():
-            if classifier == "Summary" or not isinstance(classifier_block, dict):
-                continue
-            fold_metrics = classifier_block.get(f"{fold}-Fold", {})
-            accuracy = _safe_float(fold_metrics.get("Accuracy"))
-            balanced = _safe_float(fold_metrics.get("BalancedAccuracy"))
-            if accuracy is None or balanced is None:
-                failures.append(f"{mode}/{classifier} missing Accuracy or BalancedAccuracy")
-            elif accuracy > chance * 3.0 or balanced > chance * 3.0:
-                failures.append(
-                    f"{mode}/{classifier} too far above chance for label_permutation "
-                    f"(Accuracy={accuracy:.6f}, BalancedAccuracy={balanced:.6f}, chance={chance:.6f})"
-                )
+    required_modes = set(protocol_plan.required_result_keys)
+    for mode in SYNTHETIC_RESULT_KEYS:
+        if mode not in required_modes:
+            failures.extend(_validate_inactive_control_mode(metrics, mode, fold))
+            continue
+        classifier, fold_metrics, _ = _effective_classifier_fold(metrics, mode, fold)
+        if not classifier:
+            failures.append(f"{mode} missing classifier metrics")
+            continue
+        accuracy = _safe_float(fold_metrics.get("Accuracy"))
+        balanced = _safe_float(fold_metrics.get("BalancedAccuracy"))
+        if accuracy is None or balanced is None:
+            failures.append(f"{mode}/{classifier} missing Accuracy or BalancedAccuracy")
+        elif accuracy > chance * 3.0 or balanced > chance * 3.0:
+            failures.append(
+                f"{mode}/{classifier} too far above chance for label_permutation "
+                f"(Accuracy={accuracy:.6f}, BalancedAccuracy={balanced:.6f}, chance={chance:.6f})"
+            )
     if failures:
         raise SyntheticEvaluationPipelineError(
             "label_permutation synthetic control failed; shuffled labels did not produce chance-level metrics. "
@@ -1513,15 +1622,12 @@ def _safe_float(value):
 def _write_json_and_markdown(report, experiment_directory):
     serializable = _strip_runtime_arrays(report)
     APPCLASSNET_AUDIT_JSON.parent.mkdir(parents=True, exist_ok=True)
-    APPCLASSNET_AUDIT_JSON.write_text(json.dumps(serializable, indent=2, sort_keys=True), encoding="utf-8")
+    atomic_write_json(serializable, APPCLASSNET_AUDIT_JSON)
     _write_markdown_report(serializable, APPCLASSNET_AUDIT_DOC)
     if experiment_directory:
         local_dir = Path(experiment_directory) / "Audits"
         local_dir.mkdir(parents=True, exist_ok=True)
-        (local_dir / "synthetic_quality_audit.json").write_text(
-            json.dumps(serializable, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        atomic_write_json(serializable, local_dir / "synthetic_quality_audit.json")
         _write_markdown_report(serializable, local_dir / "synthetic_quality_audit.md")
 
 

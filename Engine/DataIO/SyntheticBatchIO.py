@@ -6,11 +6,13 @@
 from __future__ import annotations
 
 import csv
-import json
 import logging
 from pathlib import Path
 
 import numpy
+
+from Engine.DataIO.JsonIO import atomic_write_json
+from Engine.DataIO.JsonIO import load_json_file
 
 
 class SyntheticBatchWriter:
@@ -168,8 +170,7 @@ class SyntheticBatchWriter:
                     self._single_npy_offset,
                 )
         manifest_path = self.batch_dir / "manifest.json"
-        with manifest_path.open("w") as manifest_file:
-            json.dump(self.manifest, manifest_file, indent=2)
+        atomic_write_json(self.manifest, manifest_path, indent=2, model=self.model_name)
         return SyntheticBatchReader(manifest_path)
 
 
@@ -178,8 +179,7 @@ class SyntheticBatchReader:
 
     def __init__(self, manifest_path):
         self.manifest_path = Path(manifest_path)
-        with self.manifest_path.open() as manifest_file:
-            self.manifest = json.load(manifest_file)
+        self.manifest = load_json_file(self.manifest_path)
 
     @property
     def total_rows(self):

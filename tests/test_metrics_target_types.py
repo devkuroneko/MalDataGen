@@ -83,7 +83,8 @@ class MetricsTargetTypesTest(unittest.TestCase):
         metrics.get_task_metrics([0.1, 0.2], [0.1, 0.3], "TR-TS", "DummyClassifier", 1)
 
         fold = metrics._dictionary_metrics["TR-TS"]["DummyClassifier"]["1-Fold"]
-        self.assertTrue(all(value == NOT_APPLICABLE for value in fold.values()))
+        self.assertTrue(all(fold[metric] == NOT_APPLICABLE for metric in metrics.list_classifier_metrics))
+        self.assertEqual(fold["status"], "not_applicable")
         self.assertIn("TR-TS:DummyClassifier", metrics._dictionary_metrics["NotApplicable"]["1-Fold"])
 
     def test_multiclass_chance_level_suspected_for_top_200(self):

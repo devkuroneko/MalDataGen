@@ -34,9 +34,16 @@ from Engine.DataIO.RealClassCountPolicy import validate_real_class_count_policy
 from Engine.DataIO.RealClassCountPolicy import validate_samples_per_class_scope
 from Engine.DataIO.DatasetContracts import materialize_npy_class_subset
 from Engine.DataIO.DatasetContracts import resolve_class_mapping
+from Engine.DataIO.JsonIO import ResultArtifactCorruptionError
+from Engine.DataIO.JsonIO import ResultArtifactMissingError
+from Engine.DataIO.JsonIO import ResultSchemaValidationError
+from Engine.DataIO.JsonIO import atomic_write_json
+from Engine.DataIO.JsonIO import load_json_file
 from Engine.Evaluation.ExperimentProtocol import EVALUATION_PROTOCOL_CHOICES
 from Engine.Evaluation.ExperimentProtocol import is_canonical_protocol_selector
 from Engine.Evaluation.ExperimentProtocol import normalize_protocol_selector
+from Engine.Evaluation.ExperimentProtocol import normalize_results_keys
+from Engine.Evaluation.ExperimentProtocol import resolve_evaluation_protocol_plan
 
 
 DEFAULT_VERBOSITY_LEVEL = logging.INFO
@@ -84,6 +91,7 @@ DEFAULT_CAMPAIGN = [
     "copula",
 ]
 DEMO_CAMPAIGNS = ["variational_demo", "adversarial_demo"]
+CONTROL_CAMPAIGN = "control"
 SDV_CAMPAIGNS = ["copula", "tvae", "ctgan"]
 NO_TRAINING_PLOT_MODELS = {"copy", "copula", "ctgan", "tvae"}
 
@@ -373,6 +381,11 @@ def _base_campaign(model_type, **params):
 
 
 campaigns_available = {
+    CONTROL_CAMPAIGN: _base_campaign(
+        "copy",
+        number_k_folds=2,
+        artifact_model_type=CONTROL_CAMPAIGN,
+    ),
     "adversarial": _base_campaign(
         "adversarial",
         adversarial_number_epochs=DEFAULT_NUM_EPOCHS,
@@ -653,6 +666,25 @@ def choose_campaigns(campaigns, full=False):
         logging.error("Available campaigns: %s", ", ".join(sorted(campaigns_available)))
         sys.exit(1)
     return tokens
+
+
+def canonicalize_control_campaigns(campaigns_chosen, parsed_arguments):
+    synthetic_control = getattr(parsed_arguments, "synthetic_control", "none")
+    if synthetic_control == "none":
+        return list(campaigns_chosen)
+    tokens = split_campaign_tokens(getattr(parsed_arguments, "campaign", None))
+    explicit_campaign = _argument_was_explicit(parsed_arguments, "campaign")
+    explicit_legacy_demo_alias = tokens == ["sf"]
+    explicit_control_campaign = tokens == [CONTROL_CAMPAIGN]
+    if explicit_campaign and not explicit_legacy_demo_alias and not explicit_control_campaign:
+        return list(campaigns_chosen)
+    if list(campaigns_chosen) != [CONTROL_CAMPAIGN]:
+        logging.info(
+            "synthetic_control=%s uses canonical control campaign instead of generator campaigns: %s",
+            synthetic_control,
+            campaigns_chosen,
+        )
+    return [CONTROL_CAMPAIGN]
 
 
 def _explicit_options(parsed_arguments):
@@ -1310,9 +1342,7 @@ def run_input_diagnostics(parsed_arguments, raw_root, output_dir, campaigns_chos
         )
 
     print(json.dumps(diagnostics, indent=2, sort_keys=True))
-    with diagnostics_path.open("w", encoding="utf-8") as diagnostics_file:
-        json.dump(diagnostics, diagnostics_file, indent=2, sort_keys=True)
-        diagnostics_file.write("\n")
+    atomic_write_json(diagnostics, diagnostics_path)
 
     logging.info("Input diagnostics saved to %s", diagnostics_path)
     for warning in diagnostics["warnings"]:
@@ -1547,9 +1577,7 @@ def preprocess_appclassnet_splits(parsed_arguments, raw_root, mode_name):
     preprocessing_report["feature_max_after_scaling"] = train_stats["feature_max_after_scaling"]
 
     report_path = preprocessing_dir / "preprocessing_stats.json"
-    with report_path.open("w", encoding="utf-8") as report_file:
-        json.dump(preprocessing_report, report_file, indent=2, sort_keys=True)
-        report_file.write("\n")
+    atomic_write_json(preprocessing_report, report_path)
 
     logging.info("AppClassNet preprocessing scaler saved to %s", scaler_path)
     logging.info("AppClassNet preprocessing stats saved to %s", report_path)
@@ -1745,9 +1773,7 @@ def run_real_real_baseline(parsed_arguments, raw_root, output_dir):
         "duration_seconds": (datetime.datetime.now() - time_start).total_seconds(),
     }
 
-    with metrics_path.open("w", encoding="utf-8") as metrics_file:
-        json.dump(metrics, metrics_file, indent=2, sort_keys=True)
-        metrics_file.write("\n")
+    atomic_write_json(metrics, metrics_path)
 
     logging.info("Baseline real-real metrics saved to %s", metrics_path)
     return metrics_path, metrics
@@ -1755,14 +1781,26 @@ def run_real_real_baseline(parsed_arguments, raw_root, output_dir):
 
 def _load_json_file(path):
     path = Path(path)
-    if not path.is_file():
-        return None
+    return load_json_file(path, normalize=normalize_results_keys)
+
+
+def _load_optional_json_file(path):
     try:
-        with path.open(encoding="utf-8") as json_file:
-            return json.load(json_file)
-    except Exception as error:
-        logging.warning("Could not read JSON %s: %s", path, error)
+        return _load_json_file(path)
+    except ResultArtifactMissingError:
         return None
+
+
+def validate_results_schema(results_data, *, path=None):
+    if not isinstance(results_data, dict):
+        raise ResultSchemaValidationError(f"Results artifact must be a JSON object: {path}")
+    if "EvaluationProtocolPlan" not in results_data and "protocol_plan" not in results_data:
+        if not any(key in results_data for key in ("TR-TR", "TR-TS", "TS-TR", "TR+TS-TR", "BatchClassifier")):
+            raise ResultSchemaValidationError(f"Results artifact has no protocol sections: {path}")
+    for key in ("TR-TR", "TR-TS", "TS-TR", "TR+TS-TR"):
+        if key in results_data and not isinstance(results_data[key], dict):
+            raise ResultSchemaValidationError(f"Results section {key} must be an object: {path}")
+    return True
 
 
 def _metric_value(metrics_block, metric_name):
@@ -1831,7 +1869,7 @@ def _synthetic_manifest_summary(output_dir_run=None, manifest_path=None, max_bat
     if not manifests:
         return {"data_space": "unknown", "feature_range": None, "manifest_path": None}
     manifest_path = Path(manifests[0])
-    manifest = _load_json_file(manifest_path) or {}
+    manifest = _load_optional_json_file(manifest_path) or {}
     feature_min = None
     feature_max = None
     batches_seen = 0
@@ -1888,22 +1926,33 @@ def _empty_evaluation_summary(status, reason):
         "MacroF1": None,
         "WeightedF1": None,
         "BalancedAccuracy": None,
+        "effective_fit_rows": None,
         "duration_seconds": None,
     }
 
 
 def _build_method_summary(results_data, evaluation_name, output_dir_run, synthetic_summary, active):
     if not active:
-        return _empty_evaluation_summary("not_run", f"Skipped by evaluation_mode.")
+        return _empty_evaluation_summary("not_applicable", f"{evaluation_name} was not active in the resolved protocol plan.")
     classifier_name, metric_values = _extract_evaluation_metrics(results_data, evaluation_name)
     metadata = _extract_batch_metadata(results_data, evaluation_name)
     required_metrics = ("Accuracy", "BalancedAccuracy", "MacroF1", "WeightedF1")
     missing_metrics = [metric for metric in required_metrics if metric_values.get(metric) is None]
-    status = "completed" if classifier_name and not missing_metrics else "not_run"
+    effective_fit_rows = metadata.get("effective_fit_rows")
+    if "effective_fit_rows" not in metadata:
+        effective_fit_rows_valid = True
+    else:
+        try:
+            effective_fit_rows_valid = int(effective_fit_rows) > 0
+        except (TypeError, ValueError):
+            effective_fit_rows_valid = False
+    status = "completed" if classifier_name and not missing_metrics and effective_fit_rows_valid else "failed"
     reason = None
     if status != "completed":
         if not classifier_name:
             reason = f"{evaluation_name} requested but no classifier metrics were found in Results.json."
+        elif not effective_fit_rows_valid:
+            reason = f"{evaluation_name} requested but effective_fit_rows was not positive."
         else:
             reason = f"{evaluation_name} requested but missing metric(s): {', '.join(missing_metrics)}."
     duration_seconds = None
@@ -1929,6 +1978,7 @@ def _build_method_summary(results_data, evaluation_name, output_dir_run, synthet
         "MacroF1": metric_values.get("MacroF1"),
         "WeightedF1": metric_values.get("WeightedF1"),
         "BalancedAccuracy": metric_values.get("BalancedAccuracy"),
+        "effective_fit_rows": effective_fit_rows,
         "duration_seconds": duration_seconds,
     }
 
@@ -1939,7 +1989,7 @@ def _build_real_method_summary(results_data, evaluation_name, active):
     classifier_name, metric_values = _extract_evaluation_metrics(results_data, evaluation_name)
     required_metrics = ("Accuracy", "BalancedAccuracy", "MacroF1", "WeightedF1")
     missing_metrics = [metric for metric in required_metrics if metric_values.get(metric) is None]
-    status = "completed" if classifier_name and not missing_metrics else "not_run"
+    status = "completed" if classifier_name and not missing_metrics else "failed"
     reason = None
     if status != "completed":
         if not classifier_name:
@@ -1974,10 +2024,13 @@ def _artifact_manifest_path(artifact_or_path, evaluation_name):
 
 
 def _requested_evaluations(evaluation_mode):
+    plan = resolve_evaluation_protocol_plan(
+        argparse.Namespace(evaluation_protocol="legacy", evaluation_mode=evaluation_mode, run_tr_tr=False)
+    )
     return {
-        "TR-TS": evaluation_mode in {"tr_ts", "both", "all"},
-        "TS-TR": evaluation_mode in {"ts_tr", "both", "all"},
-        "TR+TS-TR": evaluation_mode in {"tr_ts_tr", "all"},
+        "TR-TS": plan.run_tr_ts,
+        "TS-TR": plan.run_ts_tr,
+        "TR+TS-TR": plan.run_tr_plus_ts_tr,
     }
 
 
@@ -1993,7 +2046,11 @@ def validate_requested_evaluations_completed(payload, parsed_arguments, results_
                 f"status={summary.get('status')}; reason={summary.get('reason')}; "
                 f"stopped_function={stopped_function}."
             )
-    for evaluation_name, requested in _requested_evaluations(parsed_arguments.evaluation_mode).items():
+    requested_evaluations = {
+        key: key in resolve_evaluation_protocol_plan(parsed_arguments).required_result_keys
+        for key in ("TR-TS", "TS-TR", "TR+TS-TR")
+    }
+    for evaluation_name, requested in requested_evaluations.items():
         if not requested:
             continue
         summary = payload.get(evaluation_name, {})
@@ -2016,7 +2073,8 @@ def validate_requested_evaluations_completed(payload, parsed_arguments, results_
 
 
 def print_results_payload(payload):
-    print(json.dumps(payload, indent=2, sort_keys=True))
+    from Engine.DataIO.JsonIO import to_jsonable
+    print(json.dumps(to_jsonable(payload), indent=2, sort_keys=True, allow_nan=False))
 
 
 def write_baseline_batches_metrics(metrics, output_path):
@@ -2043,9 +2101,7 @@ def write_baseline_batches_metrics(metrics, output_path):
         "TS-TR": _empty_evaluation_summary("not_run", "baseline_real_only executes only TR-TR."),
         "TR+TS-TR": _empty_evaluation_summary("not_run", "baseline_real_only executes only TR-TR."),
     }
-    with output_path.open("w", encoding="utf-8") as metrics_file:
-        json.dump(payload, metrics_file, indent=2, sort_keys=True)
-        metrics_file.write("\n")
+    atomic_write_json(payload, output_path)
     logging.info("AppClassNet batches metrics saved to %s", output_path)
     return output_path, payload
 
@@ -2059,13 +2115,11 @@ def write_batches_metrics(results_paths, output_path, parsed_arguments):
         "TS-TR": _empty_evaluation_summary("not_run", "TS-TR was not requested."),
         "TR+TS-TR": _empty_evaluation_summary("not_run", "TR+TS-TR was not requested."),
     }
-    run_tr_tr = (
-        getattr(parsed_arguments, "run_tr_tr_effective", False)
-        or getattr(parsed_arguments, "pipeline_effective", None) in {"tr_tr", "all"}
-    )
-    run_tr_ts = parsed_arguments.evaluation_mode in {"tr_ts", "both", "all"}
-    run_ts_tr = parsed_arguments.evaluation_mode in {"ts_tr", "both", "all"}
-    run_tr_ts_tr = parsed_arguments.evaluation_mode in {"tr_ts_tr", "all"}
+    protocol_plan = resolve_evaluation_protocol_plan(parsed_arguments)
+    run_tr_tr = protocol_plan.run_tr_tr or getattr(parsed_arguments, "pipeline_effective", None) in {"tr_tr", "all"}
+    run_tr_ts = protocol_plan.run_tr_ts
+    run_ts_tr = protocol_plan.run_ts_tr
+    run_tr_ts_tr = protocol_plan.run_tr_plus_ts_tr
     if run_tr_tr:
         payload["TR-TR"] = _empty_evaluation_summary("not_run", "TR-TR requested but not yet executed.")
     if run_tr_ts:
@@ -2077,8 +2131,7 @@ def write_batches_metrics(results_paths, output_path, parsed_arguments):
     for artifact_or_path in results_paths:
         results_path = _artifact_results_path(artifact_or_path)
         results_data = _load_json_file(results_path)
-        if not isinstance(results_data, dict):
-            continue
+        validate_results_schema(results_data, path=results_path)
         output_dir_run = _artifact_combination_dir(artifact_or_path, results_path)
         tr_ts_manifest = _artifact_manifest_path(artifact_or_path, "TR-TS")
         ts_tr_manifest = _artifact_manifest_path(artifact_or_path, "TS-TR")
@@ -2115,9 +2168,7 @@ def write_batches_metrics(results_paths, output_path, parsed_arguments):
             results_data, "TR+TS-TR", output_dir_run, tr_ts_tr_synthetic_summary, run_tr_ts_tr
         )
     validate_requested_evaluations_completed(payload, parsed_arguments, results_paths, "write_batches_metrics")
-    with output_path.open("w", encoding="utf-8") as metrics_file:
-        json.dump(payload, metrics_file, indent=2, sort_keys=True)
-        metrics_file.write("\n")
+    atomic_write_json(payload, output_path)
     logging.info("AppClassNet batches metrics saved to %s", output_path)
     return output_path, payload
 
@@ -2129,17 +2180,14 @@ def collect_normal_metrics(results_paths, parsed_arguments):
         "TS-TR": _empty_evaluation_summary("not_run", "TS-TR was not requested."),
         "TR+TS-TR": _empty_evaluation_summary("not_run", "TR+TS-TR was not requested."),
     }
-    run_tr_tr = (
-        getattr(parsed_arguments, "run_tr_tr_effective", False)
-        or getattr(parsed_arguments, "pipeline_effective", None) in {"tr_tr", "all"}
-    )
-    run_tr_ts = parsed_arguments.evaluation_mode in {"tr_ts", "both", "all"}
-    run_ts_tr = parsed_arguments.evaluation_mode in {"ts_tr", "both", "all"}
-    run_tr_ts_tr = parsed_arguments.evaluation_mode in {"tr_ts_tr", "all"}
+    protocol_plan = resolve_evaluation_protocol_plan(parsed_arguments)
+    run_tr_tr = protocol_plan.run_tr_tr or getattr(parsed_arguments, "pipeline_effective", None) in {"tr_tr", "all"}
+    run_tr_ts = protocol_plan.run_tr_ts
+    run_ts_tr = protocol_plan.run_ts_tr
+    run_tr_ts_tr = protocol_plan.run_tr_plus_ts_tr
     for results_path in results_paths:
         results_data = _load_json_file(results_path)
-        if not isinstance(results_data, dict):
-            continue
+        validate_results_schema(results_data, path=results_path)
         payload["TR-TR"] = _build_real_method_summary(results_data, "TR-TR", run_tr_tr)
         payload["TR-TS"] = _build_method_summary(results_data, "TR-TS", Path(results_path).parents[1], {}, run_tr_ts)
         payload["TS-TR"] = _build_method_summary(results_data, "TS-TR", Path(results_path).parents[1], {}, run_ts_tr)
@@ -2165,6 +2213,7 @@ def _artifact_path_strings(results_grouping, attribute):
 
 def write_run_results(output_dir, parsed_arguments, campaigns_chosen, metrics_payload, results_grouping):
     output_dir = Path(output_dir)
+    protocol_plan = resolve_evaluation_protocol_plan(parsed_arguments)
     canonical_summary = {
         "TR_TR": metrics_payload.get("TR-TR", _empty_evaluation_summary("not_run", "not collected")),
         "TR_TS": metrics_payload.get("TR-TS", _empty_evaluation_summary("not_run", "not collected")),
@@ -2194,7 +2243,8 @@ def write_run_results(output_dir, parsed_arguments, campaigns_chosen, metrics_pa
         },
     }
     protocol_payload = {
-        "protocol_id": normalize_protocol_selector(getattr(parsed_arguments, "evaluation_protocol", "appclassnet_strict")),
+        "protocol_id": protocol_plan.protocol,
+        "protocol_plan": protocol_plan.as_dict(),
         "train_sources": {
             "TR_TR": ["real_train"],
             "TR_TS": ["real_train"],
@@ -2241,6 +2291,7 @@ def write_run_results(output_dir, parsed_arguments, campaigns_chosen, metrics_pa
         "run_mode": parsed_arguments.run_mode_effective,
         "pipeline": parsed_arguments.pipeline_effective,
         "pipeline_plan": build_pipeline_plan(parsed_arguments.pipeline_effective),
+        "evaluation_protocol_plan": protocol_plan.as_dict(),
         "campaigns": list(campaigns_chosen),
         "effective_parameters": getattr(parsed_arguments, "_effective_parameters", {}),
         "TR-TR": metrics_payload.get("TR-TR", _empty_evaluation_summary("not_run", "not collected")),
@@ -2262,16 +2313,18 @@ def write_run_results(output_dir, parsed_arguments, campaigns_chosen, metrics_pa
                     f"got {payload[evaluation_name].get('status')}."
                 )
     output_path = output_dir / "RunResults.json"
-    with output_path.open("w", encoding="utf-8") as results_file:
-        json.dump(payload, results_file, indent=2, sort_keys=True)
-        results_file.write("\n")
-    (output_dir / "results_summary.json").write_text(
-        json.dumps(canonical_summary, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+    atomic_write_json(payload, output_path, run_id=payload.get("run_id"), protocol=protocol_plan.protocol)
+    atomic_write_json(
+        canonical_summary,
+        output_dir / "results_summary.json",
+        run_id=payload.get("run_id"),
+        protocol=protocol_plan.protocol,
     )
-    (output_dir / "experiment_protocol.json").write_text(
-        json.dumps(protocol_payload, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+    atomic_write_json(
+        protocol_payload,
+        output_dir / "experiment_protocol.json",
+        run_id=payload.get("run_id"),
+        protocol=protocol_plan.protocol,
     )
     logging.info("Consolidated run results saved to %s", output_path)
     return output_path, payload
@@ -3086,7 +3139,7 @@ GENERATION_QUOTA_PARAMETERS = {
     "samples_per_class_scope",
 }
 
-INTERNAL_COMBINATION_PARAMETERS = GENERATION_QUOTA_PARAMETERS | K_FOLD_METADATA_PARAMETERS
+INTERNAL_COMBINATION_PARAMETERS = GENERATION_QUOTA_PARAMETERS | K_FOLD_METADATA_PARAMETERS | {"artifact_model_type"}
 
 
 def build_main_command(
@@ -3489,9 +3542,7 @@ def write_command_manifest(command):
     }
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = output_dir / "command_manifest.json"
-    with manifest_path.open("w", encoding="utf-8") as manifest_file:
-        json.dump(manifest, manifest_file, indent=2, sort_keys=True)
-        manifest_file.write("\n")
+    atomic_write_json(manifest, manifest_path)
     return manifest_path
 
 
@@ -3532,9 +3583,9 @@ def build_run_artifacts(requested_output_dir, combination):
     if not test_manifest.is_file() and legacy_manifest.is_file():
         test_manifest = legacy_manifest
 
-    manifest_data = _load_json_file(train_manifest) if train_manifest.is_file() else {}
+    manifest_data = _load_optional_json_file(train_manifest) if train_manifest.is_file() else {}
     return RunArtifacts(
-        model_name=str(combination.get("model_type")),
+        model_name=str(combination.get("artifact_model_type") or combination.get("model_type")),
         fold=None,
         combination_dir=combination_dir,
         results_json_path=combination_dir / "EvaluationResults" / "Results.json",
@@ -4105,6 +4156,7 @@ def main():
         return 0
 
     campaigns_chosen = choose_campaigns(arguments.campaign, full=arguments.run_mode_effective == "full")
+    campaigns_chosen = canonicalize_control_campaigns(campaigns_chosen, arguments)
     normalize_preprocessing_arguments(arguments, campaigns_chosen)
     output_dir = build_output_directory(arguments)
     output_dir.mkdir(parents=True, exist_ok=True)
