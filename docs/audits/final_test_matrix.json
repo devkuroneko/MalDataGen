@@ -1,0 +1,610 @@
+{
+  "audit_findings": {
+    "classifier_row_reduction_unregistered": "DecisionTreeSubset records discarded_rows/effective_fit_rows in results_summary",
+    "completed_without_metrics": [],
+    "double_transform": "not observed; preserve/source and allow_double_transform=false in runs",
+    "duplicate_flags": "covered by pytest and dryrun command construction tests",
+    "explicit_cli_overwritten": "not observed for sample quotas/classifier/transform flags; evaluation_protocol=all intentionally expands protocol set",
+    "generator_access_to_test": "none observed for generator_copy_ts_tr_10_normal; control runs intentionally use test split only to build synthetic_test control",
+    "manifest_missing_paths": [],
+    "silent_errors": "not observed; controlled failures returned non-zero exits with explicit messages",
+    "subset_paths_full": "direct raw subset is unsafe unless raw domain num_classes is retained; materialized/derived subset paths were used for final passing runs",
+    "unknown_flags": "none observed in accepted commands; argparse rejected invalid CSV label name explicitly",
+    "valid_as_test": "none observed in final gate logs",
+    "xy_mismatch": "none observed; tests cover rejection"
+  },
+  "baseline_checks": {
+    "clean_install": {
+      "command": "/tmp/maldatagen-final-venv/bin/python -m pip install --no-deps -e .",
+      "status": "passed_after_packaging_fix"
+    },
+    "dry_run_memory": {
+      "command": "MPLCONFIGDIR=/tmp/mplconfig-maldatagen-final PYTHONPATH=. python run_appclassnet_top200.py -c variational_demo --run_mode demo --pipeline synthetic --execution_mode batches --use_mmap --dry_run_memory --eval_classifier decision_tree_subset --train_samples_per_class 20 --test_samples_per_class 20 --synthetic_train_samples_per_class 10 --synthetic_test_samples_per_class 10 --generated_samples_per_class 20 --synthetic_control real_resample --real_class_count_policy strict --samples_per_class_scope split --source_profile appclassnet_top200 --feature_transform preserve --generator_transform preserve --classifier_transform preserve --evaluation_space source --random_state 0 --skip_plots --verbosity 2",
+      "status": "passed"
+    },
+    "dryrun": {
+      "command": "MPLCONFIGDIR=/tmp/mplconfig-maldatagen-final PYTHONPATH=. python run_appclassnet_top200.py -c variational_demo --run_mode demo --pipeline synthetic --dryrun --execution_mode batches --use_mmap --evaluation_protocol all --eval_classifier decision_tree_subset --train_samples_per_class 20 --test_samples_per_class 20 --synthetic_train_samples_per_class 10 --synthetic_test_samples_per_class 10 --generated_samples_per_class 20 --synthetic_control real_resample --real_class_count_policy strict --samples_per_class_scope split --source_profile appclassnet_top200 --feature_transform preserve --generator_transform preserve --classifier_transform preserve --evaluation_space source --random_state 0 --skip_plots --verbosity 2",
+      "status": "passed"
+    },
+    "pytest_all": {
+      "command": "MPLCONFIGDIR=/tmp/mplconfig-maldatagen-final PYTHONPATH=. pytest -q",
+      "passed": 251,
+      "skipped": 18,
+      "status": "passed",
+      "subtests_passed": 5,
+      "warnings": 9
+    },
+    "pytest_collect": {
+      "collected": 269,
+      "command": "MPLCONFIGDIR=/tmp/mplconfig-maldatagen-final PYTHONPATH=. pytest --collect-only -q",
+      "status": "passed"
+    },
+    "root_imports": {
+      "command": "MPLCONFIGDIR=/tmp/mplconfig-maldatagen-final PYTHONPATH=. python - <<'PY'\nimport Engine\nimport Engine.Arguments.Arguments\nimport Engine.DataIO.DatasetContracts\nimport Engine.Evaluation.EvaluationRunner\nimport Engine.Evaluation.ExperimentProtocol\nimport Engine.Preprocessing.FeatureTransformManager\nprint('root imports ok')\nPY",
+      "status": "passed"
+    }
+  },
+  "cases": {
+    "controlled_errors": {
+      "errors": [
+        {
+          "case": "clean_install_before_fix",
+          "exit_code": 1,
+          "message": "setuptools flat-layout discovery refused logs/results/outputs/Datasets; fixed by explicit package discovery in pyproject.toml"
+        },
+        {
+          "case": "raw_full_paths_with_num_classes_10",
+          "exit_code": 1,
+          "message": "loader rejected labels outside configured num_classes=10 before subset; wrapper/materialized subset or num_classes=200 is required for raw top200 paths"
+        },
+        {
+          "case": "copy_generator_batches",
+          "exit_code": 1,
+          "message": "Incremental synthetic generation is not implemented for model_type='copy'"
+        },
+        {
+          "case": "csv_label_column_name",
+          "exit_code": 2,
+          "message": "legacy CSV parser expects integer label column index; -1 works for last column"
+        },
+        {
+          "case": "manual_interrupt",
+          "exit_code": 130,
+          "message": "long direct raw subset run was interrupted; no completed result was written"
+        }
+      ],
+      "status": "passed_with_expected_errors"
+    },
+    "generator_copy_ts_tr_10_normal": {
+      "classes": 10,
+      "classifier": "DecisionTree",
+      "command": "MPLCONFIGDIR=/tmp/mplconfig-maldatagen-final PYTHONPATH=. python main.py --data_format npy_xy --train_x_path outputs/final_release_gate/2026-07-15/data/appclassnet_10/train_x.npy --train_y_path outputs/final_release_gate/2026-07-15/data/appclassnet_10/train_y.npy --valid_x_path outputs/final_release_gate/2026-07-15/data/appclassnet_10/valid_x.npy --valid_y_path outputs/final_release_gate/2026-07-15/data/appclassnet_10/valid_y.npy --test_x_path outputs/final_release_gate/2026-07-15/data/appclassnet_10/test_x.npy --test_y_path outputs/final_release_gate/2026-07-15/data/appclassnet_10/test_y.npy --target_type multiclass --feature_type continuous --num_classes 10 --split_mode provided --number_k_folds 1 --data_type continuous --verbosity 0 --output_dir outputs/final_release_gate/2026-07-15/generator_copy_ts_tr_10_normal --execution_mode normal --eval_classifier decision_tree_subset --normal_classifier decision_tree --min_samples_per_class_required 1 --generation_strategy single_conditional --classes_per_group 10 --source_profile appclassnet_top200 --feature_transform preserve --generator_transform preserve --classifier_transform preserve --evaluation_space source --evaluation_protocol ts_tr --evaluation_mode ts_tr --random_state 0 --synthetic_control none --train_samples_per_class 60 --test_samples_per_class 60 --synthetic_train_samples_per_class 30 --synthetic_test_samples_per_class 30 --real_class_count_policy strict --samples_per_class_scope split --sample_plan balanced_per_class --samples_per_class 60 --save_synthetic_format legacy --inverse_transform_synthetic --classifier DecisionTree --model_type copy --save_data True",
+      "effective_folds": 1,
+      "execution_mode": "normal",
+      "generation_strategy": "single_conditional",
+      "metrics": {
+        "TR_PLUS_TS_TR": {
+          "classifier": null,
+          "metrics": null,
+          "status": "not_run",
+          "test_source": null,
+          "train_sources": null
+        },
+        "TR_TR": {
+          "classifier": null,
+          "metrics": null,
+          "status": "not_run",
+          "test_source": null,
+          "train_sources": null
+        },
+        "TR_TS": {
+          "classifier": null,
+          "metrics": null,
+          "status": "not_run",
+          "test_source": null,
+          "train_sources": null
+        },
+        "TS_TR": {
+          "classifier": {
+            "discarded_rows": null,
+            "discarded_rows_for_fit": null,
+            "effective_classifier": "decision_tree_subset",
+            "effective_fit_rows": null,
+            "global_limit": 100000,
+            "hyperparameters": {},
+            "quota_per_class": null,
+            "reported_classifier": "DecisionTree",
+            "requested_classifier": "decision_tree"
+          },
+          "metrics": {
+            "Accuracy": 0.67125,
+            "BalancedAccuracy": 0.67125,
+            "MacroF1": 0.669269701267099,
+            "WeightedF1": 0.669269701267099
+          },
+          "status": "completed",
+          "test_source": "real_test",
+          "train_sources": [
+            "synthetic_train"
+          ]
+        }
+      },
+      "mmap": false,
+      "model_type": "copy",
+      "split_mode": "provided",
+      "status": "passed",
+      "synthetic_control": "none"
+    },
+    "label_permutation_10": {
+      "classes": 10,
+      "classifier": "DecisionTreeSubset",
+      "command": "MPLCONFIGDIR=/tmp/mplconfig-maldatagen-final PYTHONPATH=. python main.py --data_format npy_xy --train_x_path outputs/final_release_gate/2026-07-15/data/appclassnet_10/train_x.npy --train_y_path outputs/final_release_gate/2026-07-15/data/appclassnet_10/train_y.npy --valid_x_path outputs/final_release_gate/2026-07-15/data/appclassnet_10/valid_x.npy --valid_y_path outputs/final_release_gate/2026-07-15/data/appclassnet_10/valid_y.npy --test_x_path outputs/final_release_gate/2026-07-15/data/appclassnet_10/test_x.npy --test_y_path outputs/final_release_gate/2026-07-15/data/appclassnet_10/test_y.npy --target_type multiclass --feature_type continuous --num_classes 10 --split_mode provided --number_k_folds 1 --data_type continuous --verbosity 0 --output_dir outputs/final_release_gate/2026-07-15/label_permutation_10 --execution_mode batches --batch_size 256 --eval_batch_size 256 --generation_batch_size 256 --eval_classifier decision_tree_subset --batch_classifier_subset_size 100000 --min_samples_per_class_required 1 --generation_strategy single_conditional --classes_per_group 10 --source_profile appclassnet_top200 --feature_transform preserve --generator_transform preserve --classifier_transform preserve --evaluation_space source --evaluation_protocol all --evaluation_mode all --run_tr_tr --random_state 0 --synthetic_control label_permutation --mmap_npy --train_samples_per_class 60 --test_samples_per_class 60 --synthetic_train_samples_per_class 30 --synthetic_test_samples_per_class 30 --real_class_count_policy strict --samples_per_class_scope split --sample_plan class_counts --number_samples_per_class 0:60,1:60,2:60,3:60,4:60,5:60,6:60,7:60,8:60,9:60 --save_synthetic_format npy_batches --inverse_transform_synthetic --classifier DecisionTreeSubset --model_type random --save_data True",
+      "effective_folds": 1,
+      "execution_mode": "batches",
+      "generation_strategy": "single_conditional",
+      "metrics": {
+        "TR_PLUS_TS_TR": {
+          "classifier": {
+            "discarded_rows": 300,
+            "discarded_rows_for_fit": true,
+            "effective_classifier": "decision_tree_subset",
+            "effective_fit_rows": 600,
+            "global_limit": 100000,
+            "hyperparameters": {
+              "batch_classifier": "decision_tree_subset",
+              "class_weight": null,
+              "eval_classifier": "decision_tree_subset",
+              "max_depth": null,
+              "max_samples": null,
+              "n_estimators": null,
+              "random_state": 0,
+              "subset_quota_per_class": 60
+            },
+            "quota_per_class": 60,
+            "reported_classifier": "DecisionTreeSubset",
+            "requested_classifier": "decision_tree_subset"
+          },
+          "metrics": {
+            "Accuracy": 0.545,
+            "BalancedAccuracy": 0.545,
+            "MacroF1": 0.5310810178994074,
+            "WeightedF1": 0.5310810178994074
+          },
+          "status": "completed",
+          "test_source": "real_test",
+          "train_sources": [
+            "real_train",
+            "synthetic_train"
+          ]
+        },
+        "TR_TR": {
+          "classifier": {
+            "discarded_rows": null,
+            "discarded_rows_for_fit": null,
+            "effective_classifier": "decision_tree_subset",
+            "effective_fit_rows": null,
+            "global_limit": 100000,
+            "hyperparameters": {},
+            "quota_per_class": null,
+            "reported_classifier": "DecisionTreeSubset",
+            "requested_classifier": "decision_tree_subset"
+          },
+          "metrics": {
+            "Accuracy": 0.6566666666666666,
+            "BalancedAccuracy": 0.6566666666666666,
+            "MacroF1": 0.6526161717325271,
+            "WeightedF1": 0.652616171732527
+          },
+          "status": "completed",
+          "test_source": "real_test",
+          "train_sources": [
+            "real_train"
+          ]
+        },
+        "TR_TS": {
+          "classifier": {
+            "discarded_rows": 0,
+            "discarded_rows_for_fit": false,
+            "effective_classifier": "decision_tree_subset",
+            "effective_fit_rows": 600,
+            "global_limit": 100000,
+            "hyperparameters": {
+              "batch_classifier": "decision_tree_subset",
+              "class_weight": null,
+              "eval_classifier": "decision_tree_subset",
+              "max_depth": null,
+              "max_samples": null,
+              "n_estimators": null,
+              "random_state": 0,
+              "subset_quota_per_class": 60
+            },
+            "quota_per_class": 60,
+            "reported_classifier": "DecisionTreeSubset",
+            "requested_classifier": "decision_tree_subset"
+          },
+          "metrics": {
+            "Accuracy": 0.09333333333333334,
+            "BalancedAccuracy": 0.09333333333333334,
+            "MacroF1": 0.08864411592205101,
+            "WeightedF1": 0.08864411592205101
+          },
+          "status": "completed",
+          "test_source": "synthetic_test",
+          "train_sources": [
+            "real_train"
+          ]
+        },
+        "TS_TR": {
+          "classifier": {
+            "discarded_rows": 0,
+            "discarded_rows_for_fit": false,
+            "effective_classifier": "decision_tree_subset",
+            "effective_fit_rows": 300,
+            "global_limit": 100000,
+            "hyperparameters": {
+              "batch_classifier": "decision_tree_subset",
+              "class_weight": null,
+              "eval_classifier": "decision_tree_subset",
+              "max_depth": null,
+              "max_samples": null,
+              "n_estimators": null,
+              "random_state": 0,
+              "subset_quota_per_class": 60
+            },
+            "quota_per_class": 60,
+            "reported_classifier": "DecisionTreeSubset",
+            "requested_classifier": "decision_tree_subset"
+          },
+          "metrics": {
+            "Accuracy": 0.145,
+            "BalancedAccuracy": 0.145,
+            "MacroF1": 0.14380807600675663,
+            "WeightedF1": 0.14380807600675663
+          },
+          "status": "completed",
+          "test_source": "real_test",
+          "train_sources": [
+            "synthetic_train"
+          ]
+        }
+      },
+      "mmap": true,
+      "split_mode": "provided",
+      "status": "passed",
+      "synthetic_control": "label_permutation"
+    },
+    "legacy_csv_smoke": {
+      "classes": 10,
+      "classifier": "DecisionTree",
+      "command": "MPLCONFIGDIR=/tmp/mplconfig-maldatagen-final PYTHONPATH=. python main.py --data_format csv --data_load_path_file_input outputs/final_release_gate/2026-07-15/data/legacy_appclassnet_10.csv --data_load_label_column -1 --target_type multiclass --feature_type continuous --num_classes 10 --number_k_folds 2 --data_type continuous --verbosity 0 --output_dir outputs/final_release_gate/2026-07-15/legacy_csv_smoke --execution_mode normal --source_profile legacy_csv --feature_transform preserve --generator_transform preserve --classifier_transform preserve --evaluation_space source --evaluation_mode none --random_state 0 --sample_plan balanced_per_class --samples_per_class 5 --classifier DecisionTree --model_type copy --save_data False",
+      "data_format": "csv",
+      "effective_folds": 2,
+      "execution_mode": "normal",
+      "metrics": {
+        "TR_PLUS_TS_TR": {
+          "classifier": null,
+          "metrics": null,
+          "status": "not_run",
+          "test_source": null,
+          "train_sources": null
+        },
+        "TR_TR": {
+          "classifier": null,
+          "metrics": null,
+          "status": "not_run",
+          "test_source": null,
+          "train_sources": null
+        },
+        "TR_TS": {
+          "classifier": null,
+          "metrics": null,
+          "status": "not_run",
+          "test_source": null,
+          "train_sources": null
+        },
+        "TS_TR": {
+          "classifier": null,
+          "metrics": null,
+          "status": "not_run",
+          "test_source": null,
+          "train_sources": null
+        }
+      },
+      "mmap": false,
+      "model_type": "copy",
+      "split_mode": "cross_validation",
+      "status": "passed",
+      "synthetic_control": "none"
+    },
+    "real_resample_10": {
+      "classes": 10,
+      "classifier": "DecisionTreeSubset",
+      "command": "MPLCONFIGDIR=/tmp/mplconfig-maldatagen-final PYTHONPATH=. python main.py --data_format npy_xy --train_x_path outputs/final_release_gate/2026-07-15/data/appclassnet_10/train_x.npy --train_y_path outputs/final_release_gate/2026-07-15/data/appclassnet_10/train_y.npy --valid_x_path outputs/final_release_gate/2026-07-15/data/appclassnet_10/valid_x.npy --valid_y_path outputs/final_release_gate/2026-07-15/data/appclassnet_10/valid_y.npy --test_x_path outputs/final_release_gate/2026-07-15/data/appclassnet_10/test_x.npy --test_y_path outputs/final_release_gate/2026-07-15/data/appclassnet_10/test_y.npy --target_type multiclass --feature_type continuous --num_classes 10 --split_mode provided --number_k_folds 1 --data_type continuous --verbosity 0 --output_dir outputs/final_release_gate/2026-07-15/real_resample_10 --execution_mode batches --batch_size 256 --eval_batch_size 256 --generation_batch_size 256 --eval_classifier decision_tree_subset --batch_classifier_subset_size 100000 --min_samples_per_class_required 1 --generation_strategy single_conditional --classes_per_group 10 --source_profile appclassnet_top200 --feature_transform preserve --generator_transform preserve --classifier_transform preserve --evaluation_space source --evaluation_protocol all --evaluation_mode all --run_tr_tr --random_state 0 --synthetic_control real_resample --mmap_npy --train_samples_per_class 60 --test_samples_per_class 60 --synthetic_train_samples_per_class 30 --synthetic_test_samples_per_class 30 --real_class_count_policy strict --samples_per_class_scope split --sample_plan class_counts --number_samples_per_class 0:60,1:60,2:60,3:60,4:60,5:60,6:60,7:60,8:60,9:60 --save_synthetic_format npy_batches --inverse_transform_synthetic --classifier DecisionTreeSubset --model_type random --save_data True",
+      "effective_folds": 1,
+      "execution_mode": "batches",
+      "generation_strategy": "single_conditional",
+      "metrics": {
+        "TR_PLUS_TS_TR": {
+          "classifier": {
+            "discarded_rows": 300,
+            "discarded_rows_for_fit": true,
+            "effective_classifier": "decision_tree_subset",
+            "effective_fit_rows": 600,
+            "global_limit": 100000,
+            "hyperparameters": {
+              "batch_classifier": "decision_tree_subset",
+              "class_weight": null,
+              "eval_classifier": "decision_tree_subset",
+              "max_depth": null,
+              "max_samples": null,
+              "n_estimators": null,
+              "random_state": 0,
+              "subset_quota_per_class": 60
+            },
+            "quota_per_class": 60,
+            "reported_classifier": "DecisionTreeSubset",
+            "requested_classifier": "decision_tree_subset"
+          },
+          "metrics": {
+            "Accuracy": 0.6466666666666666,
+            "BalancedAccuracy": 0.6466666666666667,
+            "MacroF1": 0.6446591040593824,
+            "WeightedF1": 0.6446591040593824
+          },
+          "status": "completed",
+          "test_source": "real_test",
+          "train_sources": [
+            "real_train",
+            "synthetic_train"
+          ]
+        },
+        "TR_TR": {
+          "classifier": {
+            "discarded_rows": null,
+            "discarded_rows_for_fit": null,
+            "effective_classifier": "decision_tree_subset",
+            "effective_fit_rows": null,
+            "global_limit": 100000,
+            "hyperparameters": {},
+            "quota_per_class": null,
+            "reported_classifier": "DecisionTreeSubset",
+            "requested_classifier": "decision_tree_subset"
+          },
+          "metrics": {
+            "Accuracy": 0.6566666666666666,
+            "BalancedAccuracy": 0.6566666666666666,
+            "MacroF1": 0.6526161717325271,
+            "WeightedF1": 0.652616171732527
+          },
+          "status": "completed",
+          "test_source": "real_test",
+          "train_sources": [
+            "real_train"
+          ]
+        },
+        "TR_TS": {
+          "classifier": {
+            "discarded_rows": 0,
+            "discarded_rows_for_fit": false,
+            "effective_classifier": "decision_tree_subset",
+            "effective_fit_rows": 600,
+            "global_limit": 100000,
+            "hyperparameters": {
+              "batch_classifier": "decision_tree_subset",
+              "class_weight": null,
+              "eval_classifier": "decision_tree_subset",
+              "max_depth": null,
+              "max_samples": null,
+              "n_estimators": null,
+              "random_state": 0,
+              "subset_quota_per_class": 60
+            },
+            "quota_per_class": 60,
+            "reported_classifier": "DecisionTreeSubset",
+            "requested_classifier": "decision_tree_subset"
+          },
+          "metrics": {
+            "Accuracy": 0.6333333333333333,
+            "BalancedAccuracy": 0.6333333333333333,
+            "MacroF1": 0.626814068832136,
+            "WeightedF1": 0.626814068832136
+          },
+          "status": "completed",
+          "test_source": "synthetic_test",
+          "train_sources": [
+            "real_train"
+          ]
+        },
+        "TS_TR": {
+          "classifier": {
+            "discarded_rows": 0,
+            "discarded_rows_for_fit": false,
+            "effective_classifier": "decision_tree_subset",
+            "effective_fit_rows": 300,
+            "global_limit": 100000,
+            "hyperparameters": {
+              "batch_classifier": "decision_tree_subset",
+              "class_weight": null,
+              "eval_classifier": "decision_tree_subset",
+              "max_depth": null,
+              "max_samples": null,
+              "n_estimators": null,
+              "random_state": 0,
+              "subset_quota_per_class": 60
+            },
+            "quota_per_class": 60,
+            "reported_classifier": "DecisionTreeSubset",
+            "requested_classifier": "decision_tree_subset"
+          },
+          "metrics": {
+            "Accuracy": 0.655,
+            "BalancedAccuracy": 0.655,
+            "MacroF1": 0.6514105623058293,
+            "WeightedF1": 0.6514105623058293
+          },
+          "status": "completed",
+          "test_source": "real_test",
+          "train_sources": [
+            "synthetic_train"
+          ]
+        }
+      },
+      "mmap": true,
+      "split_mode": "provided",
+      "status": "passed",
+      "synthetic_control": "real_resample"
+    },
+    "real_resample_200_grouped": {
+      "classes": 200,
+      "classes_per_group": 25,
+      "classifier": "DecisionTreeSubset",
+      "command": "MPLCONFIGDIR=/tmp/mplconfig-maldatagen-final PYTHONPATH=. python main.py --data_format npy_xy --train_x_path outputs/final_release_gate/2026-07-15/data/appclassnet_200/train_x.npy --train_y_path outputs/final_release_gate/2026-07-15/data/appclassnet_200/train_y.npy --valid_x_path outputs/final_release_gate/2026-07-15/data/appclassnet_200/valid_x.npy --valid_y_path outputs/final_release_gate/2026-07-15/data/appclassnet_200/valid_y.npy --test_x_path outputs/final_release_gate/2026-07-15/data/appclassnet_200/test_x.npy --test_y_path outputs/final_release_gate/2026-07-15/data/appclassnet_200/test_y.npy --target_type multiclass --feature_type continuous --num_classes 200 --split_mode provided --number_k_folds 1 --data_type continuous --verbosity 0 --output_dir outputs/final_release_gate/2026-07-15/real_resample_200_grouped --execution_mode batches --batch_size 512 --eval_batch_size 512 --generation_batch_size 512 --eval_classifier decision_tree_subset --batch_classifier_subset_size 100000 --min_samples_per_class_required 1 --generation_strategy grouped_classes --classes_per_group 25 --source_profile appclassnet_top200 --feature_transform preserve --generator_transform preserve --classifier_transform preserve --evaluation_space source --evaluation_protocol all --evaluation_mode all --run_tr_tr --random_state 0 --synthetic_control real_resample --mmap_npy --train_samples_per_class 6 --test_samples_per_class 6 --synthetic_train_samples_per_class 4 --synthetic_test_samples_per_class 4 --real_class_count_policy strict --samples_per_class_scope split --sample_plan balanced_per_class --samples_per_class 8 --save_synthetic_format npy_batches --inverse_transform_synthetic --classifier DecisionTreeSubset --model_type random --save_data True",
+      "effective_folds": 1,
+      "execution_mode": "batches",
+      "generation_strategy": "grouped_classes",
+      "metrics": {
+        "TR_PLUS_TS_TR": {
+          "classifier": {
+            "discarded_rows": 800,
+            "discarded_rows_for_fit": true,
+            "effective_classifier": "decision_tree_subset",
+            "effective_fit_rows": 1200,
+            "global_limit": 100000,
+            "hyperparameters": {
+              "batch_classifier": "decision_tree_subset",
+              "class_weight": null,
+              "eval_classifier": "decision_tree_subset",
+              "max_depth": null,
+              "max_samples": null,
+              "n_estimators": null,
+              "random_state": 0,
+              "subset_quota_per_class": 6
+            },
+            "quota_per_class": 6,
+            "reported_classifier": "DecisionTreeSubset",
+            "requested_classifier": "decision_tree_subset"
+          },
+          "metrics": {
+            "Accuracy": 0.205,
+            "BalancedAccuracy": 0.205,
+            "MacroF1": 0.1984033011793848,
+            "WeightedF1": 0.1984033011793848
+          },
+          "status": "completed",
+          "test_source": "real_test",
+          "train_sources": [
+            "real_train",
+            "synthetic_train"
+          ]
+        },
+        "TR_TR": {
+          "classifier": {
+            "discarded_rows": null,
+            "discarded_rows_for_fit": null,
+            "effective_classifier": "decision_tree_subset",
+            "effective_fit_rows": null,
+            "global_limit": 100000,
+            "hyperparameters": {},
+            "quota_per_class": null,
+            "reported_classifier": "DecisionTreeSubset",
+            "requested_classifier": "decision_tree_subset"
+          },
+          "metrics": {
+            "Accuracy": 0.22416666666666665,
+            "BalancedAccuracy": 0.22416666666666665,
+            "MacroF1": 0.2124755048013562,
+            "WeightedF1": 0.2124755048013562
+          },
+          "status": "completed",
+          "test_source": "real_test",
+          "train_sources": [
+            "real_train"
+          ]
+        },
+        "TR_TS": {
+          "classifier": {
+            "discarded_rows": 0,
+            "discarded_rows_for_fit": false,
+            "effective_classifier": "decision_tree_subset",
+            "effective_fit_rows": 1200,
+            "global_limit": 100000,
+            "hyperparameters": {
+              "batch_classifier": "decision_tree_subset",
+              "class_weight": null,
+              "eval_classifier": "decision_tree_subset",
+              "max_depth": null,
+              "max_samples": null,
+              "n_estimators": null,
+              "random_state": 0,
+              "subset_quota_per_class": 6
+            },
+            "quota_per_class": 6,
+            "reported_classifier": "DecisionTreeSubset",
+            "requested_classifier": "decision_tree_subset"
+          },
+          "metrics": {
+            "Accuracy": 0.22125,
+            "BalancedAccuracy": 0.22125,
+            "MacroF1": 0.20292128704628706,
+            "WeightedF1": 0.20292128704628706
+          },
+          "status": "completed",
+          "test_source": "synthetic_test",
+          "train_sources": [
+            "real_train"
+          ]
+        },
+        "TS_TR": {
+          "classifier": {
+            "discarded_rows": 0,
+            "discarded_rows_for_fit": false,
+            "effective_classifier": "decision_tree_subset",
+            "effective_fit_rows": 800,
+            "global_limit": 100000,
+            "hyperparameters": {
+              "batch_classifier": "decision_tree_subset",
+              "class_weight": null,
+              "eval_classifier": "decision_tree_subset",
+              "max_depth": null,
+              "max_samples": null,
+              "n_estimators": null,
+              "random_state": 0,
+              "subset_quota_per_class": 6
+            },
+            "quota_per_class": 6,
+            "reported_classifier": "DecisionTreeSubset",
+            "requested_classifier": "decision_tree_subset"
+          },
+          "metrics": {
+            "Accuracy": 0.18916666666666668,
+            "BalancedAccuracy": 0.18916666666666665,
+            "MacroF1": 0.17820872962606707,
+            "WeightedF1": 0.1782087296260671
+          },
+          "status": "completed",
+          "test_source": "real_test",
+          "train_sources": [
+            "synthetic_train"
+          ]
+        }
+      },
+      "mmap": true,
+      "split_mode": "provided",
+      "status": "passed",
+      "synthetic_control": "real_resample"
+    },
+    "reproducibility_seed0": {
+      "base_case": "real_resample_10",
+      "command": "same as real_resample_10 with --output_dir outputs/final_release_gate/2026-07-15/real_resample_10_repeat",
+      "metric_blocks_identical": true,
+      "repeat_case": "real_resample_10_repeat",
+      "status": "passed"
+    }
+  },
+  "classification": "aprovado com ressalvas",
+  "date": "2026-07-15",
+  "environment": {
+    "cwd": "/home/gatopreto/PycharmProjects/MalDataGen",
+    "python": "3.10.12"
+  }
+}

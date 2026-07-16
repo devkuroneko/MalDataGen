@@ -37,7 +37,7 @@ try:
 
     from Engine.DataIO.CSVLoader import CSVDataProcessor
     from Engine.DataIO.SyntheticBatchIO import SyntheticBatchReader
-    from Tools.PlotHeatMap import HeatmapComparator
+    from Tools.Plot.PlotHeatMap import HeatmapComparator
 
     from Tools.PlotTrainingCurve import PlotTrainingCurve
 

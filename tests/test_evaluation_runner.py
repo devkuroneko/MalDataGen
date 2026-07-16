@@ -99,6 +99,37 @@ class EvaluationRunnerTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "train X/y length mismatch"):
             runner.validate(dataset)
 
+    def test_tr_ts_tr_builds_augmented_train_and_real_test_dataset(self):
+        owner = EvaluationRunnerOwner()
+        runner = EvaluationRunner(owner, EvaluationMode.TR_TS_TR)
+        dictionary_data = split_to_dictionary(
+            real_train_data=SplitData(
+                X=numpy.array([[0.0, 0.1], [0.2, 0.3]], dtype=numpy.float32),
+                y=numpy.array([0, 1]),
+                name="train",
+            ),
+            real_test_data=SplitData(
+                X=numpy.array([[0.4, 0.5], [0.6, 0.7]], dtype=numpy.float32),
+                y=numpy.array([0, 1]),
+                name="test",
+            ),
+        )
+        synthetic = {
+            0: numpy.array([[0.01, 0.11]], dtype=numpy.float32),
+            1: numpy.array([[0.21, 0.31]], dtype=numpy.float32),
+        }
+
+        dataset = runner.build_evaluation_dataset(dictionary_data, synthetic)
+        runner.validate(dataset)
+        runner.save_results(dataset, 1)
+
+        self.assertEqual(dataset.X_train.shape, (4, 2))
+        self.assertEqual(dataset.y_train.tolist(), [0, 1, 0, 1])
+        self.assertEqual(dataset.test_origin, "real:test")
+        metadata = owner._dictionary_metrics["EvaluationMetadata"]["1-Fold"]["TR+TS-TR"]
+        self.assertEqual(metadata["train_class_counts"], {"0": 2, "1": 2})
+        self.assertEqual(metadata["test_class_counts"], {"0": 1, "1": 1})
+
 
 if __name__ == "__main__":
     unittest.main()

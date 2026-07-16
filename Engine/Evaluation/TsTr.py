@@ -177,6 +177,7 @@ class TsTr:
                 ),
                 expected_num_features=dictionary_data['x_evaluation_real'].shape[1],
                 expected_data_space="source",
+                expected_schema_hash=getattr(getattr(getattr(self, "_dataset_bundle", None), "schema", None), "schema_hash", None),
             )
             validate_real_array_for_batch_evaluation(
                 dictionary_data['x_evaluation_real'],

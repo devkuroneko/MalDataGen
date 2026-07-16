@@ -36,12 +36,13 @@ try:
 
     from Engine.Evaluation.TrTr import TrTr
     from Engine.Evaluation.TrTs import TrTs
+    from Engine.Evaluation.TrTsTr import TrTsTr
     from Engine.Evaluation.TsTr import TsTr
 
 except ImportError as error:
     print(error)
     sys.exit(-1)
 
-class Evaluation(TrTs, TsTr, TrTr):
+class Evaluation(TrTs, TsTr, TrTsTr, TrTr):
     def __init__(self):
         pass

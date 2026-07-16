@@ -48,6 +48,19 @@ class FeatureTransformManagerTest(unittest.TestCase):
         numpy.testing.assert_allclose(synthetic_source, source, atol=1e-6)
         self.assertEqual(adapter.synthetic_space_after_generation(), "source")
 
+    def test_appclassnet_preserve_inverse_synthetic_batch_is_noop(self):
+        source = numpy.array([[-0.5, 0.0], [0.5, 0.25], [0.0, 0.5]], dtype=numpy.float32)
+        policy = self._app_policy(generator_transform="preserve", inverse_transform_synthetic=True)
+        adapter = ModelInputAdapter(policy)
+
+        adapter.fit_generator(source)
+        before = adapter.transform_generator_input(source)
+        after = adapter.inverse_synthetic_batch(before)
+
+        numpy.testing.assert_array_equal(before, source)
+        numpy.testing.assert_array_equal(after, before)
+        self.assertEqual(adapter.synthetic_space_after_generation(), "source")
+
     def test_valid_and_test_use_train_fitted_scaler_without_fit(self):
         train = numpy.array([[-0.5, 0.0], [0.5, 0.25]], dtype=numpy.float32)
         valid = numpy.array([[0.0, 0.1]], dtype=numpy.float32)
@@ -172,4 +185,3 @@ class FeatureTransformManagerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

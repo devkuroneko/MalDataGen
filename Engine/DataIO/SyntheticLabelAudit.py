@@ -24,6 +24,7 @@ class SyntheticLabelGenerationAudit:
             execution_mode: str,
             number_classes: int,
             label_mapping: dict[Any, Any] | None = None,
+            expected_classes=None,
             fold_number: int | None = None,
             model_type: str | None = None,
             experiment_directory: str | None = None):
@@ -40,6 +41,7 @@ class SyntheticLabelGenerationAudit:
         )
         self.mapping = _normalize_label_mapping(label_mapping, self.number_classes)
         self.inverse_mapping = _invert_mapping(self.mapping["original_to_zero_based"])
+        self.expected_classes = None if expected_classes is None else sorted(int(label) for label in expected_classes)
         self.records = []
         self.errors = []
         self.warnings = []
@@ -80,6 +82,7 @@ class SyntheticLabelGenerationAudit:
             "model_type": self.model_type,
             "experiment_directory": self.experiment_directory,
             "label_mapping": self.mapping,
+            "expected_classes": self.expected_classes,
             "records": self.records,
             "class_summary": self._class_summary(),
             "errors": self.errors,
@@ -151,18 +154,18 @@ class SyntheticLabelGenerationAudit:
                 f"Synthetic labels outside [0, {self.number_classes - 1}]: {out_of_range}."
             )
 
-        if self.number_classes == 200:
-            expected = set(range(200))
+        if self.expected_classes is not None:
+            expected = set(self.expected_classes)
             missing = sorted(expected - observed_labels)
             extra = sorted(observed_labels - expected)
             if missing:
                 self.errors.append(
-                    f"number_classes=200 requires synthetic classes exactly 0..199; "
+                    f"Synthetic generation must match requested classes exactly; "
                     f"missing {len(missing)} class(es): {missing}."
                 )
             if extra:
                 self.errors.append(
-                    f"number_classes=200 generated class(es) outside 0..199: {extra}."
+                    f"Synthetic generation produced class(es) outside requested plan: {extra}."
                 )
 
 
@@ -178,6 +181,7 @@ def audit_synthetic_label_generation(
         execution_mode=execution_mode,
         number_classes=int(number_samples_per_class["number_classes"]),
         label_mapping=label_mapping,
+        expected_classes=number_samples_per_class.get("classes", {}).keys(),
         fold_number=fold_number,
         model_type=model_type,
         experiment_directory=experiment_directory,

@@ -1,9 +1,13 @@
 import unittest
+import tempfile
+from pathlib import Path
 
 import numpy
 
 from Engine.DataIO.DatasetContracts import DatasetBundle
 from Engine.DataIO.DatasetContracts import DatasetSchema
+from Engine.DataIO.DatasetContracts import materialize_npy_class_subset
+from Engine.DataIO.DatasetContracts import resolve_class_mapping
 from Engine.DataIO.DatasetContracts import SamplePlan
 from Engine.DataIO.DatasetContracts import SplitData
 from Engine.DataIO.DatasetContracts import AlignedDataset
@@ -195,6 +199,103 @@ class DatasetContractsTest(unittest.TestCase):
         )
 
         self.assertEqual(dataset.source_indices.tolist(), [10, 20])
+
+    def test_bundle_rejects_path_that_declares_different_array(self):
+        with tempfile.TemporaryDirectory() as directory:
+            x_path = Path(directory) / "train_x.npy"
+            y_path = Path(directory) / "train_y.npy"
+            numpy.save(x_path, numpy.zeros((12, 2), dtype=numpy.float32))
+            numpy.save(y_path, numpy.tile(numpy.array([0, 1, 2], dtype=numpy.int64), 4))
+            schema = DatasetSchema(
+                feature_names=["f0", "f1"],
+                target_type="multiclass",
+                num_classes=3,
+                source_format="npy_xy",
+            )
+
+            with self.assertRaisesRegex(ValueError, "x_path shape mismatch"):
+                DatasetBundle(
+                    train=SplitData(
+                        X=numpy.zeros((2, 2), dtype=numpy.float32),
+                        y=numpy.array([0, 1], dtype=numpy.int64),
+                        name="train",
+                        x_path=str(x_path),
+                        y_path=str(y_path),
+                        validate_paths=True,
+                    ),
+                    schema=schema,
+                )
+
+    def test_bundle_rejects_shared_indices_when_splits_use_same_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            x_path = Path(directory) / "source_x.npy"
+            y_path = Path(directory) / "source_y.npy"
+            numpy.save(x_path, numpy.zeros((12, 2), dtype=numpy.float32))
+            numpy.save(y_path, numpy.tile(numpy.array([0, 1, 2], dtype=numpy.int64), 4))
+            schema = DatasetSchema(
+                feature_names=["f0", "f1"],
+                target_type="multiclass",
+                num_classes=3,
+                source_format="npy_xy",
+            )
+
+            with self.assertRaisesRegex(ValueError, "share source_indices"):
+                DatasetBundle(
+                    train=SplitData(
+                        X=numpy.zeros((12, 2), dtype=numpy.float32),
+                        y=numpy.tile(numpy.array([0, 1, 2], dtype=numpy.int64), 4),
+                        name="train",
+                        x_path=str(x_path),
+                        y_path=str(y_path),
+                        dataset_id="same",
+                        source_indices=numpy.arange(12),
+                    ),
+                    valid=SplitData(
+                        X=numpy.zeros((12, 2), dtype=numpy.float32),
+                        y=numpy.tile(numpy.array([0, 1, 2], dtype=numpy.int64), 4),
+                        name="valid",
+                        x_path=str(x_path),
+                        y_path=str(y_path),
+                        dataset_id="same",
+                        source_indices=numpy.arange(12),
+                    ),
+                    schema=schema,
+                )
+
+    def test_materialized_appclassnet_subset_remaps_labels_and_uses_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            raw_root = Path(directory) / "raw"
+            output_root = Path(directory) / "subsets"
+            raw_root.mkdir()
+            for split_name, offset in (("train", 0), ("valid", 1000), ("test", 2000)):
+                labels = numpy.tile(numpy.arange(12, dtype=numpy.int64), 2)
+                features = (
+                    numpy.arange(labels.shape[0] * 20, dtype=numpy.float32).reshape(labels.shape[0], 20)
+                    + offset
+                )
+                numpy.save(raw_root / f"{split_name}_x.npy", features)
+                numpy.save(raw_root / f"{split_name}_y.npy", labels)
+
+            mapping = resolve_class_mapping(num_classes_subset=10, total_num_classes=200)
+            subset_root, manifest_path = materialize_npy_class_subset(raw_root, output_root, mapping)
+            cached_root, cached_manifest_path = materialize_npy_class_subset(raw_root, output_root, mapping)
+
+            self.assertEqual(subset_root, cached_root)
+            self.assertEqual(manifest_path, cached_manifest_path)
+            self.assertTrue((subset_root / "subset_manifest.json").is_file())
+            for split_name in ("train", "valid", "test"):
+                x_values = numpy.load(subset_root / f"{split_name}_x.npy", mmap_mode="r", allow_pickle=False)
+                y_values = numpy.load(subset_root / f"{split_name}_y.npy", mmap_mode="r", allow_pickle=False)
+                self.assertIsInstance(x_values, numpy.memmap)
+                self.assertEqual(x_values.shape[1], 20)
+                self.assertEqual(set(numpy.unique(y_values).tolist()), set(range(10)))
+                self.assertEqual(int(y_values.min()), 0)
+                self.assertEqual(int(y_values.max()), 9)
+
+            manifest = __import__("json").loads((subset_root / "subset_manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["effective_num_classes"], 10)
+            self.assertEqual(manifest["selected_original_classes"], list(range(10)))
+            self.assertEqual(manifest["original_to_local_mapping"]["9"], 9)
 
 
 if __name__ == "__main__":

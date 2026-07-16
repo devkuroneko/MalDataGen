@@ -99,6 +99,35 @@ Available AppClassNet eval classifiers are `decision_tree_subset`, `extra_trees_
 Metrics from `normal` and `batches` can differ because the configured classifiers can differ. For a closer comparison, run both modes with a matching subset classifier when appropriate, for example `--normal_classifier decision_tree_subset` and `--eval_classifier decision_tree_subset`. The evaluation JSON files report the classifier, whether `partial_fit` was used, train batches, samples seen, per-class real/synthetic sample counts, training time and evaluation time.
 
 `metrics.json` also records simple resource usage for AppClassNet comparison: current memory, peak memory and elapsed time by stage (`loading`, `preprocessing`, `training`, `generation`, `evaluation`, `saving`), plus total elapsed time. In batches mode it additionally records the largest batch processed, number of batches and effective batch size. `psutil` is used when installed; otherwise Linux `resource` is used for peak memory, and unavailable values are written as `not_available`.
+
+### AppClassNet execution modes
+
+`run_appclassnet_top200.py` is the canonical AppClassNet top-200 runner. It now exposes the execution intent explicitly:
+
+```bash
+python3 run_appclassnet_top200.py --run_mode demo -c sf --pipeline all
+python3 run_appclassnet_top200.py --run_mode full --pipeline all
+```
+
+`--run_mode demo` uses the reduced AppClassNet profile: demo campaigns, batches mode, mmap, small synthetic quotas, skipped plots by default, and output under `outputs/appclassnet_top200/demo/<run_id>/`.
+
+`--run_mode full` uses the complete profile from the historical no-campaign run: the full campaign list, full epochs and quotas, no demo limits, and output under `outputs/appclassnet_top200/full/<run_id>/`. Before a full run starts, the runner logs the model count, combination count, number of classes, real sample counts, planned synthetic samples, epochs, expected data space, and output path. Use `--dryrun` to inspect that plan without starting training.
+
+`--pipeline` selects which evaluations run:
+
+- `tr_tr`: real train to real test only.
+- `synthetic`: train/generate synthetic data, then run TR-TS and TS-TR.
+- `all`: run TR-TR, TR-TS and TS-TR in the same execution.
+
+The legacy commands remain supported:
+
+```bash
+python3 run_appclassnet_top200.py        # full, pipeline=all
+python3 run_appclassnet_top200.py -c sf  # demo, pipeline=all
+python3 run_appclassnet_top200.py --full -c sf  # deprecated alias for --run_mode full
+```
+
+Parameter precedence is `CLI > campaign > execution profile > global default`. The effective values and their origins are recorded in `RunResults.json`, alongside the selected mode, pipeline, evaluation summaries and artifact paths.
 ---
 ### Model architecure overivew
 WWe provide a visual overview of the internal architecture of each model's building blocks through five detailed figures, highlighting the main structural changes across the models. These diagrams are documented and explained in the Overview.md [Overview.md ] file.(https://github.com/SBSeg25/MalDataGen/blob/2dd9eaad74da7726c130e50dbc35f95a463cbd00/Docs/Overview.md)

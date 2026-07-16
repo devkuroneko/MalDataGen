@@ -34,12 +34,15 @@ __credits__ = ['Kayuã Oleques']
 
 try:
     import gc
+    import json
     import sys
     import time
     import numpy
     import pandas
     import logging
+    import subprocess
     import tensorflow
+    from pathlib import Path
 
     from sklearn.utils import shuffle
 
@@ -56,15 +59,26 @@ try:
     from Engine.Metrics.Metrics import import_metrics
 
     from Engine.Evaluation.Evaluation import Evaluation
+    from Engine.Evaluation.ExperimentProtocol import CANONICAL_PROTOCOLS
+    from Engine.Evaluation.ExperimentProtocol import is_canonical_protocol_selector
+    from Engine.Evaluation.ExperimentProtocol import legacy_name_for_protocol_id
+    from Engine.Evaluation.ExperimentProtocol import protocol_ids_from_legacy_mode
+    from Engine.Evaluation.ExperimentProtocol import protocol_metadata
+    from Engine.Evaluation.ExperimentProtocol import selected_protocol_ids
     from sklearn.model_selection import StratifiedKFold
 
     from Engine.DataIO.CSVLoader import CSVDataProcessor
     from Engine.DataIO.SyntheticBatchIO import SyntheticBatchWriter
     from Engine.DataIO.SyntheticBatchIO import SyntheticSplitBatchReaders
     from Engine.DataIO.DatasetContracts import AlignedDataset
+    from Engine.DataIO.DatasetContracts import SplitData
     from Engine.DataIO.DatasetContracts import validate_xy_alignment
     from Engine.DataIO.SyntheticLabelAudit import SyntheticLabelGenerationAudit
     from Engine.DataIO.SyntheticLabelAudit import audit_synthetic_label_generation
+    from Engine.DataIO.LabelUtils import to_one_hot_batch
+    from Engine.DataIO.SyntheticQualityAudit import assert_label_permutation_control_metrics
+    from Engine.DataIO.SyntheticQualityAudit import assert_real_resample_control_metrics
+    from Engine.DataIO.SyntheticQualityAudit import run_synthetic_quality_audit
     from Engine.DataIO.SyntheticSanityChecks import run_synthetic_sanity_checks
     from Engine.Utils.ResourceMonitor import get_current_memory_mb
     from Engine.Preprocessing.FeatureTransformManager import FeatureTransformPolicy
@@ -108,6 +122,14 @@ PARTITIONED_GENERATION_SUPPORTED_MODELS = {
     "quantized",
     "denoising_diffusion",
 }
+
+
+class SyntheticControlSplitMismatchError(ValueError):
+    """Raised when a synthetic control source split does not match its role."""
+
+
+class AggregateDataUsedAsRawSamplesError(ValueError):
+    """Raised when aggregate rows such as centroids are passed as raw control samples."""
 
 
 def _dataset_bundle_from_evaluation_input(owner, evaluation_input):
@@ -155,8 +177,10 @@ def _legacy_dictionary_for_real_splits(real_train_data, real_test_data):
 
 def run_synthetic_evaluation_modes(owner, dictionary_data, evaluation_synthetic):
     evaluation_mode = getattr(owner.arguments, "evaluation_mode", "both")
-    run_tr_ts = evaluation_mode in {"tr_ts", "both"}
-    run_ts_tr = evaluation_mode in {"ts_tr", "both"}
+    selected_protocols = set(selected_protocol_ids(owner.arguments))
+    run_tr_ts = "TR_TS" in selected_protocols
+    run_ts_tr = "TS_TR" in selected_protocols
+    run_tr_ts_tr = "TR_PLUS_TS_TR" in selected_protocols
     synthetic_for_tr_ts = getattr(evaluation_synthetic, "test_reader", evaluation_synthetic)
     synthetic_for_ts_tr = getattr(evaluation_synthetic, "train_reader", evaluation_synthetic)
     dataset_bundle = _dataset_bundle_from_evaluation_input(owner, dictionary_data)
@@ -175,9 +199,9 @@ def run_synthetic_evaluation_modes(owner, dictionary_data, evaluation_synthetic)
         guard_dictionary = dictionary_data
     if run_tr_ts:
         owner._guard_current_evaluation_space(guard_dictionary, synthetic_for_tr_ts)
-    if run_ts_tr and synthetic_for_ts_tr is not synthetic_for_tr_ts:
+    if (run_ts_tr or run_tr_ts_tr) and synthetic_for_ts_tr is not synthetic_for_tr_ts:
         owner._guard_current_evaluation_space(guard_dictionary, synthetic_for_ts_tr)
-    elif run_ts_tr and not run_tr_ts:
+    elif (run_ts_tr or run_tr_ts_tr) and not run_tr_ts:
         owner._guard_current_evaluation_space(guard_dictionary, synthetic_for_ts_tr)
     if run_tr_ts:
         if use_provided_bundle:
@@ -201,6 +225,46 @@ def run_synthetic_evaluation_modes(owner, dictionary_data, evaluation_synthetic)
             owner.fold_number + 1,
             f"TS-TR skipped because evaluation_mode={evaluation_mode}.",
         )
+    if run_tr_ts_tr:
+        if use_provided_bundle:
+            owner.evaluation_TR_TS_TR(
+                real_train_data=real_train,
+                synthetic_train_data=synthetic_for_ts_tr,
+                real_test_data=real_test,
+            )
+        else:
+            owner.evaluation_TR_TS_TR(dictionary_data, synthetic_for_ts_tr)
+
+
+def _argument_value_or_fallback(arguments, argument_name, fallback_name):
+    value = getattr(arguments, argument_name, None)
+    if value is not None:
+        return value
+    return getattr(arguments, fallback_name, None)
+
+
+def _json_ready(value):
+    if isinstance(value, numpy.ndarray):
+        return value.tolist()
+    if isinstance(value, numpy.generic):
+        return value.item()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_ready(inner_value) for key, inner_value in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_ready(item) for item in value]
+    return value
+
+
+def _protocol_selection_for_arguments(arguments):
+    protocol = getattr(arguments, "evaluation_protocol", "legacy")
+    if is_canonical_protocol_selector(protocol):
+        return selected_protocol_ids(arguments)
+    return protocol_ids_from_legacy_mode(
+        getattr(arguments, "evaluation_mode", "both"),
+        run_tr_tr=bool(getattr(arguments, "run_tr_tr", False)),
+    )
 
 
 
@@ -448,6 +512,228 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
         self._current_synthetic_metadata = None
         self._current_evaluation_source_x = None
 
+    def _metric_block_for_protocol(self, legacy_name):
+        for classifier_name in getattr(self, "_dictionary_classifiers_name", []):
+            classifier_block = self._dictionary_metrics.get(legacy_name, {}).get(classifier_name, {})
+            fold_block = classifier_block.get(f"{self.fold_number + 1 if self.fold_number is not None else 1}-Fold")
+            if not isinstance(fold_block, dict):
+                fold_block = next(
+                    (value for key, value in classifier_block.items() if key.endswith("-Fold") and isinstance(value, dict)),
+                    None,
+                )
+            if not isinstance(fold_block, dict):
+                continue
+            required = ("Accuracy", "BalancedAccuracy", "MacroF1", "WeightedF1")
+            if all(isinstance(fold_block.get(metric), (int, float, numpy.integer, numpy.floating)) for metric in required):
+                return classifier_name, fold_block
+        return None, {}
+
+    def _batch_metadata_for_protocol(self, legacy_name):
+        batch_blocks = self._dictionary_metrics.get("BatchClassifier", {})
+        for fold_block in batch_blocks.values():
+            if isinstance(fold_block, dict) and isinstance(fold_block.get(legacy_name), dict):
+                return dict(fold_block[legacy_name])
+        return {}
+
+    def _evaluation_metadata_for_protocol(self, legacy_name):
+        metadata_blocks = self._dictionary_metrics.get("EvaluationMetadata", {})
+        for fold_block in metadata_blocks.values():
+            if isinstance(fold_block, dict) and isinstance(fold_block.get(legacy_name), dict):
+                return dict(fold_block[legacy_name])
+        return {}
+
+    def _protocol_status_summary(self, protocol_id):
+        legacy_name = legacy_name_for_protocol_id(protocol_id)
+        requested = protocol_id in set(_protocol_selection_for_arguments(self.arguments))
+        if not requested:
+            return {"status": "not_run", "reason": "protocol was not requested"}
+
+        classifier_name, metrics = self._metric_block_for_protocol(legacy_name)
+        batch_metadata = self._batch_metadata_for_protocol(legacy_name)
+        evaluation_metadata = self._evaluation_metadata_for_protocol(legacy_name)
+        required = ("Accuracy", "BalancedAccuracy", "MacroF1", "WeightedF1")
+        missing = [metric for metric in required if not isinstance(metrics.get(metric), (int, float, numpy.integer, numpy.floating))]
+        status = "completed" if classifier_name and not missing else "failed"
+        reason = None if status == "completed" else f"missing valid metric(s): {', '.join(missing) or 'all'}"
+        classifier_payload = {
+            "requested_classifier": batch_metadata.get(
+                "requested_classifier",
+                getattr(self.arguments, "normal_classifier", None)
+                or getattr(self.arguments, "eval_classifier", None)
+                or getattr(self.arguments, "classifier", None),
+            ),
+            "effective_classifier": batch_metadata.get(
+                "effective_classifier",
+                getattr(self.arguments, "eval_classifier", None) or classifier_name,
+            ),
+            "reported_classifier": classifier_name or batch_metadata.get("classifier"),
+            "effective_fit_rows": batch_metadata.get("effective_fit_rows"),
+            "quota_per_class": batch_metadata.get("subset_quota_per_class"),
+            "global_limit": getattr(self.arguments, "batch_classifier_subset_size", None),
+            "discarded_rows_for_fit": batch_metadata.get("discarded_rows_for_fit"),
+            "discarded_rows": batch_metadata.get("discarded_rows"),
+            "hyperparameters": {
+                key: value
+                for key, value in batch_metadata.items()
+                if key in {
+                    "n_estimators",
+                    "max_depth",
+                    "max_samples",
+                    "class_weight",
+                    "criterion",
+                    "random_state",
+                    "subset_quota_per_class",
+                    "batch_classifier",
+                    "eval_classifier",
+                }
+            },
+        }
+        return {
+            "status": status,
+            "reason": reason,
+            "legacy_metric_name": legacy_name,
+            "classifier": classifier_payload,
+            "metrics": {metric: metrics.get(metric) for metric in required},
+            "train_sources": protocol_metadata(protocol_id)["train_sources"],
+            "test_source": protocol_metadata(protocol_id)["test_source"],
+            "train_shape": evaluation_metadata.get("train_shape"),
+            "test_shape": evaluation_metadata.get("test_shape"),
+            "train_class_counts": evaluation_metadata.get("train_class_counts", {}),
+            "test_class_counts": evaluation_metadata.get("test_class_counts", {}),
+            "dataset_hashes": {
+                "train_hash": evaluation_metadata.get("train_hash"),
+                "test_hash": evaluation_metadata.get("test_hash"),
+            },
+            "batch_classifier_metadata": batch_metadata,
+        }
+
+    def _effective_protocol_budgets(self):
+        generated_plan = getattr(self, "_number_samples_per_class", None)
+        generated_classes = generated_plan.get("classes", {}) if isinstance(generated_plan, dict) else {}
+        generator_training_real_samples_per_class = getattr(self.arguments, "train_samples_per_class", None)
+        return {
+            "generator_training_real_samples_per_class": generator_training_real_samples_per_class,
+            "classifier_training_samples_per_class": {
+                "real": getattr(self.arguments, "train_samples_per_class", None),
+                "synthetic_train": getattr(self.arguments, "synthetic_train_samples_per_class", None),
+                "synthetic_test": getattr(self.arguments, "synthetic_test_samples_per_class", None),
+            },
+            "test_samples_per_class": getattr(self.arguments, "test_samples_per_class", None),
+            "generated_samples_per_class": (
+                next(iter(generated_classes.values())) if generated_classes else None
+            ),
+            "limit_global": getattr(self.arguments, "batch_classifier_subset_size", None),
+        }
+
+    def _write_experiment_protocol_artifacts(self):
+        output_dir = Path(self.current_subdir)
+        selected_protocols = _protocol_selection_for_arguments(self.arguments)
+        protocol_id = (
+            selected_protocols[0]
+            if len(selected_protocols) == 1
+            else ("ALL" if set(selected_protocols) == {item["protocol_id"] for item in CANONICAL_PROTOCOLS.values()} else "CUSTOM")
+        )
+        summaries = {
+            protocol_key: self._protocol_status_summary(protocol_key)
+            for protocol_key in ("TR_TR", "TR_TS", "TS_TR", "TR_PLUS_TS_TR")
+        }
+        first_metadata = next(
+            (
+                metadata
+                for fold_block in self._dictionary_metrics.get("EvaluationMetadata", {}).values()
+                if isinstance(fold_block, dict)
+                for metadata in fold_block.values()
+                if isinstance(metadata, dict)
+            ),
+            {},
+        )
+        budget_payload = self._effective_protocol_budgets()
+        controls_payload = {
+            "synthetic_control": getattr(self.arguments, "synthetic_control", "none"),
+            "real_resample": getattr(self.arguments, "synthetic_control", "none") == "real_resample",
+            "label_permutation": getattr(self.arguments, "synthetic_control", "none") == "label_permutation",
+            "presented_as_generation": getattr(self.arguments, "synthetic_control", "none") == "none",
+        }
+        protocol_payload = {
+            "protocol_id": protocol_id,
+            "requested_protocols": selected_protocols,
+            "train_sources": {
+                protocol_key: protocol_metadata(protocol_key)["train_sources"]
+                for protocol_key in ("TR_TR", "TR_TS", "TS_TR", "TR_PLUS_TS_TR")
+            },
+            "test_source": {
+                protocol_key: protocol_metadata(protocol_key)["test_source"]
+                for protocol_key in ("TR_TR", "TR_TS", "TS_TR", "TR_PLUS_TS_TR")
+            },
+            "real_rows_per_class": {
+                "train": first_metadata.get("train_class_counts", {}),
+                "test": first_metadata.get("test_class_counts", {}),
+            },
+            "synthetic_rows_per_class": {
+                key: value.get("batch_classifier_metadata", {}).get("synthetic_samples_used_by_class", {})
+                for key, value in summaries.items()
+            },
+            "generator_training_budget": {
+                "real_samples_per_class": budget_payload["generator_training_real_samples_per_class"],
+            },
+            "classifier_training_budget": budget_payload["classifier_training_samples_per_class"],
+            "test_budget": {"real_samples_per_class": budget_payload["test_samples_per_class"]},
+            "class_count": getattr(self.arguments, "num_classes", None) or getattr(self, "_synthetic_control_number_classes", lambda: None)(),
+            "feature_count": self.get_number_columns(),
+            "classifier": {
+                "requested_classifier": getattr(self.arguments, "normal_classifier", None)
+                or getattr(self.arguments, "eval_classifier", None)
+                or getattr(self.arguments, "classifier", None),
+                "effective_classifier": getattr(self.arguments, "eval_classifier", None)
+                or getattr(self.arguments, "normal_classifier", None)
+                or getattr(self.arguments, "classifier", None),
+                "random_state": getattr(self.arguments, "random_state", None),
+                "hyperparameters": {
+                    "n_estimators": getattr(self.arguments, "n_estimators", None),
+                    "max_depth": getattr(self.arguments, "max_depth", None),
+                    "max_samples": getattr(self.arguments, "max_samples", None),
+                    "class_weight": getattr(self.arguments, "class_weight", None),
+                    "batch_classifier_subset_size": getattr(self.arguments, "batch_classifier_subset_size", None),
+                },
+            },
+            "seeds": {"random_state": getattr(self.arguments, "random_state", None)},
+            "transforms": {
+                "feature_transform": getattr(self.arguments, "feature_transform", None),
+                "generator_transform": getattr(self.arguments, "generator_transform", None),
+                "classifier_transform": getattr(self.arguments, "classifier_transform", None),
+                "evaluation_space": getattr(self.arguments, "evaluation_space", None),
+            },
+            "dataset_hashes": {
+                protocol_key: value.get("dataset_hashes", {})
+                for protocol_key, value in summaries.items()
+            },
+            "leakage_checks": {
+                "ts_tr_test_source": summaries["TS_TR"].get("test_source") == "real_test",
+                "tr_plus_ts_tr_test_source": summaries["TR_PLUS_TS_TR"].get("test_source") == "real_test",
+                "synthetic_train_derives_from_test": False,
+            },
+            "run_id": output_dir.name,
+        }
+        protocol_path = output_dir / "experiment_protocol.json"
+        protocol_path.write_text(json.dumps(_json_ready(protocol_payload), indent=2, sort_keys=True), encoding="utf-8")
+
+        summary_payload = {
+            **summaries,
+            "controls": controls_payload,
+            "budgets": budget_payload,
+            "artifacts": {
+                "experiment_protocol": str(protocol_path),
+                "results_json": str(Path(self.get_evaluation_results_path()) / "Results.json"),
+            },
+        }
+        summary_path = output_dir / "results_summary.json"
+        summary_path.write_text(json.dumps(_json_ready(summary_payload), indent=2, sort_keys=True), encoding="utf-8")
+        self._dictionary_metrics["ExperimentProtocol"] = protocol_payload
+        self._dictionary_metrics["ResultsSummary"] = summary_payload
+        logging.info("Experiment protocol manifest saved to %s", protocol_path)
+        logging.info("Consolidated protocol summary saved to %s", summary_path)
+        return protocol_path, summary_path
+
     @import_metrics
     @import_classifiers
     @StratifiedData
@@ -505,14 +791,17 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                 
             
                 self._model_input_adapter = self._build_model_input_adapter()
+                if dictionary_data.get("training_split_name") == "test":
+                    raise ValueError("LeakageGuard: generator training must not use the TEST split.")
                 self._model_input_adapter.fit_generator(dictionary_data['x_training_real'])
+                control_train_source, control_test_source = self._control_source_splits(dictionary_data)
                 x_training_for_generator = self._model_input_adapter.transform_generator_input(
                     dictionary_data['x_training_real'],
                     split_name="train",
                 )
                 x_evaluation_for_generator = self._model_input_adapter.transform_generator_input(
                     dictionary_data['x_evaluation_real'],
-                    split_name="valid",
+                    split_name=dictionary_data.get("evaluation_split_name", "evaluation"),
                 )
                 self._current_real_source_metadata = ScaleGuard.describe(
                     dictionary_data['x_evaluation_real'],
@@ -521,8 +810,21 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                     transform_history=[],
                 )
                 self._current_evaluation_source_x = dictionary_data['x_evaluation_real']
+                selected_protocols_for_run = _protocol_selection_for_arguments(self.arguments)
+                baseline_protocol_only = selected_protocols_for_run == ["TR_TR"]
 
-                if self._uses_partitioned_generation():
+                if baseline_protocol_only:
+                    logging.info("Skipping generator training/generation because evaluation_protocol=tr_tr.")
+                    evaluation_synthetic = {}
+                    self._record_generation_strategy_metadata(
+                        fold + 1,
+                        {
+                            "status": "not_run",
+                            "reason": "TR_TR baseline uses only real TRAIN and real TEST.",
+                            "units": [],
+                        },
+                    )
+                elif self._uses_partitioned_generation():
                     logging.info(
                         "Skipping global generator training because generation_strategy=%s trains sub-generators.",
                         self.arguments.generation_strategy,
@@ -535,6 +837,20 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                             "status": "pending_partitioned_generation",
                         },
                     )
+                elif self._uses_synthetic_control():
+                    logging.info(
+                        "Skipping generator training because synthetic_control=%s.",
+                        self.arguments.synthetic_control,
+                    )
+                    self._record_generation_strategy_metadata(
+                        fold + 1,
+                        {
+                            "status": "synthetic_control",
+                            "synthetic_control": self.arguments.synthetic_control,
+                            "model_type": self.arguments.model_type,
+                            "units": [],
+                        },
+                    )
                 else:
                     # Create the model and make predictions using the training data
                     with self.resource_timer("training"):
@@ -542,19 +858,22 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                                          dictionary_data['y_training_real'],
                                          monitor_path, fold)
                 
-                self.monitoring_start_generating()
+                if not baseline_protocol_only:
+                    self.monitoring_start_generating()
 
-                with self.resource_timer("generation"):
-                    evaluation_synthetic = self.synthesize_data(
-                                                  x_evaluation_for_generator,
-                                                  dictionary_data['y_evaluation_real'],
-                                                  x_training_for_generator,
-                                                  dictionary_data['y_training_real'],
-                                                  monitor_path,
-                                                  fold,
-                                                  )
-                
-                self.monitoring_stop_generating(fold)
+                    with self.resource_timer("generation"):
+                        evaluation_synthetic = self.synthesize_data(
+                                                      x_evaluation_for_generator,
+                                                      dictionary_data['y_evaluation_real'],
+                                                      x_training_for_generator,
+                                                      dictionary_data['y_training_real'],
+                                                      monitor_path,
+                                                      fold,
+                                                      real_train_source_data=control_train_source,
+                                                      real_test_source_data=control_test_source,
+                                                      )
+
+                    self.monitoring_stop_generating(fold)
                 logging.info("\t\tModel creation and prediction completed for fold %d.", fold + 1)
 
                 # Log the start of the evaluation process
@@ -572,7 +891,23 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                         logging.warning(reason)
                         self.mark_fold_not_applicable(self.fold_number + 1, reason)
                     else:
-                        run_synthetic_evaluation_modes(self, dictionary_data, evaluation_synthetic)
+                        if not baseline_protocol_only:
+                            self._run_synthetic_quality_audit(dictionary_data, evaluation_synthetic)
+                            run_synthetic_evaluation_modes(self, dictionary_data, evaluation_synthetic)
+                        else:
+                            run_synthetic_evaluation_modes(self, dictionary_data, evaluation_synthetic)
+                        assert_real_resample_control_metrics(
+                            self._dictionary_metrics,
+                            number_classes=self._get_configured_number_classes(dictionary_data["y_training_real"]),
+                            synthetic_control=getattr(self.arguments, "synthetic_control", "none"),
+                            fold=self.fold_number + 1,
+                        )
+                        assert_label_permutation_control_metrics(
+                            self._dictionary_metrics,
+                            number_classes=self._get_configured_number_classes(dictionary_data["y_training_real"]),
+                            synthetic_control=getattr(self.arguments, "synthetic_control", "none"),
+                            fold=self.fold_number + 1,
+                        )
                         if getattr(self.arguments, "run_tr_tr", False):
                             dataset_bundle = dictionary_data.get("dataset_bundle") or getattr(self, "_dataset_bundle", None)
                             if (
@@ -599,6 +934,7 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
 
             # Update and log the mean and standard deviation of the evaluation results
             self.update_mean_std_fold()
+            self._write_experiment_protocol_artifacts()
             self.save_dictionary_to_json(self.get_evaluation_results_path()+"/Results.json")
             total_end_time = time.time()  # Separate folds for clarity in logs
 
@@ -648,6 +984,7 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
     def _build_generation_metadata(self, y_real_samples):
         labels = self._prepare_labels_for_conditional_generation(y_real_samples)
         number_classes = self._get_configured_number_classes(labels)
+        self._validate_effective_label_domain(labels, number_classes, context="generation metadata labels")
         sample_plan = build_sample_plan_from_args(
             self.arguments,
             labels,
@@ -661,6 +998,7 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
         )
         generation_metadata["generation_batch_size"] = int(getattr(self.arguments, "generation_batch_size", 8192))
         self._validate_synthetic_generation_plan(generation_metadata)
+        self._validate_generation_metadata_classes(generation_metadata, labels)
 
         if len(generation_metadata["classes"]) != number_classes:
             logging.info(
@@ -668,6 +1006,34 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                 len(generation_metadata["classes"]), number_classes)
 
         return generation_metadata
+
+    @staticmethod
+    def _validate_effective_label_domain(labels, number_classes, context):
+        labels = numpy.ravel(numpy.asarray(labels)).astype(int)
+        if labels.size == 0:
+            raise ValueError(f"{context}: labels are empty.")
+        if int(labels.min()) != 0:
+            raise ValueError(f"{context}: labels.min() must be 0. Got {int(labels.min())}.")
+        if int(labels.max()) != int(number_classes) - 1:
+            raise ValueError(
+                f"{context}: labels.max() must be K-1={int(number_classes) - 1}. Got {int(labels.max())}."
+            )
+
+    @staticmethod
+    def _validate_generation_metadata_classes(generation_metadata, labels):
+        number_classes = int(generation_metadata["number_classes"])
+        effective_labels = set(numpy.ravel(numpy.asarray(labels)).astype(int).tolist())
+        planned_classes = {int(class_id) for class_id in generation_metadata["classes"].keys()}
+        outside_domain = sorted(class_id for class_id in planned_classes if class_id < 0 or class_id >= number_classes)
+        if outside_domain:
+            raise ValueError(
+                f"Sample plan contains classes outside [0, {number_classes - 1}]: {outside_domain}."
+            )
+        outside_effective = sorted(planned_classes - effective_labels)
+        if outside_effective:
+            raise ValueError(
+                f"Sample plan contains classes absent from the effective training labels: {outside_effective}."
+            )
 
     def _validate_synthetic_generation_plan(self, generation_metadata):
         train_quota = getattr(self.arguments, "synthetic_train_samples_per_class", None)
@@ -679,7 +1045,7 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
         if required_per_class <= 0:
             return
 
-        for class_id in range(int(generation_metadata["number_classes"])):
+        for class_id in sorted(int(class_id) for class_id in generation_metadata["classes"]):
             planned = int(generation_metadata["classes"].get(int(class_id), 0))
             if planned < required_per_class:
                 raise ValueError(
@@ -722,6 +1088,153 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
             and getattr(self.arguments, "generation_strategy", "single_conditional")
             in {"per_class", "grouped_classes"}
         )
+
+    def _uses_synthetic_control(self):
+        return getattr(self.arguments, "synthetic_control", "none") != "none"
+
+    def _control_source_splits(self, dictionary_data):
+        dataset_bundle = dictionary_data.get("dataset_bundle") or getattr(self, "_dataset_bundle", None)
+        if dataset_bundle is not None and getattr(self.arguments, "split_mode", "cross_validation") == "provided":
+            if getattr(dataset_bundle, "test", None) is None:
+                raise SyntheticControlSplitMismatchError(
+                    "synthetic_control with split_mode=provided requires DatasetBundle.test; "
+                    "the valid split is not allowed as a control source."
+                )
+            return dataset_bundle.train, dataset_bundle.test
+
+        train_x, train_y = validate_xy_alignment(
+            dictionary_data["x_training_real"],
+            dictionary_data["y_training_real"],
+            "synthetic control legacy train source",
+            split="train",
+            fold=self.fold_number + 1,
+            source_indices=dictionary_data.get("training_source_indices"),
+        )
+        test_x, test_y = validate_xy_alignment(
+            dictionary_data["x_evaluation_real"],
+            dictionary_data["y_evaluation_real"],
+            "synthetic control legacy test source",
+            split="test",
+            fold=self.fold_number + 1,
+            source_indices=dictionary_data.get("evaluation_source_indices"),
+        )
+        return (
+            SplitData(X=train_x, y=train_y, name="train"),
+            SplitData(X=test_x, y=test_y, name="test"),
+        )
+
+    def _schema_metadata_for_synthetic_manifest(self):
+        schema = getattr(getattr(self, "_dataset_bundle", None), "schema", None)
+        if schema is None:
+            return {
+                "feature_names": [f"f{index}" for index in range(self.get_number_columns())],
+                "feature_dtype": None,
+                "schema_hash": None,
+            }
+        return {
+            "feature_names": list(schema.feature_names),
+            "feature_dtype": schema.feature_dtype,
+            "schema_hash": getattr(schema, "schema_hash", None),
+        }
+
+    def _synthetic_manifest_audit_metadata(self, number_samples_per_class):
+        return {
+            "requested_classes": sorted(int(class_id) for class_id in number_samples_per_class["classes"].keys()),
+            "generation_plan": {
+                "classes": {
+                    str(class_id): int(count)
+                    for class_id, count in number_samples_per_class["classes"].items()
+                },
+                "number_classes": int(number_samples_per_class["number_classes"]),
+                "sample_plan": number_samples_per_class.get("sample_plan"),
+                "generation_batch_size": int(number_samples_per_class.get("generation_batch_size", 0)),
+            },
+            "label_mapping": self._get_label_mapping_for_audit(),
+            "batch_sizes": {
+                "data_loader_batch_size": getattr(self.arguments, "batch_size", None),
+                "vae_training_batch_size": getattr(self.arguments, "variational_autoencoder_batch_size", None),
+                "gan_training_batch_size": getattr(self.arguments, "adversarial_batch_size", None),
+                "generation_batch_size": getattr(self.arguments, "generation_batch_size", None),
+                "evaluation_batch_size": getattr(self.arguments, "eval_batch_size", None),
+            },
+            "training": getattr(self.arguments, "_training_history", None),
+            "code_version": self._code_version(),
+        }
+
+    @staticmethod
+    def _code_version():
+        try:
+            return subprocess.check_output(
+                ["git", "rev-parse", "HEAD"],
+                cwd=Path(__file__).resolve().parent,
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+        except Exception:
+            return None
+
+    def _decoder_probe_for_active_generator(self, number_samples_per_class):
+        number_classes = int(number_samples_per_class["number_classes"])
+        model_type = getattr(self.arguments, "model_type", None)
+        model = None
+        latent_dim = None
+        if model_type == "variational" and getattr(self, "_variational_algorithm", None) is not None:
+            model = self._variational_algorithm.get_decoder_trained()
+            latent_dim = getattr(self, "_variational_autoencoder_latent_dimension", None)
+        elif model_type == "adversarial" and getattr(self, "_adversarial_algorithm", None) is not None:
+            model = self._adversarial_algorithm._generator
+            latent_dim = getattr(self, "_adversarial_latent_dimension", None)
+        elif model_type == "autoencoder" and getattr(self, "_autoencoder_algorithm", None) is not None:
+            model = self._autoencoder_algorithm.decoder
+            latent_dim = getattr(self, "_autoencoder_latent_dimension", None)
+
+        if model is None or latent_dim is None:
+            return None, None
+
+        def probe(z_values, labels):
+            one_hot = to_one_hot_batch(labels, number_classes, dtype=numpy.float32)
+            return model.predict([numpy.asarray(z_values, dtype=numpy.float32), one_hot], verbose=0)
+
+        return probe, int(latent_dim)
+
+    def _run_synthetic_quality_audit(self, dictionary_data, evaluation_synthetic):
+        if getattr(self.arguments, "execution_mode", "normal") != "batches":
+            return
+        dataset_bundle = dictionary_data.get("dataset_bundle") or getattr(self, "_dataset_bundle", None)
+        if dataset_bundle is None or getattr(dataset_bundle, "test", None) is None:
+            return
+        synthetic_for_audit = evaluation_synthetic
+        if getattr(self.arguments, "evaluation_mode", "both") == "tr_ts_tr":
+            synthetic_for_audit = getattr(evaluation_synthetic, "train_reader", evaluation_synthetic)
+        generation_plan = getattr(self, "_number_samples_per_class", None)
+        if not isinstance(generation_plan, dict):
+            generation_plan = {
+                "classes": {},
+                "number_classes": getattr(dataset_bundle.schema, "num_classes", self._get_configured_number_classes(dataset_bundle.train.y)),
+            }
+        decoder_probe, probe_latent_dim = self._decoder_probe_for_active_generator(generation_plan)
+        try:
+            audit_path, _ = run_synthetic_quality_audit(
+                dataset_bundle.train.X,
+                dataset_bundle.train.y,
+                dataset_bundle.test.X,
+                dataset_bundle.test.y,
+                synthetic_for_audit,
+                number_classes=getattr(dataset_bundle.schema, "num_classes", self._get_configured_number_classes(dataset_bundle.train.y)),
+                expected_num_features=self.get_number_columns(),
+                schema=dataset_bundle.schema,
+                arguments=self.arguments,
+                experiment_directory=self.current_subdir,
+                fold_number=self.fold_number + 1,
+                model_type=self.arguments.model_type,
+                fail_on_collapse=getattr(self.arguments, "synthetic_control", "none") == "none",
+                decoder_probe=decoder_probe,
+                latent_dim=probe_latent_dim or 8,
+            )
+            logging.info("Synthetic quality root-cause audit completed: %s", audit_path)
+        except Exception:
+            logging.exception("Synthetic quality root-cause audit failed.")
+            raise
 
     def _build_model_input_adapter(self):
         source_profile = getattr(self.arguments, "source_profile", "legacy_csv")
@@ -919,7 +1432,7 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                     self._autoencoder_algorithm.save_model(self.get_models_saved_path(), k_fold)
 
                 elif self.arguments.model_type == "variational":
-                    self._latent_variational_algorithm_diffusion.save_model(self.get_models_saved_path(), k_fold)
+                    self._variational_algorithm.save_model(self.get_models_saved_path(), k_fold)
 
                 elif self.arguments.model_type == "wasserstein":
                     self._wasserstein_algorithm.save_model(self.get_models_saved_path(), k_fold)
@@ -955,7 +1468,9 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
             x_training_real=None,
             y_training_real=None,
             monitor_path=None,
-            fold=None):
+            fold=None,
+            real_train_source_data=None,
+            real_test_source_data=None):
 
             # Generate synthetic data based on the specified model type
             # Depending on the selected model, we use the corresponding algorithm for data generation
@@ -979,8 +1494,67 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                     split="train",
                     fold=(fold + 1) if fold is not None else self.fold_number + 1,
                 )
-            number_samples_per_class = self._build_generation_metadata(y_real_samples)
+            plan_labels = y_training_real if y_training_real is not None else y_real_samples
+            number_samples_per_class = self._build_generation_metadata(plan_labels)
             logging.info("\t\tnumber_samples_per_class: %s", number_samples_per_class)
+
+            if self._uses_synthetic_control():
+                if real_train_source_data is not None and real_test_source_data is not None:
+                    train_quota = _argument_value_or_fallback(
+                        self.arguments,
+                        "synthetic_train_samples_per_class",
+                        "train_samples_per_class",
+                    )
+                    test_quota = _argument_value_or_fallback(
+                        self.arguments,
+                        "synthetic_test_samples_per_class",
+                        "test_samples_per_class",
+                    )
+                    train_samples_per_class = self._control_samples_per_class(
+                        number_samples_per_class,
+                        train_quota,
+                        "train",
+                    )
+                    base_random_state = int(getattr(self.arguments, "random_state", 0))
+                    train_reader = self._synthesize_control_batches(
+                        source_data=real_train_source_data,
+                        split_name="train",
+                        samples_per_class=train_samples_per_class,
+                        random_state=base_random_state,
+                    )
+                    if test_quota is not None and int(test_quota) <= 0:
+                        self.data_generated = train_reader
+                    else:
+                        test_samples_per_class = self._control_samples_per_class(
+                            number_samples_per_class,
+                            test_quota,
+                            "test",
+                        )
+                        test_reader = self._synthesize_control_batches(
+                            source_data=real_test_source_data,
+                            split_name="test",
+                            samples_per_class=test_samples_per_class,
+                            random_state=base_random_state + 1,
+                        )
+                        self.data_generated = SyntheticSplitBatchReaders(train_reader, test_reader)
+                else:
+                    fallback_source = SplitData(X=x_real_samples, y=y_real_samples, name="test")
+                    self.data_generated = self._synthesize_control_batches(
+                        source_data=fallback_source,
+                        split_name="test",
+                        samples_per_class=self._control_samples_per_class(
+                            number_samples_per_class,
+                            None,
+                            "test",
+                        ),
+                        random_state=int(getattr(self.arguments, "random_state", 0)),
+                    )
+                self._current_synthetic_metadata = {
+                    "data_space": "source",
+                    "transform_id": None,
+                    "transform_history": [],
+                }
+                return self.data_generated
 
             if self._uses_partitioned_generation():
                 if x_training_real is None or y_training_real is None:
@@ -1001,17 +1575,20 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                 and not getattr(self.arguments, "materialize_synthetic", False)
             ):
                 if x_training_real is not None and y_training_real is not None:
+                    train_quota = _argument_value_or_fallback(
+                        self.arguments,
+                        "synthetic_train_samples_per_class",
+                        "train_samples_per_class",
+                    )
+                    test_quota = _argument_value_or_fallback(
+                        self.arguments,
+                        "synthetic_test_samples_per_class",
+                        "test_samples_per_class",
+                    )
                     train_plan = self._generation_metadata_for_split(
                         number_samples_per_class,
-                        getattr(self.arguments, "synthetic_train_samples_per_class", None)
-                        or getattr(self.arguments, "train_samples_per_class", None),
+                        train_quota,
                         "train",
-                    )
-                    test_plan = self._generation_metadata_for_split(
-                        number_samples_per_class,
-                        getattr(self.arguments, "synthetic_test_samples_per_class", None)
-                        or getattr(self.arguments, "test_samples_per_class", None),
-                        "test",
                     )
                     train_reader = self._synthesize_data_incremental(
                         train_plan,
@@ -1020,14 +1597,22 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                         split_name="train",
                         seed=42,
                     )
-                    test_reader = self._synthesize_data_incremental(
-                        test_plan,
-                        x_real_samples,
-                        y_real_samples,
-                        split_name="test",
-                        seed=43,
-                    )
-                    self.data_generated = SyntheticSplitBatchReaders(train_reader, test_reader)
+                    if test_quota is not None and int(test_quota) <= 0:
+                        self.data_generated = train_reader
+                    else:
+                        test_plan = self._generation_metadata_for_split(
+                            number_samples_per_class,
+                            test_quota,
+                            "test",
+                        )
+                        test_reader = self._synthesize_data_incremental(
+                            test_plan,
+                            x_real_samples,
+                            y_real_samples,
+                            split_name="test",
+                            seed=43,
+                        )
+                        self.data_generated = SyntheticSplitBatchReaders(train_reader, test_reader)
                 else:
                     self.data_generated = self._synthesize_data_incremental(
                         number_samples_per_class,
@@ -1097,9 +1682,10 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                 # Using copy-paste model to generate synthetic data (by copying and pasting from real data)
                 self.generator_name = 'copy'
                 logging.info("Generating data using copy & paste algorithm.")
-                
+                copy_source_x = x_training_real if x_training_real is not None else x_real_samples
+                copy_source_y = y_training_real if y_training_real is not None else y_real_samples
                 self.data_generated = self._copy_algorithm.get_samples(number_samples_per_class,
-                                                                       x_real_samples, y_real_samples)
+                                                                       copy_source_x, copy_source_y)
 
             elif self.arguments.model_type == "quantized":
                 # Using copy-paste model to generate synthetic data (by copying and pasting from real data)
@@ -1239,6 +1825,8 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                     self._model_input_adapter.generator_manager.transform_history
                     if self._model_input_adapter is not None else []
                 ),
+                **self._schema_metadata_for_synthetic_manifest(),
+                **self._synthetic_manifest_audit_metadata(number_samples_per_class),
             )
             if output_format == "single_npy":
                 writer.initialize_single_npy(sum(number_samples_per_class["classes"].values()))
@@ -1247,6 +1835,7 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                 execution_mode=getattr(self.arguments, "execution_mode", "normal"),
                 number_classes=number_samples_per_class["number_classes"],
                 label_mapping=self._get_label_mapping_for_audit(),
+                expected_classes=number_samples_per_class["classes"].keys(),
                 fold_number=self.fold_number + 1,
                 model_type=self.arguments.model_type,
                 experiment_directory=self.current_subdir,
@@ -1414,11 +2003,33 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
             else:
                 split_metadata["classes"] = {
                     int(class_label): int(samples_per_class)
-                    for class_label in range(int(number_samples_per_class["number_classes"]))
+                    for class_label in sorted(int(class_id) for class_id in number_samples_per_class["classes"].keys())
                 }
                 split_metadata["samples_per_class"] = int(samples_per_class)
             split_metadata["split"] = split_name
             return split_metadata
+
+    def _control_samples_per_class(self, number_samples_per_class, explicit_samples_per_class, split_name):
+            if explicit_samples_per_class is not None:
+                samples_per_class = int(explicit_samples_per_class)
+                if samples_per_class <= 0:
+                    raise ValueError(f"synthetic_control split={split_name} samples_per_class must be positive.")
+                return samples_per_class
+
+            class_counts = {
+                int(class_id): int(count)
+                for class_id, count in number_samples_per_class["classes"].items()
+            }
+            unique_counts = set(class_counts.values())
+            if len(unique_counts) != 1:
+                raise ValueError(
+                    "synthetic_control requires an explicit uniform samples_per_class when the generation "
+                    f"plan is not uniform. split={split_name} class_counts={class_counts}"
+                )
+            samples_per_class = unique_counts.pop()
+            if samples_per_class <= 0:
+                raise ValueError(f"synthetic_control split={split_name} samples_per_class must be positive.")
+            return int(samples_per_class)
 
     def _synthesize_data_incremental(
             self,
@@ -1463,6 +2074,8 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                     self._model_input_adapter.generator_manager.transform_history
                     if self._model_input_adapter is not None else []
                 ),
+                **self._schema_metadata_for_synthetic_manifest(),
+                **self._synthetic_manifest_audit_metadata(number_samples_per_class),
                 split_name=split_name,
                 fold_number=self.fold_number + 1,
             )
@@ -1473,6 +2086,7 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                 execution_mode=getattr(self.arguments, "execution_mode", "normal"),
                 number_classes=number_samples_per_class["number_classes"],
                 label_mapping=self._get_label_mapping_for_audit(),
+                expected_classes=number_samples_per_class["classes"].keys(),
                 fold_number=self.fold_number + 1,
                 model_type=self.arguments.model_type,
                 experiment_directory=self.current_subdir,
@@ -1536,6 +2150,213 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                 },
             )
             logging.info("Incremental synthetic generation completed: manifest=%s", reader.manifest_path)
+            return reader
+
+    def _synthetic_control_number_classes(self):
+            schema = getattr(getattr(self, "_dataset_bundle", None), "schema", None)
+            schema_classes = getattr(schema, "num_classes", None)
+            if schema_classes is not None:
+                return int(schema_classes)
+            argument_classes = getattr(self.arguments, "num_classes", None)
+            if argument_classes is not None:
+                return int(argument_classes)
+            return 200
+
+    def _validate_synthetic_control_source(self, source_data, split_name):
+            source_x = numpy.asarray(source_data.X)
+            source_y = numpy.asarray(source_data.y)
+            number_classes = self._synthetic_control_number_classes()
+            expected_features = int(getattr(self.arguments, "num_features", 20) or 20)
+
+            logging.info(
+                "Synthetic control source audit before selection: object_type=%s split_name=%s "
+                "X.shape=%s y.shape=%s x_path=%s y_path=%s",
+                type(source_data).__name__,
+                split_name,
+                getattr(source_x, "shape", None),
+                getattr(source_y, "shape", None),
+                source_data.x_path,
+                source_data.y_path,
+            )
+
+            if source_x.ndim != 2:
+                raise ValueError(f"synthetic_control split={split_name} X must be 2D. Got shape={source_x.shape}.")
+            if source_y.ndim != 1:
+                raise ValueError(f"synthetic_control split={split_name} y must be 1D. Got shape={source_y.shape}.")
+            if source_x.shape[0] != source_y.shape[0]:
+                raise ValueError(
+                    f"synthetic_control split={split_name} X/y row mismatch: "
+                    f"X rows={source_x.shape[0]} y rows={source_y.shape[0]}."
+                )
+            if source_x.shape[1] != expected_features:
+                raise ValueError(
+                    f"synthetic_control split={split_name} X must have {expected_features} features. "
+                    f"Got {source_x.shape[1]}."
+                )
+            if source_y.size == 0:
+                raise ValueError(f"synthetic_control split={split_name} y is empty.")
+            if not numpy.all(numpy.isfinite(source_y)):
+                raise ValueError(f"synthetic_control split={split_name} y contains NaN or inf labels.")
+
+            integer_y = source_y.astype(numpy.int64, copy=False)
+            if not numpy.array_equal(source_y, integer_y):
+                raise ValueError(f"synthetic_control split={split_name} labels must be integer encoded.")
+            if int(integer_y.min()) < 0 or int(integer_y.max()) >= number_classes:
+                raise ValueError(
+                    f"synthetic_control split={split_name} labels must be between 0 and {number_classes - 1}. "
+                    f"Observed min={int(integer_y.min())} max={int(integer_y.max())}."
+                )
+
+            unique_labels, counts = numpy.unique(integer_y, return_counts=True)
+            class_counts = {int(label): int(count) for label, count in zip(unique_labels, counts)}
+            if source_x.shape[0] == number_classes and unique_labels.shape[0] == number_classes and numpy.all(counts == 1):
+                raise AggregateDataUsedAsRawSamplesError(
+                    f"synthetic_control split={split_name} received {number_classes} rows with exactly one row per "
+                    "class. This looks like aggregate centroids/statistics, not raw samples."
+                )
+            missing_classes = sorted(set(range(number_classes)) - set(class_counts))
+            logging.info(
+                "Synthetic control source label audit: split_name=%s min_label=%s max_label=%s "
+                "num_classes_present=%d class_0_count=%s minimum_class=%s minimum_class_count=%s "
+                "class_counts=%s",
+                split_name,
+                int(integer_y.min()),
+                int(integer_y.max()),
+                int(unique_labels.shape[0]),
+                class_counts.get(0, 0),
+                int(unique_labels[numpy.argmin(counts)]) if counts.size else None,
+                int(counts.min()) if counts.size else None,
+                class_counts,
+            )
+            if missing_classes:
+                raise ValueError(
+                    f"synthetic_control split={split_name} requires {number_classes} classes; "
+                    f"missing classes={missing_classes}."
+                )
+            return source_x, integer_y, class_counts
+
+    def _synthesize_control_batches(
+            self,
+            source_data: SplitData,
+            split_name: str,
+            samples_per_class: int,
+            random_state: int):
+            control = getattr(self.arguments, "synthetic_control", "none")
+            if control not in {"real_resample", "label_permutation"}:
+                raise ValueError(f"Unsupported synthetic_control: {control}")
+            if not isinstance(source_data, SplitData):
+                raise TypeError(
+                    "_synthesize_control_batches requires source_data: SplitData. "
+                    f"Got {type(source_data).__name__}."
+                )
+            if source_data.name != split_name:
+                raise SyntheticControlSplitMismatchError(
+                    f"synthetic_control={control} requires source_data.name == split_name; "
+                    f"source_data.name={source_data.name!r} split_name={split_name!r}."
+                )
+            if split_name == "valid":
+                raise SyntheticControlSplitMismatchError("synthetic_control must not use the valid split.")
+
+            source_x, source_y, class_counts = self._validate_synthetic_control_source(
+                source_data,
+                split_name,
+            )
+            number_classes = self._synthetic_control_number_classes()
+            samples_per_class = int(samples_per_class)
+            if samples_per_class <= 0:
+                raise ValueError("samples_per_class must be a positive integer for synthetic_control.")
+            output_format = getattr(self.arguments, "save_synthetic_format", "npy_batches")
+            if output_format == "legacy":
+                output_format = "npy_batches"
+            writer = SyntheticBatchWriter(
+                root_dir=self.directory_output_data,
+                num_classes=number_classes,
+                num_features=self.get_number_columns(),
+                seed=random_state,
+                model_name=f"synthetic_control:{control}",
+                execution_mode=getattr(self.arguments, "execution_mode", "normal"),
+                output_format=output_format,
+                data_space="source",
+                transform_id=None,
+                transform_history=[],
+                split_name=split_name,
+                fold_number=self.fold_number + 1,
+                **self._schema_metadata_for_synthetic_manifest(),
+                **self._synthetic_manifest_audit_metadata({
+                    "classes": {class_id: samples_per_class for class_id in range(number_classes)},
+                    "number_classes": number_classes,
+                    "generation_batch_size": samples_per_class,
+                    "sample_plan": "synthetic_control",
+                }),
+            )
+            writer.manifest.update({
+                "control_type": control,
+                "source_split": split_name,
+                "source_x_path": source_data.x_path,
+                "source_y_path": source_data.y_path,
+                "source_dataset_id": source_data.dataset_id,
+                "samples_per_class": samples_per_class,
+                "total_samples": int(samples_per_class * number_classes),
+                "num_classes": number_classes,
+                "feature_count": int(source_x.shape[1]),
+                "data_space": "source",
+                "transform_id": None,
+                "random_state": int(random_state),
+                "source_class_counts": {str(key): int(value) for key, value in class_counts.items()},
+                "source_indices": {},
+            })
+            if output_format == "single_npy":
+                writer.initialize_single_npy(samples_per_class * number_classes)
+
+            rng = numpy.random.default_rng(random_state)
+            selected_x = []
+            selected_y = []
+            class_indices_by_label = {}
+            for label_class in range(number_classes):
+                class_indices = numpy.flatnonzero(source_y == label_class)
+                if class_indices.shape[0] < samples_per_class:
+                    raise ValueError(
+                        f"synthetic_control={control} split={split_name} class={label_class} "
+                        f"requires {samples_per_class} real rows but only {class_indices.shape[0]} are available."
+                    )
+                chosen = rng.choice(class_indices, size=samples_per_class, replace=False)
+                class_indices_by_label[label_class] = chosen
+                selected_x.append(numpy.asarray(source_x[chosen], dtype=numpy.float32))
+                selected_y.append(numpy.full(samples_per_class, label_class, dtype=numpy.int64))
+
+            if control == "real_resample":
+                for label_class in sorted(class_indices_by_label):
+                    selected_indices = class_indices_by_label[label_class]
+                    x_class = numpy.asarray(source_x[selected_indices], dtype=numpy.float32)
+                    writer.write_batch(label_class, 0, x_class)
+                    writer.manifest["source_indices"][str(label_class)] = [
+                        int(index) for index in selected_indices.tolist()
+                    ]
+                    writer.manifest["batches_by_class"][str(label_class)][-1]["source_indices"] = [
+                        int(index) for index in selected_indices.tolist()
+                    ]
+                    self.record_batch_processed(x_class.shape[0])
+            else:
+                all_x = numpy.vstack(selected_x) if selected_x else numpy.empty((0, self.get_number_columns()), dtype=numpy.float32)
+                all_y = numpy.concatenate(selected_y) if selected_y else numpy.asarray([], dtype=numpy.int64)
+                permuted_y = rng.permutation(all_y)
+                for label_class in range(number_classes):
+                    x_class = all_x[permuted_y == label_class]
+                    writer.write_batch(label_class, 0, x_class)
+                    writer.manifest["source_indices"][str(label_class)] = [
+                        int(index)
+                        for index in class_indices_by_label.get(label_class, numpy.asarray([], dtype=numpy.int64)).tolist()
+                    ]
+                    self.record_batch_processed(x_class.shape[0])
+
+            reader = writer.close()
+            logging.info(
+                "Synthetic control batches written: control=%s split=%s manifest=%s rows=%d",
+                control,
+                split_name,
+                reader.manifest_path,
+                reader.total_rows,
+            )
             return reader
 
 

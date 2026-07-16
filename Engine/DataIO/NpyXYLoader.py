@@ -164,7 +164,10 @@ class NpyXYLoader:
             name=split_name,
             x_path=str(x_path),
             y_path=str(y_path),
+            validate_paths=True,
             dataset_id=self.source_profile,
+            source_indices=numpy.arange(x_values.shape[0], dtype=numpy.int64),
+            data_space="source",
         )
 
     def _load_array(self, path: Path):

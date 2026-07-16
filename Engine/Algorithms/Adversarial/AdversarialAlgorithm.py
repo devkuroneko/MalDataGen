@@ -198,6 +198,10 @@ class AdversarialAlgorithm(Model):
         self._file_name_discriminator = file_name_discriminator
         self._file_name_generator = file_name_generator
         self._models_saved_path = models_saved_path
+        try:
+            self._number_classes = int(generator_model.input_shape[1][-1])
+        except (TypeError, IndexError, ValueError):
+            self._number_classes = None
 
 
     def compile(self, optimizer_generator, optimizer_discriminator, loss_generator, loss_discriminator, *args,
@@ -238,8 +242,7 @@ class AdversarialAlgorithm(Model):
         # Get the current batch size (number of samples in this batch)
         batch_size = tensorflow.shape(real_feature)[0]
 
-        # Expand the label tensor to match the expected shape (add a new axis at the end)
-        real_samples_label = tensorflow.expand_dims(real_samples_label, axis=-1)
+        real_samples_label = self._prepare_condition_labels(real_samples_label)
 
         # Sample random noise vectors (latent space) for the generator input
         latent_space = tensorflow.random.normal(shape=(batch_size, self._latent_dimension))
@@ -309,6 +312,25 @@ class AdversarialAlgorithm(Model):
 
         # Return a dictionary containing both losses for tracking
         return {"loss_d": loss_value, "loss_g": total_loss_g}
+
+    def _prepare_condition_labels(self, labels):
+        labels = tensorflow.convert_to_tensor(labels)
+        if labels.shape.rank == 1:
+            if self._number_classes is None:
+                raise ValueError("Cannot one-hot encode rank-1 GAN labels without a known class count.")
+            labels = tensorflow.one_hot(tensorflow.cast(labels, tensorflow.int32), depth=self._number_classes)
+        elif labels.shape.rank == 3 and labels.shape[-1] == 1:
+            labels = tensorflow.squeeze(labels, axis=-1)
+
+        tensorflow.debugging.assert_rank(labels, 2, message="Conditional GAN labels must be rank-2 one-hot tensors.")
+        labels = tensorflow.cast(labels, tensorflow.float32)
+        if self._number_classes is not None:
+            tensorflow.debugging.assert_equal(
+                tensorflow.shape(labels)[1],
+                self._number_classes,
+                message="Conditional GAN one-hot width does not match generator/discriminator class count.",
+            )
+        return labels
 
     def get_samples(self, number_samples_per_class):
         """

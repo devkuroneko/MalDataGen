@@ -42,7 +42,7 @@ try:
     import json
     import seaborn as sns
     from Engine.DataIO.CSVLoader import CSVDataProcessor
-    from Tools.PlotHeatMap import HeatmapComparator
+    from Tools.Plot.PlotHeatMap import HeatmapComparator
 
     from Tools.PlotTrainingCurve import PlotTrainingCurve
     import pandas as pd

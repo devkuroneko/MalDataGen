@@ -47,7 +47,7 @@ try:
     from Tools.Plot import Plot
     import Tools.config as config
 
-    from Tools.utils import create_directory
+    from Tools.Plot.utils import create_directory
 
 except ImportError as error:
     logging.error(error)

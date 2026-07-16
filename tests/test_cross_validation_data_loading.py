@@ -130,8 +130,9 @@ class CrossValidationDataLoadingTest(unittest.TestCase):
 
             self.assertEqual(len(owner.list_folds), 1)
             fold = owner.list_folds[0]
-            self.assertEqual(fold["evaluation_split_name"], "valid")
+            self.assertEqual(fold["evaluation_split_name"], "test")
             self.assertFalse(fold["evaluation_not_applicable"])
+            self.assertEqual(fold["x_evaluation_real"].shape, (4, 2))
             self.assertEqual(fold["real_train_split"].name, "train")
             self.assertEqual(fold["real_valid_split"].name, "valid")
             self.assertEqual(fold["real_test_split"].name, "test")
@@ -246,8 +247,10 @@ class CrossValidationDataLoadingTest(unittest.TestCase):
             _apply_bundle_to_owner(owner, bundle)
             _build_provided_split_folds(owner, bundle)
 
+            evaluation_counts = dict(zip(*numpy.unique(owner.list_folds[0]["y_evaluation_real"], return_counts=True)))
             valid_counts = dict(zip(*numpy.unique(bundle.valid.y, return_counts=True)))
             test_counts = dict(zip(*numpy.unique(bundle.test.y, return_counts=True)))
+            self.assertEqual(evaluation_counts, {0: 2, 1: 2, 2: 2})
             self.assertEqual(valid_counts, {0: 1, 1: 1, 2: 1})
             self.assertEqual(test_counts, {0: 2, 1: 2, 2: 2})
             self.assertEqual(owner.list_folds[0]["real_test_split"].name, "test")

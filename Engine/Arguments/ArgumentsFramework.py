@@ -53,6 +53,7 @@ import logging
 #     sys.exit(-1)
 
 from ..Classifiers.Classifiers import Classifiers
+from Engine.Evaluation.ExperimentProtocol import EVALUATION_PROTOCOL_CHOICES
 DEFAULT_VERBOSITY = logging.INFO
 TIME_FORMAT = '%Y-%m-%d,%H:%M:%S'
 DEFAULT_DATA_TYPE = "float32"
@@ -161,17 +162,18 @@ def add_argument_framework():
                               'AppClassNet synthetic quality.'))
 
     parser.add_argument('--evaluation_mode', type=str, default="both",
-                        choices=["none", "tr_ts", "ts_tr", "both"],
-                        help='Synthetic evaluation mode: none, TR-TS, TS-TR, or both. Default: both.')
+                        choices=["none", "tr_ts", "ts_tr", "tr_ts_tr", "both", "all"],
+                        help=('Synthetic evaluation mode: none, TR-TS, TS-TR, TR+TS-TR, both (TR-TS and TS-TR), '
+                              'or all. Default: both.'))
 
     parser.add_argument('--run_tr_tr', action='store_true', default=False,
                         help=('Also execute the pipeline TR-TR evaluator. Default false preserves the original '
                               'synthetic pipeline output; use --baseline_real_only for the AppClassNet golden.'))
 
     parser.add_argument('--evaluation_protocol', type=str, default="legacy",
-                        choices=["legacy", "appclassnet_strict"],
-                        help=('Evaluation protocol. legacy preserves the original MalDataGen evaluator semantics; '
-                              'appclassnet_strict uses train real for TR-TS and full real evaluation for TS-TR.'))
+                        choices=EVALUATION_PROTOCOL_CHOICES,
+                        help=('Evaluation protocol. Canonical AppClassNet selectors: tr_tr, tr_ts, ts_tr, '
+                              'tr_plus_ts_tr, all. legacy/appclassnet_strict are preserved for compatibility.'))
 
     parser.add_argument('--batch_classifier_subset_size', type=int, default=100000,
                         help='Maximum rows loaded for *_subset batch classifiers. Default: 100000.')

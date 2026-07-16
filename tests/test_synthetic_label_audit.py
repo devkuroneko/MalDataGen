@@ -56,11 +56,12 @@ class SyntheticLabelAuditTest(unittest.TestCase):
             self.assertEqual(persisted["status"], "failed")
             self.assertTrue(persisted["errors"])
 
-    def test_appclassnet_200_requires_complete_zero_based_domain(self):
+    def test_expected_classes_enforce_requested_subset_only(self):
         with tempfile.TemporaryDirectory() as directory:
             audit = SyntheticLabelGenerationAudit(
                 execution_mode="batches",
                 number_classes=200,
+                expected_classes=[0, 1],
             )
             audit.output_path = Path(directory) / "label_generation_audit.json"
             audit.record(0, 0, numpy.ones((1, 2), dtype=numpy.float32))
@@ -71,6 +72,21 @@ class SyntheticLabelAuditTest(unittest.TestCase):
             with audit.output_path.open() as audit_file:
                 persisted = json.load(audit_file)
             self.assertIn("missing", persisted["errors"][0])
+
+    def test_appclassnet_200_allows_partial_subset_when_requested(self):
+        with tempfile.TemporaryDirectory() as directory:
+            audit = SyntheticLabelGenerationAudit(
+                execution_mode="batches",
+                number_classes=200,
+                expected_classes=[0],
+            )
+            audit.output_path = Path(directory) / "label_generation_audit.json"
+            audit.record(0, 0, numpy.ones((1, 2), dtype=numpy.float32))
+
+            _, report = audit.finalize()
+
+            self.assertEqual(report["status"], "passed")
+            self.assertEqual(report["expected_classes"], [0])
 
 
 if __name__ == "__main__":

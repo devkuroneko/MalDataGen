@@ -1,4 +1,6 @@
 import tempfile
+import subprocess
+import sys
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -10,6 +12,7 @@ import numpy
 from Engine.DataIO.DatasetContracts import DatasetBundle
 from Engine.DataIO.DatasetContracts import DatasetSchema
 from Engine.DataIO.DatasetContracts import SplitData
+from Engine.Classifiers.BatchClassifiers import train_batch_classifier
 from Engine.Evaluation.EvaluationRunner import EvaluationSplitMismatchError
 from Engine.Preprocessing.FeatureTransformManager import PreprocessingSpaceMismatchError
 from Engine.Preprocessing.FeatureTransformManager import ScaleGuard
@@ -17,12 +20,235 @@ from main import run_synthetic_evaluation_modes
 import run_appclassnet_top200 as runner
 from run_appclassnet_top200 import APPCLASSNET_NUM_CLASSES
 from run_appclassnet_top200 import build_batch_main_command
+from run_appclassnet_top200 import build_main_command
 from run_appclassnet_top200 import build_number_samples_per_class_plan
 from run_appclassnet_top200 import deduplicate_command_options
 from run_appclassnet_top200 import effective_evaluation_mode
 
 
 class AppClassNetEvaluationModeTest(unittest.TestCase):
+
+    def test_no_arguments_resolve_to_full(self):
+        args = _parsed_runner_args([])
+
+        self.assertEqual(args.run_mode_effective, "full")
+        self.assertEqual(args.run_mode_origin, "default")
+        self.assertEqual(args.pipeline_effective, "all")
+
+    def test_campaign_sf_resolves_to_demo(self):
+        args = _parsed_runner_args(["-c", "sf"])
+
+        self.assertEqual(args.run_mode_effective, "demo")
+        self.assertEqual(args.run_mode_origin, "legacy_campaign")
+
+    def test_explicit_run_mode_demo_resolves_to_demo(self):
+        args = _parsed_runner_args(["--run_mode", "demo"])
+
+        self.assertEqual(args.run_mode_effective, "demo")
+
+    def test_explicit_run_mode_full_resolves_to_full(self):
+        args = _parsed_runner_args(["--run_mode", "full"])
+
+        self.assertEqual(args.run_mode_effective, "full")
+
+    def test_explicit_run_mode_wins_over_campaign(self):
+        args = _parsed_runner_args(["--run_mode", "full", "-c", "sf"])
+
+        self.assertEqual(args.run_mode_effective, "full")
+        self.assertEqual(runner.choose_campaigns(args.campaign, full=args.run_mode_effective == "full"), runner.DEFAULT_CAMPAIGN)
+
+    def test_legacy_full_resolves_to_full(self):
+        with self.assertWarns(DeprecationWarning):
+            args = _parsed_runner_args(["--full", "-c", "sf"])
+
+        self.assertEqual(args.run_mode_effective, "full")
+        self.assertEqual(args.run_mode_origin, "legacy_full")
+
+    def test_demo_does_not_mutate_full_defaults(self):
+        demo = _parsed_runner_args(["-c", "sf"])
+        full = _parsed_runner_args([])
+
+        self.assertEqual(demo.execution_mode, "batches")
+        self.assertEqual(full.execution_mode, "normal")
+
+    def test_full_does_not_inherit_demo_limits(self):
+        args = _parsed_runner_args([])
+
+        self.assertEqual(runner._profile_parameter_value(args, "train_samples_per_class"), 100000)
+        self.assertNotEqual(runner._profile_parameter_value(args, "train_samples_per_class"), 1000)
+
+    def test_pipeline_tr_tr_executes_only_tr_tr(self):
+        args = _parsed_runner_args(["--run_mode", "full", "--pipeline", "tr_tr"])
+        plan = runner.build_pipeline_plan(args.pipeline_effective)
+
+        self.assertTrue(args.baseline_real_only)
+        self.assertEqual(args.evaluation_mode, "none")
+        self.assertEqual(plan["run_tr_tr"], "completed")
+        self.assertEqual(plan["run_tr_ts"], "not_run")
+        self.assertEqual(plan["run_ts_tr"], "not_run")
+
+    def test_pipeline_synthetic_executes_tr_ts_and_ts_tr(self):
+        args = _parsed_runner_args(["--run_mode", "demo", "--pipeline", "synthetic"])
+        plan = runner.build_pipeline_plan(args.pipeline_effective)
+
+        self.assertFalse(args.run_tr_tr_effective)
+        self.assertEqual(args.evaluation_mode, "both")
+        self.assertEqual(plan["run_tr_ts"], "completed")
+        self.assertEqual(plan["run_ts_tr"], "completed")
+        self.assertEqual(plan["run_tr_ts_tr"], "not_run")
+
+    def test_pipeline_augmentation_executes_only_tr_ts_tr(self):
+        args = _parsed_runner_args(["--run_mode", "demo", "--pipeline", "augmentation"])
+        plan = runner.build_pipeline_plan(args.pipeline_effective)
+
+        self.assertFalse(args.run_tr_tr_effective)
+        self.assertEqual(args.evaluation_mode, "tr_ts_tr")
+        self.assertEqual(plan["run_tr_ts"], "not_run")
+        self.assertEqual(plan["run_ts_tr"], "not_run")
+        self.assertEqual(plan["run_tr_ts_tr"], "completed")
+
+    def test_pipeline_augmentation_does_not_inherit_synthetic_test_quota(self):
+        args = _parsed_runner_args(["--run_mode", "demo", "--pipeline", "augmentation"])
+        command = _batch_command_for_args(self, args, {"model_type": "copy"})
+
+        self.assertEqual(command[command.index("--synthetic_train_samples_per_class") + 1], "50")
+        self.assertEqual(command[command.index("--synthetic_test_samples_per_class") + 1], "0")
+        self.assertEqual(command[command.index("--number_samples_per_class") + 1], build_number_samples_per_class_plan(50))
+
+    def test_pipeline_all_executes_all_evaluations(self):
+        args = _parsed_runner_args(["--run_mode", "full", "--pipeline", "all"])
+        plan = runner.build_pipeline_plan(args.pipeline_effective)
+
+        self.assertTrue(args.run_tr_tr_effective)
+        self.assertEqual(args.evaluation_mode, "all")
+        self.assertEqual(plan["run_tr_tr"], "completed")
+        self.assertEqual(plan["run_tr_ts"], "completed")
+        self.assertEqual(plan["run_ts_tr"], "completed")
+        self.assertEqual(plan["run_tr_ts_tr"], "completed")
+
+    def test_pipeline_all_reuses_preprocessing(self):
+        plan = runner.build_pipeline_plan("all")
+
+        self.assertEqual(plan["preprocessing_runs"], 1)
+
+    def test_pipeline_all_reuses_synthetic_generation(self):
+        plan = runner.build_pipeline_plan("all")
+
+        self.assertEqual(plan["synthetic_generation_runs"], 1)
+
+    def test_demo_output_directory_contains_demo(self):
+        args = _parsed_runner_args(["-c", "sf"])
+
+        self.assertIn("/demo/", str(runner.build_output_directory(args)))
+
+    def test_full_output_directory_contains_full(self):
+        args = _parsed_runner_args([])
+
+        self.assertIn("/full/", str(runner.build_output_directory(args)))
+
+    def test_run_results_contains_mode(self):
+        args = _parsed_runner_args(["--run_mode", "demo", "--pipeline", "synthetic"])
+        with tempfile.TemporaryDirectory() as directory:
+            _, payload = runner.write_run_results(
+                Path(directory),
+                args,
+                ["variational_demo"],
+                {
+                    "TR-TR": runner._empty_evaluation_summary("not_run", "synthetic only"),
+                    "TR-TS": _completed_summary(),
+                    "TS-TR": _completed_summary(),
+                    "TR+TS-TR": runner._empty_evaluation_summary("not_run", "synthetic only"),
+                },
+                [],
+            )
+
+        self.assertEqual(payload["run_mode"], "demo")
+
+    def test_effective_parameters_record_origin(self):
+        args = _parsed_runner_args([])
+
+        self.assertEqual(args._effective_parameters["run_mode"]["origin"], "default")
+        self.assertEqual(args._effective_parameters["execution_mode"]["origin"], "profile")
+        self.assertIn("default_value", args._effective_parameters["execution_mode"])
+
+    def test_resolved_config_records_effective_values_once(self):
+        args = _parsed_runner_args(["--run_mode", "demo", "--pipeline", "synthetic"])
+        resolved, _, _, _ = runner.resolve_config_for_command(
+            args,
+            {"model_type": "copy", "number_k_folds": 5},
+            split_mode="provided",
+            raw_root=Path("/tmp/raw"),
+        )
+
+        self.assertEqual(resolved.dataset.effective_number_k_folds, 1)
+        self.assertEqual(resolved.sample_plan.generated_samples_per_class, 100)
+        self.assertEqual(resolved.transform.feature_transform, args.feature_transform)
+        self.assertIn("generated_samples_per_class", resolved.effective_parameters)
+
+    def test_no_arguments_keep_full_campaign_behavior(self):
+        args = _parsed_runner_args([])
+
+        self.assertEqual(runner.choose_campaigns(args.campaign, full=True), runner.DEFAULT_CAMPAIGN)
+
+    def test_campaign_sf_keeps_demo_campaign_behavior(self):
+        args = _parsed_runner_args(["-c", "sf"])
+
+        self.assertEqual(runner.choose_campaigns(args.campaign, full=False), runner.DEMO_CAMPAIGNS)
+
+    def test_legacy_csv_command_still_works(self):
+        args = _parsed_runner_args(["--run_mode", "full", "--pipeline", "synthetic"])
+        command = build_main_command(
+            "python3",
+            Path("/tmp/dataset.csv"),
+            Path("/tmp/out"),
+            {"model_type": "copy", "number_k_folds": 1, "classifier": "DecisionTree", "save_data": "True"},
+            20,
+            "continuous",
+            -1,
+            None,
+            100,
+            args,
+        )
+
+        self.assertIn("--data_load_path_file_input", command)
+        self.assertNotIn("--data_format", command)
+        self.assertEqual(command.count("--number_k_folds"), 1)
+        self.assertEqual(command[command.index("--number_k_folds") + 1], "1")
+        self.assertNotIn("--effective_number_k_folds", command)
+
+    def test_provided_split_resolves_effective_folds_to_one(self):
+        metadata = runner.resolve_k_fold_metadata({"number_k_folds": 5}, "provided")
+
+        self.assertEqual(metadata["requested_number_k_folds"], 5)
+        self.assertEqual(metadata["effective_number_k_folds"], 1)
+        self.assertEqual(metadata["split_mode"], "provided")
+        self.assertEqual(metadata["number_k_folds_origin"], "campaign")
+        self.assertEqual(metadata["origin"], "campaign")
+
+    def test_cross_validation_preserves_requested_folds(self):
+        metadata = runner.resolve_k_fold_metadata({"number_k_folds": 5}, "cross_validation")
+
+        self.assertEqual(metadata["requested_number_k_folds"], 5)
+        self.assertEqual(metadata["effective_number_k_folds"], 5)
+        self.assertEqual(metadata["split_mode"], "cross_validation")
+
+    def test_cross_validation_command_preserves_requested_folds(self):
+        args = _parsed_runner_args(["--run_mode", "full", "--pipeline", "synthetic"])
+        command = build_main_command(
+            "python3",
+            Path("/tmp/dataset.csv"),
+            Path("/tmp/out"),
+            {"model_type": "copy", "number_k_folds": 5, "classifier": "DecisionTree", "save_data": "True"},
+            20,
+            "continuous",
+            -1,
+            None,
+            100,
+            args,
+        )
+
+        self.assertEqual(command.count("--number_k_folds"), 1)
+        self.assertEqual(command[command.index("--number_k_folds") + 1], "5")
 
     def test_baseline_real_only_effective_evaluation_mode_is_none(self):
         arguments = SimpleNamespace(baseline_real_only=True, evaluation_mode="both")
@@ -81,6 +307,23 @@ class AppClassNetEvaluationModeTest(unittest.TestCase):
             ],
         )
 
+    def test_all_executes_tr_ts_ts_tr_and_tr_ts_tr(self):
+        owner = _FakeEvaluationOwner("all")
+        synthetic = SimpleNamespace(train_reader={"split": "train"}, test_reader={"split": "test"})
+
+        run_synthetic_evaluation_modes(owner, {"x_evaluation_real": numpy.zeros((1, 2))}, synthetic)
+
+        self.assertEqual(
+            owner.calls,
+            [
+                ("guard", synthetic.test_reader),
+                ("guard", synthetic.train_reader),
+                ("TR-TS", synthetic.test_reader),
+                ("TS-TR", synthetic.train_reader),
+                ("TR+TS-TR", synthetic.train_reader),
+            ],
+        )
+
     def test_provided_tr_ts_uses_train_and_synthetic_test(self):
         bundle = _provided_bundle()
         owner = _FakeEvaluationOwner("tr_ts", split_mode="provided")
@@ -111,6 +354,16 @@ class AppClassNetEvaluationModeTest(unittest.TestCase):
 
         self.assertIn(("TS-TR", synthetic.train_reader, "test"), owner.calls)
         self.assertNotIn(("TS-TR", synthetic.train_reader, "valid"), owner.calls)
+
+    def test_provided_tr_ts_tr_uses_train_synthetic_train_and_test(self):
+        bundle = _provided_bundle()
+        owner = _FakeEvaluationOwner("tr_ts_tr", split_mode="provided")
+        owner._dataset_bundle = bundle
+        synthetic = SimpleNamespace(train_reader={"split": "synthetic_train"}, test_reader={"split": "synthetic_test"})
+
+        run_synthetic_evaluation_modes(owner, {"dataset_bundle": bundle}, synthetic)
+
+        self.assertEqual(owner.calls[-1], ("TR+TS-TR", "train", synthetic.train_reader, "test"))
 
     def test_ts_tr_rejects_valid_as_real_test_split(self):
         owner = _FakeEvaluationOwner("ts_tr", split_mode="provided")
@@ -315,6 +568,124 @@ class AppClassNetEvaluationModeTest(unittest.TestCase):
         self.assertEqual(command[command.index("--synthetic_test_samples_per_class") + 1], "500")
         self.assertEqual(command[command.index("--number_samples_per_class") + 1], build_number_samples_per_class_plan(1000))
 
+    def test_vae_epochs_alias_is_forwarded_as_canonical_variational_epochs(self):
+        args = _batch_args()
+        args.vae_epochs = 30
+        args._explicit_cli_options = {"vae_epochs"}
+
+        command = _batch_command_for_args(
+            self,
+            args,
+            {"model_type": "variational", "variational_autoencoder_number_epochs": 300},
+        )
+
+        self.assertNotIn("--vae_epochs", command)
+        self.assertEqual(command.count("--variational_autoencoder_number_epochs"), 1)
+        self.assertEqual(command[command.index("--variational_autoencoder_number_epochs") + 1], "30")
+
+    def test_num_classes_subset_records_effective_num_classes(self):
+        args = _batch_args()
+        args.num_classes_subset = 10
+        args._explicit_cli_options = {"num_classes_subset"}
+
+        command = _batch_command_for_args(self, args, {"model_type": "copy"})
+        manifest = runner.COMMAND_MANIFESTS[tuple(map(str, command))]
+
+        self.assertNotIn("--num_classes_subset", command)
+        self.assertEqual(command[command.index("--num_classes") + 1], "10")
+        self.assertIn("batches/subsets", command[command.index("--train_x_path") + 1])
+        self.assertEqual(manifest["resolved_config"]["dataset"]["effective_num_classes"], 10)
+        self.assertEqual(
+            manifest["resolved_config"]["effective_parameters"]["effective_num_classes"]["effective_value"],
+            10,
+        )
+
+    def test_transform_arguments_are_preserved_separately(self):
+        args = _batch_args()
+        args.feature_transform = "minmax"
+        args.generator_transform = "standard"
+        args.classifier_transform = "preserve"
+        args.evaluation_space = "transformed"
+
+        command = _batch_command_for_args(self, args, {"model_type": "copy"})
+
+        self.assertEqual(command[command.index("--feature_transform") + 1], "minmax")
+        self.assertEqual(command[command.index("--generator_transform") + 1], "standard")
+        self.assertEqual(command[command.index("--classifier_transform") + 1], "preserve")
+        self.assertEqual(command[command.index("--evaluation_space") + 1], "transformed")
+
+    def test_unknown_main_flag_is_rejected_before_subprocess(self):
+        command = _batch_command_for_args(self, _batch_args(), {"model_type": "copy"})
+        command.extend(["--does_not_exist", "1"])
+
+        with self.assertRaisesRegex(ValueError, "UnknownMainCommandArgument"):
+            runner.validate_command_before_subprocess(command)
+
+    def test_conflicting_classifier_aliases_raise_error(self):
+        parser = runner.build_parser()
+        args = parser.parse_args([
+            "--batch_classifier",
+            "sgd",
+            "--eval_classifier",
+            "decision_tree_subset",
+        ])
+        runner.annotate_explicit_cli_arguments(
+            args,
+            ["--batch_classifier", "sgd", "--eval_classifier", "decision_tree_subset"],
+        )
+
+        with self.assertWarns(DeprecationWarning), self.assertRaisesRegex(ValueError, "ConflictingClassifierArguments"):
+            runner.normalize_classifier_arguments(args)
+
+    def test_command_manifest_is_written_for_real_execution_only(self):
+        args = _batch_args()
+        command = _batch_command_for_args(self, args, {"model_type": "copy"})
+
+        manifest_path = runner.write_command_manifest(command)
+
+        self.assertTrue(manifest_path.is_file())
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["resolved_config"]["classifier"]["effective_classifier"], "decision_tree_subset")
+        self.assertIn("canonical_command", payload)
+
+    def test_dryrun_run_cmd_does_not_call_subprocess_or_write_manifest(self):
+        args = _batch_args()
+        command = _batch_command_for_args(self, args, {"model_type": "copy"})
+        manifest_path = Path(command[command.index("--output_dir") + 1]) / "command_manifest.json"
+        previous_arguments = runner.arguments
+        runner.arguments = SimpleNamespace(dryrun=True)
+        self.addCleanup(setattr, runner, "arguments", previous_arguments)
+
+        with mock.patch.object(runner.subprocess, "run", side_effect=AssertionError("subprocess should not run")):
+            runner.run_cmd(command)
+
+        self.assertFalse(manifest_path.exists())
+
+    def test_batch_classifier_metadata_records_requested_effective_and_fit_rows(self):
+        x_values = numpy.array([[0.0], [1.0], [2.0], [3.0]], dtype=numpy.float32)
+        y_values = numpy.array([0, 0, 1, 1], dtype=numpy.int64)
+        args = SimpleNamespace(
+            random_state=0,
+            train_samples_per_class=1,
+            batch_classifier_subset_size=10,
+            max_depth=2,
+            decision_tree_criterion="gini",
+            decision_tree_max_features=None,
+            decision_tree_max_leaf_nodes=None,
+        )
+
+        _, metadata = train_batch_classifier(
+            "decision_tree_subset",
+            [(x_values, y_values)],
+            num_classes=2,
+            arguments=args,
+        )
+
+        self.assertEqual(metadata["requested_classifier"], "decision_tree_subset")
+        self.assertEqual(metadata["effective_classifier"], "decision_tree_subset")
+        self.assertEqual(metadata["classifier_name"], "DecisionTreeSubset")
+        self.assertEqual(metadata["effective_fit_rows"], 2)
+
     def test_synthetic_50_50_plans_100_per_class(self):
         self.assertEqual(_planned_samples_for_synthetic_quotas(self, 50, 50), build_number_samples_per_class_plan(100))
 
@@ -419,6 +790,67 @@ class AppClassNetEvaluationModeTest(unittest.TestCase):
         options = [token for token in command if str(token).startswith("--")]
 
         self.assertEqual(len(options), len(set(options)))
+        self.assertNotIn("--batch_classifier", command)
+
+    def test_batch_command_sends_only_effective_number_k_folds(self):
+        command = _batch_command_for_args(
+            self,
+            _batch_args(),
+            {"model_type": "copy", "number_k_folds": 2},
+        )
+
+        self.assertEqual(command.count("--number_k_folds"), 1)
+        self.assertEqual(command[command.index("--number_k_folds") + 1], "1")
+        self.assertNotIn("--effective_number_k_folds", command)
+
+    def test_duplicate_command_arguments_are_rejected_before_subprocess(self):
+        command = _batch_command_for_args(
+            self,
+            _batch_args(),
+            {"model_type": "copy", "number_k_folds": 2},
+        )
+        command.extend(["--number_k_folds", "1"])
+
+        with self.assertRaisesRegex(ValueError, "DuplicateCommandArgument"):
+            runner.validate_command_before_subprocess(command)
+
+    def test_main_accepts_produced_real_resample_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            raw_root = Path(directory) / "raw"
+            output_dir = Path(directory) / "out"
+            raw_root.mkdir()
+            _write_npy_split(raw_root, "train", rows_per_class=2)
+            _write_npy_split(raw_root, "valid", rows_per_class=1)
+            _write_npy_split(raw_root, "test", rows_per_class=2)
+
+            args = _batch_args(evaluation_mode="both")
+            args.synthetic_control = "real_resample"
+            args.train_samples_per_class = 2
+            args.test_samples_per_class = 2
+            args.synthetic_train_samples_per_class = 1
+            args.synthetic_test_samples_per_class = 1
+            args.generated_samples_per_class = 2
+            args.save_synthetic_format = "npy_batches"
+
+            command = build_batch_main_command(
+                sys.executable,
+                raw_root,
+                output_dir,
+                {"model_type": "copy", "number_k_folds": 2},
+                20,
+                "multiclass",
+                args,
+            )
+
+            completed = subprocess.run(command, check=False, capture_output=True, text=True, timeout=120)
+            combined_output = f"{completed.stdout}\n{completed.stderr}"
+
+            self.assertNotEqual(completed.returncode, 2, combined_output)
+            self.assertEqual(completed.returncode, 0, combined_output)
+            self.assertNotIn("unrecognized arguments", combined_output)
+            self.assertIn("Synthetic control source audit before selection", combined_output)
+            self.assertIn("synthetic_batches/train/manifest.json", combined_output)
+            self.assertIn("synthetic_batches/test/manifest.json", combined_output)
 
     def test_legacy_number_samples_per_class_plan_uses_generated_count(self):
         plan = build_number_samples_per_class_plan(123)
@@ -448,6 +880,7 @@ class AppClassNetEvaluationModeTest(unittest.TestCase):
         self.assertEqual(payload["TR-TR"]["status"], "not_run")
         self.assertEqual(payload["TR-TS"]["status"], "not_run")
         self.assertEqual(payload["TS-TR"]["status"], "not_run")
+        self.assertEqual(payload["TR+TS-TR"]["status"], "not_run")
         self.assertIsNone(payload["TR-TS"]["Accuracy"])
         self.assertIsNone(payload["TS-TR"]["Accuracy"])
 
@@ -462,6 +895,7 @@ class AppClassNetEvaluationModeTest(unittest.TestCase):
 
         self.assertEqual(payload["TR-TS"]["status"], "completed")
         self.assertEqual(payload["TS-TR"]["status"], "not_run")
+        self.assertEqual(payload["TR+TS-TR"]["status"], "not_run")
         self.assertIsNotNone(payload["TR-TS"]["Accuracy"])
 
     def test_evaluation_mode_ts_tr(self):
@@ -475,6 +909,7 @@ class AppClassNetEvaluationModeTest(unittest.TestCase):
 
         self.assertEqual(payload["TR-TS"]["status"], "not_run")
         self.assertEqual(payload["TS-TR"]["status"], "completed")
+        self.assertEqual(payload["TR+TS-TR"]["status"], "not_run")
         self.assertIsNotNone(payload["TS-TR"]["Accuracy"])
 
     def test_evaluation_mode_both(self):
@@ -489,8 +924,28 @@ class AppClassNetEvaluationModeTest(unittest.TestCase):
         self.assertEqual(payload["TR-TR"]["status"], "not_run")
         self.assertEqual(payload["TR-TS"]["status"], "completed")
         self.assertEqual(payload["TS-TR"]["status"], "completed")
+        self.assertEqual(payload["TR+TS-TR"]["status"], "not_run")
         self.assertIsNotNone(payload["TR-TS"]["MacroF1"])
         self.assertIsNotNone(payload["TS-TR"]["WeightedF1"])
+
+    def test_evaluation_mode_tr_ts_tr(self):
+        results_path = _write_batch_results_fixture(
+            self,
+            include_tr_ts=False,
+            include_ts_tr=False,
+            include_tr_ts_tr=True,
+        )
+
+        _, payload = runner.write_batches_metrics(
+            [results_path],
+            _temp_metrics_path(self),
+            SimpleNamespace(evaluation_mode="tr_ts_tr"),
+        )
+
+        self.assertEqual(payload["TR-TS"]["status"], "not_run")
+        self.assertEqual(payload["TS-TR"]["status"], "not_run")
+        self.assertEqual(payload["TR+TS-TR"]["status"], "completed")
+        self.assertIsNotNone(payload["TR+TS-TR"]["Accuracy"])
 
     def test_baseline_real_only(self):
         _, payload = runner.write_baseline_batches_metrics(
@@ -515,6 +970,7 @@ class AppClassNetEvaluationModeTest(unittest.TestCase):
         self.assertEqual(payload["TR-TR"]["status"], "completed")
         self.assertEqual(payload["TR-TS"]["status"], "not_run")
         self.assertEqual(payload["TS-TR"]["status"], "not_run")
+        self.assertEqual(payload["TR+TS-TR"]["status"], "not_run")
 
     def test_requested_evaluation_cannot_finish_not_run(self):
         results_path = _write_batch_results_fixture(self, include_tr_ts=False, include_ts_tr=False)
@@ -626,6 +1082,27 @@ class _FakeEvaluationOwner:
         else:
             self.calls.append(("TS-TR", synthetic_data))
 
+    def evaluation_TR_TS_TR(
+            self,
+            dictionary_data=None,
+            synthetic_data=None,
+            *,
+            real_train_data=None,
+            synthetic_train_data=None,
+            real_test_data=None):
+        if real_train_data is not None or real_test_data is not None:
+            if real_train_data.name != "train":
+                raise EvaluationSplitMismatchError(
+                    f"TR+TS-TR requires real split 'train', but received '{real_train_data.name}'."
+                )
+            if real_test_data.name != "test":
+                raise EvaluationSplitMismatchError(
+                    f"TR+TS-TR requires real split 'test', but received '{real_test_data.name}'."
+                )
+            self.calls.append(("TR+TS-TR", real_train_data.name, synthetic_train_data, real_test_data.name))
+        else:
+            self.calls.append(("TR+TS-TR", synthetic_data))
+
     def mark_evaluation_classifiers_not_applicable(self, evaluation_type, fold, reason):
         self.calls.append(("skip", evaluation_type))
 
@@ -677,6 +1154,27 @@ class _SyntheticMemoryBatches:
             yield label, values
 
 
+def _parsed_runner_args(raw_args):
+    parser = runner.build_parser()
+    args = parser.parse_args(raw_args)
+    runner.annotate_explicit_cli_arguments(args, raw_args)
+    runner.apply_execution_profile(args)
+    runner.normalize_classifier_arguments(args)
+    return args
+
+
+def _completed_summary():
+    summary = runner._empty_evaluation_summary("completed", None)
+    summary.update({
+        "classifier": "DecisionTreeSubset",
+        "Accuracy": 1.0,
+        "BalancedAccuracy": 1.0,
+        "MacroF1": 1.0,
+        "WeightedF1": 1.0,
+    })
+    return summary
+
+
 def _batch_args(evaluation_mode="both"):
     return SimpleNamespace(
         dataset_split="train",
@@ -689,10 +1187,12 @@ def _batch_args(evaluation_mode="both"):
         generation_strategy="single_conditional",
         classes_per_group=10,
         source_profile="appclassnet_top200",
+        feature_transform="preserve",
         generator_transform="preserve",
         classifier_transform="preserve",
         evaluation_space="source",
         evaluation_mode=evaluation_mode,
+        batch_classifier=None,
         use_mmap=True,
         max_train_samples=None,
         max_samples_per_class=None,
@@ -714,6 +1214,12 @@ def _batch_args(evaluation_mode="both"):
         allow_double_transform=False,
         allow_scaler_refit=False,
         inverse_transform_synthetic=True,
+        synthetic_control="none",
+        class_subset=None,
+        num_classes_subset=None,
+        vae_epochs=None,
+        gan_epochs=None,
+        _effective_parameters={},
     )
 
 
@@ -722,7 +1228,7 @@ def _batch_command_for_args(test_case, args, combination):
     test_case.addCleanup(directory.cleanup)
     raw_root = Path(directory.name)
     for split in ("train", "valid", "test"):
-        numpy.save(raw_root / f"{split}_x.npy", numpy.zeros((APPCLASSNET_NUM_CLASSES, 2), dtype=numpy.float32))
+        numpy.save(raw_root / f"{split}_x.npy", numpy.zeros((APPCLASSNET_NUM_CLASSES, 20), dtype=numpy.float32))
         numpy.save(raw_root / f"{split}_y.npy", numpy.arange(APPCLASSNET_NUM_CLASSES, dtype=numpy.int64))
 
     return build_batch_main_command(
@@ -734,6 +1240,15 @@ def _batch_command_for_args(test_case, args, combination):
         "multiclass",
         args,
     )
+
+
+def _write_npy_split(raw_root, split, rows_per_class):
+    labels = numpy.repeat(numpy.arange(APPCLASSNET_NUM_CLASSES, dtype=numpy.int64), rows_per_class)
+    features = numpy.zeros((labels.shape[0], 20), dtype=numpy.float32)
+    features[:, 0] = labels.astype(numpy.float32)
+    features[:, 1] = numpy.arange(labels.shape[0], dtype=numpy.float32)
+    numpy.save(raw_root / f"{split}_x.npy", features)
+    numpy.save(raw_root / f"{split}_y.npy", labels)
 
 
 def _planned_samples_for_synthetic_quotas(test_case, train_quota, test_quota):
@@ -750,7 +1265,7 @@ def _temp_metrics_path(test_case):
     return Path(directory.name) / "metrics.json"
 
 
-def _write_batch_results_fixture(test_case, include_tr_ts=True, include_ts_tr=True):
+def _write_batch_results_fixture(test_case, include_tr_ts=True, include_ts_tr=True, include_tr_ts_tr=False):
     directory = tempfile.TemporaryDirectory()
     test_case.addCleanup(directory.cleanup)
     run_dir = Path(directory.name) / "dataset" / "campaign" / "combination_1"
@@ -766,6 +1281,9 @@ def _write_batch_results_fixture(test_case, include_tr_ts=True, include_ts_tr=Tr
     if include_ts_tr:
         results["TS-TR"] = {"DecisionTreeSubset": {"1-Fold": _metric_block()}}
         results["BatchClassifier"]["1-Fold"]["TS-TR"] = _metadata_block()
+    if include_tr_ts_tr:
+        results["TR+TS-TR"] = {"DecisionTreeSubset": {"1-Fold": _metric_block()}}
+        results["BatchClassifier"]["1-Fold"]["TR+TS-TR"] = _metadata_block()
     results_path = results_dir / "Results.json"
     with results_path.open("w", encoding="utf-8") as results_file:
         json.dump(results, results_file)

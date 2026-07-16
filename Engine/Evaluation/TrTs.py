@@ -148,6 +148,7 @@ class TrTs:
                 ),
                 expected_num_features=dictionary_data[train_x_key].shape[1],
                 expected_data_space="source",
+                expected_schema_hash=getattr(getattr(getattr(self, "_dataset_bundle", None), "schema", None), "schema_hash", None),
             )
             train_batches = iter_array_batches(
                 dictionary_data[train_x_key],

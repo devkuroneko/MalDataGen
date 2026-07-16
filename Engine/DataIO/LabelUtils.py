@@ -100,6 +100,7 @@ def one_hot_encode_labels(labels: Any, num_classes: int, context: str = "labels"
     encoded = numpy.zeros((integer_labels.shape[0], int(num_classes)), dtype=numpy.float32)
     if integer_labels.size:
         encoded[numpy.arange(integer_labels.shape[0]), integer_labels] = 1.0
+    validate_one_hot_roundtrip(integer_labels, encoded, int(num_classes), context=context)
     return encoded
 
 
@@ -124,8 +125,26 @@ def to_one_hot_batch(labels: Any, num_classes: int, dtype=numpy.float32) -> nump
     encoded = numpy.zeros((integer_labels.shape[0], num_classes), dtype=dtype)
     if integer_labels.size:
         encoded[numpy.arange(integer_labels.shape[0]), integer_labels] = 1.0
+    validate_one_hot_roundtrip(integer_labels, encoded, num_classes, context="one-hot batch labels")
     logging.info("Using batch-wise one-hot encoding: output_shape=%s dtype=%s", encoded.shape, encoded.dtype)
     return encoded
+
+
+def validate_one_hot_roundtrip(labels: Any, encoded: Any, num_classes: int, context: str = "labels") -> None:
+    integer_labels = labels_to_1d_integer(labels, context=context)
+    encoded_array = numpy.asarray(encoded)
+    num_classes = _validate_num_classes(int(num_classes))
+
+    if encoded_array.ndim != 2:
+        raise ValueError(f"{context} one-hot encoding must be 2D. Got shape {encoded_array.shape}.")
+    if encoded_array.shape[0] != integer_labels.shape[0]:
+        raise ValueError(
+            f"{context} one-hot row count {encoded_array.shape[0]} does not match labels {integer_labels.shape[0]}."
+        )
+    if encoded_array.shape[1] != num_classes:
+        raise ValueError(f"{context} one-hot must have {num_classes} columns. Got {encoded_array.shape[1]}.")
+    if integer_labels.size and not numpy.array_equal(numpy.argmax(encoded_array, axis=1), integer_labels):
+        raise ValueError(f"{context} one-hot argmax does not recover the original labels.")
 
 
 def _validate_num_classes(num_classes: int) -> int:

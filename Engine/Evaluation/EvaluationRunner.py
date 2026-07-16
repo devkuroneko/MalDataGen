@@ -19,6 +19,8 @@ import numpy
 
 from Engine.DataIO.LabelUtils import labels_to_1d_integer
 from Engine.DataIO.DatasetContracts import validate_xy_alignment
+from Engine.Evaluation.ExperimentProtocol import LEGACY_TO_CANONICAL
+from Engine.Evaluation.ExperimentProtocol import is_canonical_protocol_selector
 from Engine.Preprocessing.FeatureTransformManager import ScaleGuard
 
 
@@ -26,6 +28,7 @@ class EvaluationMode(str, Enum):
     TR_TR = "TR-TR"
     TR_TS = "TR-TS"
     TS_TR = "TS-TR"
+    TR_TS_TR = "TR+TS-TR"
 
 
 class EvaluationSplitMismatchError(ValueError):
@@ -52,6 +55,8 @@ def evaluation_protocol(arguments) -> str:
 
 
 def uses_strict_appclassnet_protocol(arguments) -> bool:
+    if is_canonical_protocol_selector(evaluation_protocol(arguments)):
+        return True
     if evaluation_protocol(arguments) == "appclassnet_strict":
         return True
     return getattr(arguments, "source_profile", "legacy_csv") == "appclassnet_top200"
@@ -215,6 +220,40 @@ class EvaluationRunner:
                 test_metadata={**(getattr(self.owner, "_current_real_source_metadata", None) or {}), **test_metadata},
             )
 
+        if self.mode == EvaluationMode.TR_TS_TR:
+            synthetic_x, synthetic_y = materialize_synthetic_dict(synthetic_data)
+            train_metadata = split_metadata_from_mapping(dictionary_data, "train")
+            test_metadata = split_metadata_from_mapping(dictionary_data, "test")
+            if strict and train_metadata.get("name") is not None:
+                require_split_name("TR+TS-TR", train_metadata.get("name"), "train")
+            if strict and test_metadata.get("name") is not None:
+                require_split_name("TR+TS-TR", test_metadata.get("name"), "test")
+            real_train_x = dictionary_data["x_training_real"]
+            real_train_y = labels_to_1d_integer(
+                dictionary_data["y_training_real"],
+                context="TR+TS-TR real training labels",
+            )
+            return EvaluationDataset(
+                X_train=numpy.vstack([
+                    numpy.asarray(real_train_x, dtype=numpy.float32),
+                    synthetic_x,
+                ]),
+                y_train=numpy.concatenate([real_train_y, synthetic_y]),
+                X_test=dictionary_data["x_evaluation_real"],
+                y_test=labels_to_1d_integer(
+                    dictionary_data["y_evaluation_real"],
+                    context="TR+TS-TR evaluation labels",
+                ),
+                train_origin="real:train+synthetic:training",
+                test_origin=f"real:{test_metadata.get('name', 'evaluation')}",
+                train_metadata={**ScaleGuard.describe(real_train_x, data_space="source"), **train_metadata},
+                test_metadata={
+                    **ScaleGuard.describe(dictionary_data["x_evaluation_real"], data_space="source"),
+                    **(getattr(self.owner, "_current_real_source_metadata", None) or {}),
+                    **test_metadata,
+                },
+            )
+
         raise ValueError(f"Unsupported evaluation mode: {self.mode}")
 
     def validate(self, dataset: EvaluationDataset):
@@ -291,6 +330,7 @@ class EvaluationRunner:
         metrics = self.owner._dictionary_metrics.setdefault("EvaluationMetadata", {})
         mode_block = metrics.setdefault(fold_key, {})
         mode_block[self.mode.value] = {
+            "protocol_id": LEGACY_TO_CANONICAL.get(self.mode.value, self.mode.value),
             "train_origin": dataset.train_origin,
             "test_origin": dataset.test_origin,
             "data_space": dataset.data_space,

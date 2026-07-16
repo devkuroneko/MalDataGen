@@ -259,8 +259,22 @@ def add_argument_data_load(parser):
     parser.add_argument('--inverse_transform_synthetic', action='store_true', default=False,
                         help='Inverse-transform synthetic samples back to source space after generator-space generation.')
 
+    parser.add_argument('--no-inverse_transform_synthetic', action='store_false',
+                        dest='inverse_transform_synthetic',
+                        help='Diagnostic override: keep synthetic data in generator space after generation.')
+
+    parser.add_argument('--synthetic_control', type=str, default='none',
+                        choices=['none', 'real_resample', 'label_permutation'],
+                        help='Diagnostic synthetic path control written as npy_batches.')
+
     parser.add_argument('--num_classes', type=int, default=DEFAULT_NUM_CLASSES,
                         help='Optional class-domain size for new loaders, for example --num_classes 200.')
+
+    parser.add_argument('--class_subset', type=str, default=None,
+                        help='Comma-separated original class labels to keep and remap inside this experiment.')
+
+    parser.add_argument('--num_classes_subset', type=int, default=None,
+                        help='Keep original labels 0..N-1 and remap inside this diagnostic experiment.')
 
     parser.add_argument('--remap_labels_to_zero_based', action='store_true', default=False,
                         help=("Explicitly remap 1-based labels to zero-based labels in new loaders. "
@@ -320,5 +334,11 @@ def add_argument_data_load(parser):
 
     parser.add_argument('--materialize_synthetic', action='store_true', default=False,
                         help='Materialize synthetic data in memory in batches mode. This can use substantial RAM.')
+
+    parser.add_argument('--vae_epochs', type=int, default=None,
+                        help='Diagnostic alias for variational_autoencoder_number_epochs.')
+
+    parser.add_argument('--gan_epochs', type=int, default=None,
+                        help='Diagnostic alias for adversarial/wasserstein GAN epoch counts.')
 
     return parser

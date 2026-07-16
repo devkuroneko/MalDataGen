@@ -1,34 +1,63 @@
-### exclusão de pastas que excedem o limite do github
-Datasets/raw
-Datasets/raw/AppClassNet
-Datasets/raw/AppClassNet/top200
-Datasets/raw/AppClassNet/README
-Datasets/raw/AppClassNet/LICENSE
-Datasets/converted
-Datasets/converted/train_x.csv
-Datasets/converted/train_y.csv
-Datasets/converted/test_x.csv
-Datasets/converted/test_y.csv
-Datasets/converted/valid_x.csv
-Datasets/converted/valid_y.csv
-Datasets/converted/AppClassNet
-Datasets/converted/AppClassNet/top200
-Datasets/converted/AppClassNet/top200/train.csv
-Datasets/converted/AppClassNet/top200/train_balanced_max1000.csv
-Datasets/converted/AppClassNet/top200/train_balanced_max10000.csv
+### MalDataGen generated and local artifacts
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+.venv/
+venv/
+env/
+ENV/
+.env/
+.tox/
+.nox/
+
+.idea/
+*.ideia
+*.iws
+*.iml
+*.ipr
+
+# Large local datasets and reproducible generated data. Do not delete these
+# automatically; review docs/audits/ARTIFACT_RETENTION_PLAN.md first.
+Datasets/raw/
+Datasets/converted/
+Datasets/synthetic/
+Datasets/**/subset_cache/
+Datasets/**/.cache/
+
+# Execution outputs, historical result trees and generated synthetic batches.
+outputs/
+results/
+logs/
+*.tmp
+*.temp
+*.bak
+*.joblib
+*.pkl
+*.h5
+*.hdf5
+*.npz
+*.npy
+*.log
 
 local_documentation/*.md
 
-*.pyc
-*.npy
-*.__pycache__
-*.lock
-*.ideia
-.idea
-*.pdf
-*.json
-*.joblib
-*.log
+# Keep repository configs and small manifests visible unless a generated
+# directory above ignores them.
+!docs/**/*.json
+!*.example.json
+!config/**/*.json
+!configs/**/*.json
+!**/manifest.example.json
+!**/manifest.schema.json
 ### JetBrains template
 # Covers JetBrains IDEs: IntelliJ, RubyMine, PhpStorm, AppCode, PyCharm, CLion, Android Studio, WebStorm and Rider
 # Reference: https://intellij-support.jetbrains.com/hc/en-us/articles/206544839

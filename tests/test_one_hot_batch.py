@@ -29,6 +29,7 @@ class OneHotBatchTest(unittest.TestCase):
         self.assertEqual(float(encoded[1, 50]), 1.0)
         self.assertEqual(float(encoded[2, 199]), 1.0)
         self.assertEqual(float(encoded.sum()), 3.0)
+        numpy.testing.assert_array_equal(numpy.argmax(encoded, axis=1), [0, 50, 199])
 
     def test_out_of_range_labels_raise_clear_error(self):
         with self.assertRaisesRegex(ValueError, "num_classes=3"):
@@ -42,4 +43,3 @@ class OneHotBatchTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

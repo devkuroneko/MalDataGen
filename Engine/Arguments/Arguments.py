@@ -85,6 +85,8 @@ try:
     from Engine.Arguments.Classifiers.ArgumentsStochasticGradientDescent import add_argument_stochastic_gradient_descent
 
     from Engine.Arguments.Classifiers.ArgumentsQuadraticDiscriminantAnalysis import add_argument_quadratic_discriminant_analysis
+    from Engine.Evaluation.ExperimentProtocol import is_canonical_protocol_selector
+    from Engine.Evaluation.ExperimentProtocol import normalize_protocol_selector
 
 except ImportError as error:
     print(error)
@@ -177,6 +179,40 @@ def _normalize_preprocessing_arguments(parsed_arguments):
     return parsed_arguments
 
 
+def _normalize_evaluation_protocol_arguments(parsed_arguments):
+    protocol = normalize_protocol_selector(getattr(parsed_arguments, "evaluation_protocol", "legacy"))
+    if is_canonical_protocol_selector(protocol):
+        parsed_arguments.evaluation_protocol = protocol
+        if protocol == "tr_tr":
+            parsed_arguments.evaluation_mode = "none"
+            parsed_arguments.run_tr_tr = True
+        elif protocol == "tr_ts":
+            parsed_arguments.evaluation_mode = "tr_ts"
+            parsed_arguments.run_tr_tr = False
+        elif protocol == "ts_tr":
+            parsed_arguments.evaluation_mode = "ts_tr"
+            parsed_arguments.run_tr_tr = False
+        elif protocol == "tr_plus_ts_tr":
+            parsed_arguments.evaluation_mode = "tr_ts_tr"
+            parsed_arguments.run_tr_tr = False
+        elif protocol == "all":
+            parsed_arguments.evaluation_mode = "all"
+            parsed_arguments.run_tr_tr = True
+    return parsed_arguments
+
+
+def _apply_diagnostic_epoch_aliases(parsed_arguments):
+    if getattr(parsed_arguments, "vae_epochs", None) is not None:
+        parsed_arguments.variational_autoencoder_number_epochs = int(parsed_arguments.vae_epochs)
+    if getattr(parsed_arguments, "gan_epochs", None) is not None:
+        parsed_arguments.adversarial_number_epochs = int(parsed_arguments.gan_epochs)
+        if hasattr(parsed_arguments, "wasserstein_number_epochs"):
+            parsed_arguments.wasserstein_number_epochs = int(parsed_arguments.gan_epochs)
+        if hasattr(parsed_arguments, "wasserstein_gp_number_epochs"):
+            parsed_arguments.wasserstein_gp_number_epochs = int(parsed_arguments.gan_epochs)
+    return parsed_arguments
+
+
 def arguments(function):
     """
     Decorator to initialize an instance of the Arguments class
@@ -248,7 +284,9 @@ class Arguments(DirectoryManager):
         self.arguments = add_argument_support_vector_machine(self.arguments)
 
         self.arguments = self.arguments.parse_args()
+        self.arguments = _apply_diagnostic_epoch_aliases(self.arguments)
         self.arguments = _normalize_preprocessing_arguments(self.arguments)
+        self.arguments = _normalize_evaluation_protocol_arguments(self.arguments)
         self.arguments = _configure_classifier_arguments(self.arguments)
         self.arguments = validate_data_load_arguments(self.arguments)
         self._create_directories(base_directory=self.arguments.output_dir)

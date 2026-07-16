@@ -1,0 +1,38 @@
+{
+  "blocking": [],
+  "classification": "aprovado com ressalvas",
+  "non_blocking": [
+    {
+      "description": "Clean editable install initially failed because setuptools discovered non-package top-level directories in the flat layout.",
+      "id": "packaging-flat-layout",
+      "resolution": "Added explicit package discovery for Engine*, Tools*, and experiments* in pyproject.toml.",
+      "severity": "medium",
+      "status": "fixed_in_gate"
+    },
+    {
+      "description": "model_type=copy is not implemented for incremental synthetic generation in execution_mode=batches.",
+      "id": "copy-batches-incremental-unsupported",
+      "severity": "medium",
+      "status": "known_limitation",
+      "workaround": "Use execution_mode=normal for copy smoke tests, or use synthetic_control in batches."
+    },
+    {
+      "description": "Legacy CSV CLI rejects a column name for --data_load_label_column and accepts an integer index such as -1.",
+      "id": "csv-label-column-index-only",
+      "severity": "low",
+      "status": "known_legacy_behavior"
+    },
+    {
+      "description": "When passing raw AppClassNet top200 paths directly to main.py, --num_classes must match the raw domain before subset filtering. The wrapper materializes subset paths and passes the reduced domain safely.",
+      "id": "direct-raw-subset-num-classes",
+      "severity": "low",
+      "status": "known_usage_constraint"
+    },
+    {
+      "description": "Some audit helpers also write latest-run copies under results/appclassnet_top200/* while output-specific copies are preserved under each run directory.",
+      "id": "shared-results-audit-location",
+      "severity": "low",
+      "status": "watch"
+    }
+  ]
+}

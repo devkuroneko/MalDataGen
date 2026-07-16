@@ -10,7 +10,11 @@ adapting data into the existing MalDataGen fold contract.
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from dataclasses import dataclass, field
+import hashlib
+import json
+from pathlib import Path
 from typing import Any, Iterable
 
 try:
@@ -25,6 +29,7 @@ TARGET_TYPES = {"binary", "multiclass", "regression", "none", "auto"}
 SOURCE_FORMATS = {"csv", "npy_xy", "unknown"}
 SOURCE_PROFILES = {"legacy_csv", "appclassnet_top200", "custom", "unknown"}
 DATA_SPACES = {"source", "generator", "classifier", "unknown", "transformed"}
+APPCLASSNET_FEATURE_COUNT = 20
 
 
 def _validate_choice(value: str, allowed_values: set[str], field_name: str) -> str:
@@ -38,6 +43,28 @@ def _normalize_optional_labels(class_labels: Iterable[Any] | None) -> tuple[Any,
     if class_labels is None:
         return None
     return tuple(class_labels)
+
+
+def _schema_hash_payload(schema: "DatasetSchema") -> dict[str, Any]:
+    return {
+        "feature_names": list(schema.feature_names),
+        "num_features": len(schema.feature_names),
+        "feature_dtype": schema.feature_dtype,
+        "feature_type": schema.feature_type,
+        "target_type": schema.target_type,
+        "num_classes": schema.num_classes,
+        "class_labels": list(schema.class_labels) if schema.class_labels is not None else None,
+        "source_format": schema.source_format,
+        "source_profile": schema.source_profile,
+        "data_space": schema.data_space,
+        "transform_id": schema.transform_id,
+    }
+
+
+def compute_schema_hash(schema: "DatasetSchema") -> str:
+    payload = _schema_hash_payload(schema)
+    encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _shape_of(values):
@@ -149,6 +176,7 @@ class DatasetSchema:
     transform_id: str | None = None
     feature_dtype: str | None = None
     data_space: str = "unknown"
+    schema_hash: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.feature_names, list):
@@ -186,6 +214,9 @@ class DatasetSchema:
         elif self.num_classes is not None and (not isinstance(self.num_classes, int) or self.num_classes < 1):
             raise ValueError("num_classes must be a positive integer when provided.")
 
+        if self.schema_hash is None:
+            self.schema_hash = compute_schema_hash(self)
+
     @staticmethod
     def _normalize_range(value, field_name):
         if value is None:
@@ -196,15 +227,111 @@ class DatasetSchema:
 
 
 @dataclass(slots=True)
+class ClassMapping:
+    """Resolved original-to-local class mapping for an experiment subset."""
+
+    selected_original_classes: list[int]
+    original_to_local_mapping: dict[int, int] = field(init=False)
+    local_to_original_mapping: dict[int, int] = field(init=False)
+    effective_num_classes: int = field(init=False)
+    subset_id: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.selected_original_classes = [int(label) for label in self.selected_original_classes]
+        if not self.selected_original_classes:
+            raise ValueError("selected_original_classes must not be empty.")
+        if len(set(self.selected_original_classes)) != len(self.selected_original_classes):
+            raise ValueError("selected_original_classes contains duplicates.")
+        if any(label < 0 for label in self.selected_original_classes):
+            raise ValueError("selected_original_classes cannot contain negative labels.")
+        self.original_to_local_mapping = {
+            int(original): int(index)
+            for index, original in enumerate(self.selected_original_classes)
+        }
+        self.local_to_original_mapping = {
+            int(local): int(original)
+            for original, local in self.original_to_local_mapping.items()
+        }
+        self.effective_num_classes = len(self.selected_original_classes)
+        payload = {
+            "selected_original_classes": self.selected_original_classes,
+            "original_to_local_mapping": self.original_to_local_mapping,
+        }
+        encoded = json.dumps(payload, sort_keys=True).encode("utf-8")
+        self.subset_id = hashlib.sha256(encoded).hexdigest()[:16]
+
+    def to_json_dict(self) -> dict[str, Any]:
+        return {
+            "selected_original_classes": list(self.selected_original_classes),
+            "original_to_local_mapping": {
+                str(key): int(value)
+                for key, value in self.original_to_local_mapping.items()
+            },
+            "local_to_original_mapping": {
+                str(key): int(value)
+                for key, value in self.local_to_original_mapping.items()
+            },
+            "effective_num_classes": int(self.effective_num_classes),
+            "subset_id": self.subset_id,
+        }
+
+
+@dataclass(slots=True)
+class SubsetManifest:
+    """Manifest for a materialized class subset."""
+
+    subset_id: str
+    dataset_id: str
+    selected_original_classes: list[int]
+    original_to_local_mapping: dict[int, int]
+    local_to_original_mapping: dict[int, int]
+    effective_num_classes: int
+    schema_hash: str
+    data_space: str
+    transform_id: str | None
+    splits: dict[str, dict[str, Any]]
+
+    def to_json_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["original_to_local_mapping"] = {
+            str(key): int(value)
+            for key, value in self.original_to_local_mapping.items()
+        }
+        payload["local_to_original_mapping"] = {
+            str(key): int(value)
+            for key, value in self.local_to_original_mapping.items()
+        }
+        return payload
+
+    def save(self, path) -> Path:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as manifest_file:
+            json.dump(self.to_json_dict(), manifest_file, indent=2, sort_keys=True)
+            manifest_file.write("\n")
+        return path
+
+@dataclass(slots=True)
 class SplitData:
     """A named dataset split with explicit feature matrix and optional target."""
 
-    X: Any
+    X: Any | None = None
     y: Any | None = None
     name: str = "train"
+    reader: Any | None = None
+    y_reader: Any | None = None
     x_path: str | None = None
     y_path: str | None = None
+    validate_paths: bool = False
+    row_count: int | None = None
+    feature_count: int | None = None
     dataset_id: str | None = None
+    source_indices: Any | None = None
+    data_space: str = "source"
+    transform_id: str | None = None
+    schema_hash: str | None = None
+    subset_id: str | None = None
+    label_mapping: dict[Any, Any] | None = None
     num_samples: int = 0
     class_counts: dict[Any, int] = field(default_factory=dict)
     minimum_class_count: int | None = None
@@ -213,9 +340,27 @@ class SplitData:
         if not isinstance(self.name, str) or not self.name:
             raise ValueError("name must be a non-empty string.")
 
+        self.data_space = _validate_choice(self.data_space, DATA_SPACES, "data_space")
+
+        if self.X is None:
+            if self.reader is None:
+                raise ValueError("SplitData requires X or reader.")
+            self.X = self.reader
+
         self.X = numpy.asarray(self.X)
         if self.X.ndim != 2:
             raise ValueError(f"SplitData.X for split {self.name!r} must be 2D. Got shape {self.X.shape}.")
+
+        if self.source_indices is not None:
+            self.source_indices = numpy.asarray(self.source_indices, dtype=numpy.int64).reshape(-1)
+            if self.source_indices.shape[0] != self.X.shape[0]:
+                raise ValueError(
+                    f"SplitData source_indices for split {self.name!r} has {self.source_indices.shape[0]} rows; "
+                    f"expected {self.X.shape[0]}."
+                )
+
+        if self.y is None and self.y_reader is not None:
+            self.y = self.y_reader
 
         if self.y is None:
             self.refresh_metadata()
@@ -245,14 +390,16 @@ class SplitData:
 
     @property
     def num_rows(self) -> int:
-        return int(self.X.shape[0])
+        return int(self.row_count if self.row_count is not None else self.X.shape[0])
 
     @property
     def num_features(self) -> int:
-        return int(self.X.shape[1])
+        return int(self.feature_count if self.feature_count is not None else self.X.shape[1])
 
     def refresh_metadata(self) -> None:
-        self.num_samples = int(self.X.shape[0])
+        self.row_count = int(self.X.shape[0])
+        self.feature_count = int(self.X.shape[1])
+        self.num_samples = int(self.row_count)
         if self.y is None:
             self.class_counts = {}
             self.minimum_class_count = None
@@ -348,6 +495,7 @@ class DatasetBundle:
             if not isinstance(self.test, SplitData):
                 raise ValueError("test must be a SplitData instance when provided.")
             self._validate_split(self.test)
+        validate_dataset_bundle_integrity(self)
 
     def _validate_split(self, split: SplitData) -> None:
         if split.num_features != len(self.schema.feature_names):
@@ -396,3 +544,348 @@ class DatasetBundle:
         if self.test is not None:
             available_splits["test"] = self.test
         return available_splits
+
+
+def resolve_class_mapping(
+        class_subset: str | Iterable[int] | None = None,
+        num_classes_subset: int | None = None,
+        *,
+        total_num_classes: int | None = None) -> ClassMapping | None:
+    """Resolve CLI subset options before any data filtering occurs."""
+    if class_subset is not None and num_classes_subset is not None:
+        raise ValueError("Use either --class_subset or --num_classes_subset, not both.")
+    if class_subset is None and num_classes_subset is None:
+        return None
+    if class_subset is not None:
+        if isinstance(class_subset, str):
+            selected = [
+                int(value.strip())
+                for value in class_subset.replace(" ", ",").split(",")
+                if value.strip()
+            ]
+        else:
+            selected = [int(value) for value in class_subset]
+    else:
+        if int(num_classes_subset) <= 0:
+            raise ValueError("--num_classes_subset must be a positive integer.")
+        selected = list(range(int(num_classes_subset)))
+
+    if total_num_classes is not None:
+        outside = [label for label in selected if label >= int(total_num_classes)]
+        if outside:
+            raise ValueError(
+                f"Class subset contains labels outside configured class domain 0..{int(total_num_classes) - 1}: "
+                f"{outside}."
+            )
+    return ClassMapping(selected)
+
+
+def _path_shape(path, *, mmap_mode="r"):
+    values = numpy.load(path, mmap_mode=mmap_mode, allow_pickle=False)
+    return values.shape, values.dtype
+
+
+def _validate_split_paths(split: SplitData) -> None:
+    if split.x_path is None:
+        return
+    x_path = Path(split.x_path)
+    if not x_path.is_file():
+        if not split.validate_paths:
+            return
+        raise FileNotFoundError(f"Split {split.name!r} x_path does not exist: {x_path}")
+    x_shape, _ = _path_shape(x_path)
+    if tuple(x_shape) != tuple(split.X.shape):
+        raise ValueError(
+            f"Split {split.name!r} x_path shape mismatch: path has {tuple(x_shape)}, "
+            f"in-memory X has {tuple(split.X.shape)}."
+        )
+    if split.y_path is None:
+        return
+    y_path = Path(split.y_path)
+    if not y_path.is_file():
+        raise FileNotFoundError(f"Split {split.name!r} y_path does not exist: {y_path}")
+    y_shape, _ = _path_shape(y_path)
+    declared_y_shape = tuple(numpy.asarray(split.y).shape)
+    if tuple(y_shape) != declared_y_shape:
+        loaded_y = numpy.load(y_path, mmap_mode="r", allow_pickle=False)
+        if tuple(numpy.asarray(loaded_y).reshape(-1).shape) != declared_y_shape:
+            raise ValueError(
+                f"Split {split.name!r} y_path shape mismatch: path has {tuple(y_shape)}, "
+                f"in-memory y has {declared_y_shape}."
+            )
+
+
+def _validate_integer_label_range(split: SplitData, schema: DatasetSchema) -> None:
+    if split.y is None or schema.target_type != "multiclass":
+        return
+    labels = numpy.asarray(split.y)
+    if labels.size == 0:
+        raise ValueError(f"Split {split.name!r} has no labels.")
+    if schema.class_labels is not None:
+        valid_labels = set(schema.class_labels)
+        unknown_labels = set(labels.tolist()) - valid_labels
+        if unknown_labels:
+            raise ValueError(f"Split {split.name!r} contains labels outside class_labels: {unknown_labels}.")
+        return
+    try:
+        integer_labels = labels.astype(numpy.int64)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"Split {split.name!r} labels must be integer encoded.") from error
+    if not numpy.array_equal(labels, integer_labels):
+        raise ValueError(f"Split {split.name!r} labels must be integer encoded.")
+    if schema.num_classes is not None:
+        if int(integer_labels.min()) < 0 or int(integer_labels.max()) >= int(schema.num_classes):
+            raise ValueError(
+                f"Split {split.name!r} labels must be in [0, {int(schema.num_classes) - 1}]. "
+                f"Observed min={int(integer_labels.min())} max={int(integer_labels.max())}."
+            )
+
+
+def validate_dataset_bundle_integrity(bundle: DatasetBundle) -> None:
+    """Validate that arrays, paths, indices, labels, schema and spaces agree."""
+    expected_schema_hash = compute_schema_hash(bundle.schema)
+    if bundle.schema.schema_hash != expected_schema_hash:
+        raise ValueError("Dataset schema_hash is inconsistent with DatasetSchema contents.")
+
+    source_index_sets: dict[tuple[str | None, str | None], dict[str, set[int]]] = {}
+    for split in bundle.splits.values():
+        if bundle.schema.target_type == "none":
+            if split.X.ndim != 2:
+                raise ValueError(f"Split {split.name!r} X must be 2D.")
+        elif bundle.schema.class_labels is not None and not numpy.issubdtype(numpy.asarray(split.y).dtype, numpy.number):
+            split.X = numpy.asarray(split.X)
+            split.y = numpy.asarray(split.y).reshape(-1)
+            if split.X.ndim != 2:
+                raise ValueError(f"Split {split.name!r} X must be 2D.")
+            if split.X.shape[0] != split.y.shape[0]:
+                raise ValueError(
+                    f"Split {split.name!r} X/y row mismatch: X has {split.X.shape[0]} rows, "
+                    f"y has {split.y.shape[0]} rows."
+                )
+        else:
+            split.X, split.y = validate_xy_alignment(
+                split.X,
+                split.y,
+                "DatasetBundle integrity",
+                split=split.name,
+                source_indices=split.source_indices,
+            )
+        if split.num_features != len(bundle.schema.feature_names):
+            raise ValueError(
+                f"Split {split.name!r} feature_count={split.num_features} does not match schema "
+                f"feature count={len(bundle.schema.feature_names)}."
+            )
+        if (
+                bundle.schema.source_profile == "appclassnet_top200"
+                and (split.validate_paths or (split.x_path is not None and Path(split.x_path).is_file()))
+                and split.num_features != APPCLASSNET_FEATURE_COUNT):
+            raise ValueError(
+                f"Split {split.name!r} must have {APPCLASSNET_FEATURE_COUNT} AppClassNet features. "
+                f"Got {split.num_features}."
+            )
+        _validate_choice(split.data_space, DATA_SPACES, "data_space")
+        if split.schema_hash is None:
+            split.schema_hash = bundle.schema.schema_hash
+        if split.schema_hash != bundle.schema.schema_hash:
+            raise ValueError(
+                f"Split {split.name!r} schema_hash={split.schema_hash} does not match bundle "
+                f"schema_hash={bundle.schema.schema_hash}."
+            )
+        _validate_integer_label_range(split, bundle.schema)
+        _validate_split_paths(split)
+        if split.source_indices is None:
+            split.source_indices = numpy.arange(split.num_rows, dtype=numpy.int64)
+        if split.source_indices is not None:
+            indices = numpy.asarray(split.source_indices, dtype=numpy.int64).reshape(-1)
+            if indices.shape[0] != split.num_rows:
+                raise ValueError(f"Split {split.name!r} source_indices length does not match row_count.")
+            if indices.size and int(indices.min()) < 0:
+                raise ValueError(f"Split {split.name!r} source_indices contain negative values.")
+            limit = split.num_rows
+            if split.x_path is not None and Path(split.x_path).is_file():
+                path_shape, _ = _path_shape(Path(split.x_path))
+                limit = int(path_shape[0])
+            if indices.size and int(indices.max()) >= limit and split.subset_id is None:
+                raise ValueError(
+                    f"Split {split.name!r} source_indices contain values outside source row limit={limit}."
+                )
+            source_key = (split.dataset_id, None if split.subset_id else split.x_path)
+            source_index_sets.setdefault(source_key, {})[split.name] = set(int(value) for value in indices.tolist())
+
+    for source_key, split_sets in source_index_sets.items():
+        if source_key[1] is None:
+            continue
+        names = sorted(split_sets)
+        for left_index, left_name in enumerate(names):
+            for right_name in names[left_index + 1:]:
+                overlap = split_sets[left_name].intersection(split_sets[right_name])
+                if overlap:
+                    raise ValueError(
+                        f"Splits {left_name!r} and {right_name!r} share source_indices for source={source_key}: "
+                        f"{sorted(overlap)[:10]}."
+                    )
+
+
+def apply_class_subset_to_bundle(
+        bundle: DatasetBundle,
+        class_mapping: ClassMapping,
+        *,
+        materialize_dir: str | Path | None = None,
+        mmap_mode: str | None = "r") -> SubsetManifest | None:
+    """Apply a resolved class subset and optionally materialize new split files."""
+    split_entries = {}
+    if materialize_dir is not None:
+        materialize_dir = Path(materialize_dir) / class_mapping.subset_id
+        materialize_dir.mkdir(parents=True, exist_ok=True)
+
+    for split in bundle.splits.values():
+        labels = numpy.asarray(split.y, dtype=numpy.int64).reshape(-1)
+        original_indices = (
+            numpy.asarray(split.source_indices, dtype=numpy.int64).reshape(-1)
+            if split.source_indices is not None
+            else numpy.arange(labels.shape[0], dtype=numpy.int64)
+        )
+        mask = numpy.isin(labels, numpy.asarray(class_mapping.selected_original_classes, dtype=numpy.int64))
+        if not numpy.any(mask):
+            raise ValueError(f"class subset removed all rows from split {split.name!r}.")
+        selected_x = numpy.asarray(split.X[mask], dtype=numpy.float32)
+        selected_original_y = labels[mask]
+        selected_y = numpy.asarray(
+            [class_mapping.original_to_local_mapping[int(label)] for label in selected_original_y],
+            dtype=numpy.int64,
+        )
+        selected_source_indices = numpy.asarray(original_indices[mask], dtype=numpy.int64)
+
+        if materialize_dir is not None:
+            x_path = materialize_dir / f"{split.name}_x.npy"
+            y_path = materialize_dir / f"{split.name}_y.npy"
+            numpy.save(x_path, selected_x)
+            numpy.save(y_path, selected_y)
+            split.X = numpy.load(x_path, mmap_mode=mmap_mode, allow_pickle=False)
+            split.y = numpy.load(y_path, mmap_mode=mmap_mode, allow_pickle=False)
+            split.x_path = str(x_path)
+            split.y_path = str(y_path)
+        else:
+            split.X = selected_x
+            split.y = selected_y
+
+        split.source_indices = selected_source_indices
+        split.subset_id = class_mapping.subset_id
+        split.label_mapping = dict(class_mapping.original_to_local_mapping)
+        split.dataset_id = split.dataset_id or bundle.metadata.get("dataset_id")
+        split.refresh_metadata()
+
+        split_entries[split.name] = {
+            "x_path": split.x_path,
+            "y_path": split.y_path,
+            "row_count": int(split.row_count),
+            "feature_count": int(split.feature_count),
+            "class_counts": {str(key): int(value) for key, value in split.class_counts.items()},
+            "source_indices_min": int(selected_source_indices.min()) if selected_source_indices.size else None,
+            "source_indices_max": int(selected_source_indices.max()) if selected_source_indices.size else None,
+        }
+
+    bundle.schema.num_classes = int(class_mapping.effective_num_classes)
+    bundle.schema.class_labels = tuple(range(class_mapping.effective_num_classes))
+    bundle.schema.schema_hash = None
+    bundle.schema.schema_hash = compute_schema_hash(bundle.schema)
+    for split in bundle.splits.values():
+        split.schema_hash = bundle.schema.schema_hash
+        split.dataset_id = split.dataset_id or bundle.schema.source_profile
+
+    bundle.metadata["subset_id"] = class_mapping.subset_id
+    bundle.metadata["selected_original_classes"] = list(class_mapping.selected_original_classes)
+    bundle.metadata["original_to_local_mapping"] = {
+        str(key): int(value) for key, value in class_mapping.original_to_local_mapping.items()
+    }
+    bundle.metadata["local_to_original_mapping"] = {
+        str(key): int(value) for key, value in class_mapping.local_to_original_mapping.items()
+    }
+    bundle.metadata["effective_num_classes"] = int(class_mapping.effective_num_classes)
+
+    validate_dataset_bundle_integrity(bundle)
+
+    if materialize_dir is None:
+        return None
+
+    manifest = SubsetManifest(
+        subset_id=class_mapping.subset_id,
+        dataset_id=bundle.metadata.get("dataset_id", bundle.schema.source_profile),
+        selected_original_classes=list(class_mapping.selected_original_classes),
+        original_to_local_mapping=dict(class_mapping.original_to_local_mapping),
+        local_to_original_mapping=dict(class_mapping.local_to_original_mapping),
+        effective_num_classes=int(class_mapping.effective_num_classes),
+        schema_hash=bundle.schema.schema_hash,
+        data_space=bundle.schema.data_space,
+        transform_id=bundle.schema.transform_id,
+        splits=split_entries,
+    )
+    manifest.save(Path(materialize_dir) / "subset_manifest.json")
+    return manifest
+
+
+def materialize_npy_class_subset(
+        raw_root,
+        output_root,
+        class_mapping: ClassMapping,
+        *,
+        split_names: Iterable[str] = ("train", "valid", "test"),
+        dataset_id: str = "appclassnet_top200",
+        expected_num_features: int = APPCLASSNET_FEATURE_COUNT,
+        mmap_mode: str | None = "r") -> tuple[Path, Path]:
+    """Materialize train/valid/test .npy files for a class subset."""
+    raw_root = Path(raw_root)
+    output_root = Path(output_root)
+    subset_root = output_root / class_mapping.subset_id
+    manifest_path = subset_root / "subset_manifest.json"
+    expected_files = [
+        subset_root / f"{split_name}_{axis}.npy"
+        for split_name in split_names
+        for axis in ("x", "y")
+    ]
+    if manifest_path.is_file() and all(path.is_file() for path in expected_files):
+        return subset_root, manifest_path
+
+    feature_names = [f"f{index}" for index in range(expected_num_features)]
+    schema = DatasetSchema(
+        feature_names=feature_names,
+        feature_type="continuous",
+        target_name="label",
+        target_type="multiclass",
+        num_classes=200 if dataset_id == "appclassnet_top200" else None,
+        source_format="npy_xy",
+        source_profile=dataset_id if dataset_id in SOURCE_PROFILES else "custom",
+        source_feature_range=(-0.5, 0.5) if dataset_id == "appclassnet_top200" else None,
+        current_feature_range=(-0.5, 0.5) if dataset_id == "appclassnet_top200" else None,
+        already_normalized=dataset_id == "appclassnet_top200",
+        normalization_range=(-0.5, 0.5) if dataset_id == "appclassnet_top200" else None,
+        feature_dtype="float32",
+        data_space="source",
+    )
+    splits = {}
+    for split_name in split_names:
+        x_path = raw_root / f"{split_name}_x.npy"
+        y_path = raw_root / f"{split_name}_y.npy"
+        x_values = numpy.load(x_path, mmap_mode=mmap_mode, allow_pickle=False)
+        y_values = numpy.asarray(numpy.load(y_path, mmap_mode=mmap_mode, allow_pickle=False)).reshape(-1)
+        splits[split_name] = SplitData(
+            X=x_values,
+            y=y_values,
+            name=split_name,
+            x_path=str(x_path),
+            y_path=str(y_path),
+            validate_paths=True,
+            dataset_id=dataset_id,
+            source_indices=numpy.arange(y_values.shape[0], dtype=numpy.int64),
+            data_space="source",
+            schema_hash=schema.schema_hash,
+        )
+    bundle = DatasetBundle(
+        train=splits["train"],
+        valid=splits.get("valid"),
+        test=splits.get("test"),
+        schema=schema,
+        metadata={"dataset_id": dataset_id},
+    )
+    apply_class_subset_to_bundle(bundle, class_mapping, materialize_dir=output_root, mmap_mode=mmap_mode)
+    return subset_root, manifest_path

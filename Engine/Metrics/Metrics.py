@@ -238,6 +238,17 @@ class Metrics:
                    }
                } for classifier in self._classifier_list
            },
+           "TR+TS-TR": {
+               classifier: {
+                   **{
+                       f'{fold}-Fold': {metric: NOT_APPLICABLE for metric in self.list_classifier_metrics}
+                       for fold in range(1, arguments.number_k_folds + 1)
+                   },
+                   'Summary': {
+                       metric: {'mean': NOT_APPLICABLE, 'std': NOT_APPLICABLE} for metric in self.list_classifier_metrics
+                   }
+               } for classifier in self._classifier_list
+           },
 
             "DistanceMetrics": {
                 methodology: {
@@ -465,6 +476,7 @@ class Metrics:
 
     def monitoring_start_generating(self):
         self._time_start_generating = time.perf_counter_ns()
+        self._process_mem_start = get_current_memory_mb()
 
     def monitoring_stop_generating(self, fold):
         self._time_end_generating = time.perf_counter_ns()
@@ -603,8 +615,10 @@ class Metrics:
             - Modifies the dictionary in-place by adding mean/std values
         """
 
-        for methodology in ["TS-TR", "TR-TS", "TR-TR"]:
+        for methodology in ["TS-TR", "TR-TS", "TR-TR", "TR+TS-TR"]:
             for classifier in self._dictionary_classifiers_name:
+                if methodology not in self._dictionary_metrics or classifier not in self._dictionary_metrics[methodology]:
+                    continue
 
                 # Get the metrics data for current methodology and classifier
                 data = self._dictionary_metrics[methodology][classifier]
@@ -645,7 +659,7 @@ class Metrics:
 
     def mark_fold_not_applicable(self, fold, reason):
         """Mark unsupported evaluations explicitly instead of leaving fake zero metrics."""
-        for methodology in ["TS-TR", "TR-TS", "TR-TR"]:
+        for methodology in ["TS-TR", "TR-TS", "TR-TR", "TR+TS-TR"]:
             for classifier in self._dictionary_classifiers_name:
                 fold_key = f"{fold}-Fold"
                 if fold_key in self._dictionary_metrics[methodology][classifier]:

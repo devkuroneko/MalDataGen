@@ -34,6 +34,7 @@ __credits__ = ['Synthetic Ocean AI']
 
 try:
 
+    import json
     import sys
     import time
     from pathlib import Path
@@ -48,6 +49,8 @@ try:
     from Engine.DataIO.LabelUtils import build_class_metadata
     from Engine.DataIO.LabelUtils import validate_zero_based_labels
     from Engine.DataIO.DatasetContracts import validate_xy_alignment
+    from Engine.DataIO.DatasetContracts import apply_class_subset_to_bundle
+    from Engine.DataIO.DatasetContracts import resolve_class_mapping
     from Engine.DataIO.NpyXYLoader import NpyXYLoader
     from Engine.DataIO.StratifiedNpySelection import build_minimum_coverage_report
     from Engine.DataIO.StratifiedNpySelection import get_last_stratified_selection_report
@@ -221,6 +224,11 @@ def _apply_stratified_split_selection(owner, split, y_path, split_name, samples_
             "batches split before stratified selection",
             split=split_name,
         )
+        original_source_indices = (
+            numpy.asarray(split.source_indices, dtype=numpy.int64).reshape(-1)
+            if split.source_indices is not None
+            else numpy.arange(split.y.shape[0], dtype=numpy.int64)
+        )
         scanned_rows = int(selection_report.get("total_rows_scanned", -1))
         if scanned_rows != int(split.X.shape[0]):
             raise ValueError(
@@ -237,13 +245,14 @@ def _apply_stratified_split_selection(owner, split, y_path, split_name, samples_
                 )
         split.X = numpy.asarray(split.X[indices], dtype=numpy.float32)
         split.y = numpy.asarray(split.y[indices])
+        split.source_indices = numpy.asarray(original_source_indices[indices], dtype=numpy.int64)
         split.refresh_metadata()
         validate_xy_alignment(
             split.X,
             split.y,
             "batches split after stratified selection",
             split=split_name,
-            source_indices=indices,
+            source_indices=split.source_indices,
         )
         _log_array_memory(f"Limited {split_name} X", split.X)
         _log_array_memory(f"Limited {split_name} y", split.y)
@@ -336,6 +345,7 @@ def load_dataset_from_args(arguments, owner=None):
         return bundle
 
 def _apply_bundle_to_owner(owner, bundle):
+        _apply_class_subset(owner, bundle)
         owner._dataset_bundle = bundle
         owner._target_type = bundle.schema.target_type
         owner._data_type = bundle.schema.feature_type
@@ -371,6 +381,57 @@ def _apply_bundle_to_owner(owner, bundle):
         owner._number_samples_per_class = _number_samples_per_class_from_schema(bundle.schema, owner._data_loaded_labels)
         owner.arguments.number_samples_per_class = owner._number_samples_per_class
 
+def _parse_class_subset(arguments, bundle):
+        return resolve_class_mapping(
+            getattr(arguments, "class_subset", None),
+            getattr(arguments, "num_classes_subset", None),
+            total_num_classes=getattr(bundle.schema, "num_classes", None),
+        )
+
+def _apply_class_subset(owner, bundle):
+        class_mapping = _parse_class_subset(owner.arguments, bundle)
+        if class_mapping is None:
+            return
+
+        materialize_dir = None
+        if getattr(owner.arguments, "execution_mode", "normal") == "batches":
+            materialize_dir = APPCLASSNET_SELECTION_ROOT
+
+        manifest = apply_class_subset_to_bundle(
+            bundle,
+            class_mapping,
+            materialize_dir=materialize_dir,
+            mmap_mode=_mmap_mode_for_npy(owner.arguments) or "r",
+        )
+        owner.arguments.num_classes = class_mapping.effective_num_classes
+        for class_count_argument in (
+                "autoencoder_number_classes",
+                "variational_autoencoder_number_classes",
+                "wasserstein_number_classes",
+                "wasserstein_gp_number_classes",
+                "quantized_vae_number_classes"):
+            if hasattr(owner.arguments, class_count_argument):
+                setattr(owner.arguments, class_count_argument, class_mapping.effective_num_classes)
+        mapping_path = Path(owner.current_subdir) / "SelectionReports" / "class_subset_mapping.json"
+        mapping_path.parent.mkdir(parents=True, exist_ok=True)
+        mapping_path.write_text(
+            json.dumps({
+                "selected_original_classes": class_mapping.selected_original_classes,
+                "original_to_local_mapping": bundle.metadata["original_to_local_mapping"],
+                "local_to_original_mapping": bundle.metadata["local_to_original_mapping"],
+                "effective_num_classes": class_mapping.effective_num_classes,
+                "subset_id": class_mapping.subset_id,
+                "subset_manifest": None if manifest is None else str(Path(materialize_dir) / class_mapping.subset_id / "subset_manifest.json"),
+            }, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        logging.info(
+            "Applied class subset with %d classes subset_id=%s. Mapping saved to %s",
+            class_mapping.effective_num_classes,
+            class_mapping.subset_id,
+            mapping_path,
+        )
+
 def _number_samples_per_class_from_schema(schema, labels):
         metadata = build_class_metadata(labels, num_classes=schema.num_classes)
         if schema.num_classes is not None:
@@ -387,10 +448,18 @@ def _split_metadata(split):
             "x_path": split.x_path,
             "y_path": split.y_path,
             "dataset_id": split.dataset_id,
+            "subset_id": split.subset_id,
+            "row_count": split.row_count,
+            "feature_count": split.feature_count,
             "num_samples": split.num_samples,
             "class_counts": {str(key): int(value) for key, value in split.class_counts.items()},
             "minimum_class_count": split.minimum_class_count,
             "shape": list(split.X.shape),
+            "source_indices_min": int(numpy.min(split.source_indices)) if split.source_indices is not None and len(split.source_indices) else None,
+            "source_indices_max": int(numpy.max(split.source_indices)) if split.source_indices is not None and len(split.source_indices) else None,
+            "data_space": split.data_space,
+            "transform_id": split.transform_id,
+            "schema_hash": split.schema_hash,
         }
 
 def _create_fold(
@@ -414,8 +483,16 @@ def _create_fold(
             "fold evaluation",
             split=evaluation_source.name,
         )
-        train_source_indices = numpy.arange(train_y.shape[0], dtype=numpy.int64)
-        evaluation_source_indices = numpy.arange(evaluation_y.shape[0], dtype=numpy.int64)
+        train_source_indices = (
+            numpy.asarray(training_split.source_indices, dtype=numpy.int64).reshape(-1)
+            if training_split.source_indices is not None
+            else numpy.arange(train_y.shape[0], dtype=numpy.int64)
+        )
+        evaluation_source_indices = (
+            numpy.asarray(evaluation_source.source_indices, dtype=numpy.int64).reshape(-1)
+            if evaluation_source.source_indices is not None
+            else numpy.arange(evaluation_y.shape[0], dtype=numpy.int64)
+        )
         return {
             'x_training_real': numpy.asarray(train_x, dtype=numpy.float32),
             'y_training_real': validate_zero_based_labels(train_y, context=f"{training_split.name} y"),
@@ -457,7 +534,7 @@ def _mark_test_not_applicable(owner, reason):
         }
 
 def _build_provided_split_folds(owner, bundle):
-        evaluation_split = bundle.valid or bundle.test
+        evaluation_split = bundle.test or bundle.valid
         evaluation_name = None if evaluation_split is None else evaluation_split.name
         evaluation_not_applicable = bundle.test is None
 

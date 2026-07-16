@@ -195,6 +195,73 @@ def _fit_autoencode_with_one_hot(model, arguments, x_real_samples, y_real_sample
     )
 
 
+def _record_fit_history(owner, model_name, history, epochs, batch_size=None, callbacks=None, optimizer=None):
+    metrics = getattr(owner, "_dictionary_metrics", None)
+    if metrics is None:
+        return
+    history_dict = getattr(history, "history", {}) or {}
+    serializable_history = {}
+    for metric_name, values in history_dict.items():
+        serializable_history[metric_name] = [
+            float(value) if numpy.isscalar(value) else float(numpy.asarray(value).reshape(-1)[0])
+            for value in values
+        ]
+    block = metrics.setdefault("TrainingLosses", {})
+    fold_key = f"{getattr(owner, 'fold_number', 0) + 1}-Fold"
+    epochs_recorded = max((len(values) for values in serializable_history.values()), default=0)
+    loss_values = (
+        serializable_history.get("loss")
+        or serializable_history.get("total_loss")
+        or serializable_history.get("loss_g")
+        or []
+    )
+    best_epoch = None
+    if loss_values:
+        best_epoch = int(numpy.nanargmin(numpy.asarray(loss_values, dtype=numpy.float64)) + 1)
+    history_params = dict(getattr(history, "params", {}) or {})
+    steps = history_params.get("steps")
+    if steps is None:
+        steps = history_params.get("samples")
+        if steps is not None and batch_size:
+            steps = int(numpy.ceil(int(steps) / int(batch_size)))
+    updates = None if steps is None else int(steps) * int(epochs_recorded)
+    learning_rate = None
+    if optimizer is not None:
+        try:
+            learning_rate = float(keras.backend.get_value(optimizer.learning_rate))
+        except Exception:
+            learning_rate = None
+    early_stopping = None
+    if callbacks:
+        early_stopping = [
+            {
+                "class": callback.__class__.__name__,
+                "stopped_epoch": int(getattr(callback, "stopped_epoch", 0) or 0),
+                "best_epoch": int(getattr(callback, "best_epoch", 0) or 0) if hasattr(callback, "best_epoch") else None,
+            }
+            for callback in callbacks
+            if "Early" in callback.__class__.__name__
+        ]
+    block.setdefault(fold_key, {})[model_name] = {
+        "epochs_configured": int(epochs),
+        "epochs_recorded": epochs_recorded,
+        "training_reached_fit": bool(epochs_recorded > 0),
+        "best_epoch": best_epoch,
+        "learning_rate": learning_rate,
+        "batch_size": None if batch_size is None else int(batch_size),
+        "batches_per_epoch": None if steps is None else int(steps),
+        "updates": updates,
+        "early_stopping": early_stopping,
+        "loss_by_class": serializable_history.get("loss_by_class"),
+        "history": serializable_history,
+    }
+    arguments = getattr(owner, "arguments", None)
+    if arguments is not None:
+        existing = getattr(arguments, "_training_history", None) or {}
+        existing.setdefault(fold_key, {})[model_name] = block[fold_key][model_name]
+        setattr(arguments, "_training_history", existing)
+
+
 
 class AdversarialInstance:
     """
@@ -360,7 +427,7 @@ class AdversarialInstance:
             callbacks_list.append(self._callback_early_stop)
 
         # Fit the model with real samples and the corresponding labels
-        _fit_features_and_one_hot(
+        history = _fit_features_and_one_hot(
             self._adversarial_algorithm,
             arguments,
             x_real_samples,
@@ -370,6 +437,15 @@ class AdversarialInstance:
             epochs=self._adversarial_number_epochs,
             batch_size=self._adversarial_batch_size,
             callbacks=callbacks_list)
+        _record_fit_history(
+            self,
+            "adversarial",
+            history,
+            self._adversarial_number_epochs,
+            batch_size=self._adversarial_batch_size,
+            callbacks=callbacks_list,
+            optimizer=generator_optimizer,
+        )
 
 
     # Getter and setter for adversarial_number_epochs
@@ -2128,7 +2204,7 @@ class WassersteinInstance:
             callbacks_list.append(self._callback_early_stop)
 
         # Fit the WassersteinGP GAN model
-        _fit_features_and_one_hot(
+        history = _fit_features_and_one_hot(
             self._wasserstein_algorithm,
             arguments,
             x_real_samples,
@@ -2138,6 +2214,7 @@ class WassersteinInstance:
             epochs=self._wasserstein_number_epochs,
             batch_size=self._wasserstein_batch_size,
             callbacks=callbacks_list)
+        _record_fit_history(self, "wasserstein", history, self._wasserstein_number_epochs)
 
     # Getter and setter for wasserstein_latent_dimension
     @property
@@ -2567,7 +2644,7 @@ class WassersteinGPInstance:
             callbacks_list.append(self._callback_early_stop)
 
         # Fit the WassersteinGP GAN model
-        _fit_features_and_one_hot(
+        history = _fit_features_and_one_hot(
             self._wasserstein_gp_algorithm,
             arguments,
             x_real_samples,
@@ -2577,6 +2654,7 @@ class WassersteinGPInstance:
             epochs=self._wasserstein_gp_number_epochs,
             batch_size=self._wasserstein_gp_batch_size,
             callbacks=callbacks_list)
+        _record_fit_history(self, "wasserstein_gp", history, self._wasserstein_gp_number_epochs)
 
 
     # Getter and setter for wasserstein_latent_dimension
@@ -2975,7 +3053,7 @@ class VariationalAutoencoderInstance:
             callbacks_list.append(self._callback_early_stop)
 
         # Fit the variational autoencoder model
-        _fit_autoencode_with_one_hot(
+        history = _fit_autoencode_with_one_hot(
             self._variational_algorithm,
             arguments,
             x_real_samples,
@@ -2985,6 +3063,15 @@ class VariationalAutoencoderInstance:
             epochs=self._variational_autoencoder_number_epochs,
             batch_size=self._variational_autoencoder_batch_size,
             callbacks=callbacks_list)
+        _record_fit_history(
+            self,
+            "variational",
+            history,
+            self._variational_autoencoder_number_epochs,
+            batch_size=self._variational_autoencoder_batch_size,
+            callbacks=callbacks_list,
+            optimizer=variational_optimizer,
+        )
 
 
     # Getter and setter for variational_autoencoder_latent_dimension

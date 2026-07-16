@@ -21,6 +21,9 @@ class SyntheticBatchIOTest(unittest.TestCase):
                 model_name="variational",
                 execution_mode="batches",
                 output_format="npy_batches",
+                feature_names=["a", "b", "c"],
+                feature_dtype="float32",
+                schema_hash="abc123",
             )
             writer.write_batch(0, 0, numpy.ones((2, 3), dtype=numpy.float32))
             writer.write_batch(0, 1, numpy.full((1, 3), 2, dtype=numpy.float32))
@@ -37,6 +40,9 @@ class SyntheticBatchIOTest(unittest.TestCase):
             self.assertEqual(manifest["features"], 3)
             self.assertEqual(manifest["model"], "variational")
             self.assertEqual(manifest["execution_mode"], "batches")
+            self.assertEqual(manifest["feature_order"], ["a", "b", "c"])
+            self.assertEqual(manifest["feature_dtype"], "float32")
+            self.assertEqual(manifest["schema_hash"], "abc123")
             self.assertEqual(len(manifest["batches_by_class"]["0"]), 2)
             self.assertEqual(manifest["batches_by_class"]["199"][0]["shape"], [2, 3])
 
@@ -69,4 +75,3 @@ class SyntheticBatchIOTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -190,7 +190,8 @@ def validate_synthetic_batches_for_evaluation(
         expected_num_classes=None,
         samples_per_class=None,
         expected_num_features=None,
-        expected_data_space="source"):
+        expected_data_space="source",
+        expected_schema_hash=None):
     if synthetic_data is None:
         raise ValueError(f"{context} requires synthetic data.")
 
@@ -206,6 +207,12 @@ def validate_synthetic_batches_for_evaluation(
                 f"{context} synthetic manifest num_classes={manifest.get('num_classes')} "
                 f"does not match expected {expected_num_classes}."
             )
+        synthetic_schema_hash = manifest.get("schema_hash")
+        if expected_schema_hash is not None and synthetic_schema_hash is not None:
+            if synthetic_schema_hash != expected_schema_hash:
+                raise ValueError(
+                    f"{context} schema hash mismatch: real={expected_schema_hash} synthetic={synthetic_schema_hash}."
+                )
 
     counts = {}
     feature_count = expected_num_features
@@ -304,6 +311,7 @@ def _collect_stratified_subset(train_batches, arguments, num_classes):
 
 
 def train_batch_classifier(classifier_key, train_batches, num_classes, arguments, batch_recorder=None):
+    requested_classifier_key = classifier_key
     if classifier_key == "random_forest_subset":
         classifier_key = "random_forest_light"
     classifier = make_batch_classifier(classifier_key, arguments)
@@ -351,8 +359,11 @@ def train_batch_classifier(classifier_key, train_batches, num_classes, arguments
 
     train_time_seconds = time.perf_counter() - start_time
     return classifier, {
+        "requested_classifier": requested_classifier_key,
+        "effective_classifier": classifier_key,
         "batch_classifier": classifier_key,
         "eval_classifier": classifier_key,
+        "random_state": _random_state(arguments),
         "classifier_name": get_batch_classifier_display_name(classifier_key),
         "used_partial_fit": uses_partial_fit,
         "partial_fit": uses_partial_fit,
@@ -367,6 +378,11 @@ def train_batch_classifier(classifier_key, train_batches, num_classes, arguments
         "train_batch_count": int(train_batches_seen),
         "train_samples_seen": int(train_samples_seen),
         "total_samples_seen": int(train_samples_seen),
+        "effective_fit_rows": int(train_samples_seen) if uses_partial_fit else int(largest_batch_processed),
+        "fit_rows_input": int(train_samples_seen),
+        "discarded_rows": 0 if uses_partial_fit else max(0, int(train_samples_seen) - int(largest_batch_processed)),
+        "discarded_rows_for_fit": False if uses_partial_fit else int(train_samples_seen) > int(largest_batch_processed),
+        "global_limit": int(getattr(arguments, "batch_classifier_subset_size", 100000)),
         "largest_batch_processed": int(largest_batch_processed),
         "training_time_seconds": float(train_time_seconds),
         "training_time": float(train_time_seconds),

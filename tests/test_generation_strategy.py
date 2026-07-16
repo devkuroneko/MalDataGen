@@ -53,6 +53,22 @@ class GenerationStrategyTest(unittest.TestCase):
             ],
         )
 
+    def test_split_generation_plan_preserves_effective_classes(self):
+        instance = _strategy_instance(strategy="single_conditional")
+
+        split_plan = instance._generation_metadata_for_split(
+            {
+                "classes": {0: 4, 2: 4},
+                "number_classes": 3,
+                "generation_batch_size": 16,
+            },
+            samples_per_class=2,
+            split_name="train",
+        )
+
+        self.assertEqual(split_plan["classes"], {0: 2, 2: 2})
+        self.assertNotIn(1, split_plan["classes"])
+
     def test_invalid_classes_per_group_fails_fast(self):
         instance = _strategy_instance(strategy="grouped_classes", classes_per_group=0)
 

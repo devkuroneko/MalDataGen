@@ -28,8 +28,18 @@ class SyntheticBatchWriter:
             data_space="source",
             transform_id=None,
             transform_history=None,
+            feature_names=None,
+            feature_dtype=None,
+            schema_hash=None,
             split_name=None,
-            fold_number=None):
+            fold_number=None,
+            requested_classes=None,
+            generation_plan=None,
+            label_mapping=None,
+            batch_sizes=None,
+            training=None,
+            code_version=None,
+            data_hashes=None):
         self.root_dir = Path(root_dir)
         self.num_classes = int(num_classes)
         self.num_features = int(num_features)
@@ -40,8 +50,18 @@ class SyntheticBatchWriter:
         self.data_space = data_space
         self.transform_id = transform_id
         self.transform_history = list(transform_history or [])
+        self.feature_names = list(feature_names or [f"f{index}" for index in range(self.num_features)])
+        self.feature_dtype = str(feature_dtype) if feature_dtype is not None else None
+        self.schema_hash = schema_hash
         self.split_name = split_name
         self.fold_number = fold_number
+        self.requested_classes = None if requested_classes is None else [int(label) for label in requested_classes]
+        self.generation_plan = dict(generation_plan or {})
+        self.label_mapping = label_mapping
+        self.batch_sizes = dict(batch_sizes or {})
+        self.training = training
+        self.code_version = code_version
+        self.data_hashes = dict(data_hashes or {})
         self.batch_dir = self.root_dir / "synthetic_batches"
         if self.split_name:
             self.batch_dir = self.batch_dir / str(self.split_name)
@@ -62,8 +82,19 @@ class SyntheticBatchWriter:
             "data_space": self.data_space,
             "transform_id": self.transform_id,
             "transform_history": self.transform_history,
+            "feature_names": self.feature_names,
+            "feature_order": self.feature_names,
+            "feature_dtype": self.feature_dtype,
+            "schema_hash": self.schema_hash,
             "split": self.split_name,
             "fold": self.fold_number,
+            "requested_classes": self.requested_classes,
+            "generation_plan": self.generation_plan,
+            "label_mapping": self.label_mapping,
+            "batch_sizes": self.batch_sizes,
+            "training": self.training,
+            "code_version": self.code_version,
+            "data_hashes": self.data_hashes,
         }
 
     def initialize_single_npy(self, total_rows, dtype=numpy.float32):
