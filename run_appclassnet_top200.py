@@ -19,6 +19,7 @@ import numbers
 import shlex
 import subprocess
 import sys
+import time
 import warnings
 from dataclasses import asdict
 from dataclasses import dataclass
@@ -30,6 +31,7 @@ from Engine.Preprocessing.FeatureTransformManager import FeatureTransformManager
 from Engine.Preprocessing.FeatureTransformManager import FeatureTransformPolicy
 from Engine.Preprocessing.FeatureTransformManager import TransformManifest
 from Engine.DataIO.RealClassCountPolicy import select_stratified_indices_from_labels
+from Engine.DataIO.RealClassCountPolicy import build_split_sample_plan
 from Engine.DataIO.RealClassCountPolicy import validate_real_class_count_policy
 from Engine.DataIO.RealClassCountPolicy import validate_samples_per_class_scope
 from Engine.DataIO.DatasetContracts import materialize_npy_class_subset
@@ -39,11 +41,16 @@ from Engine.DataIO.JsonIO import ResultArtifactMissingError
 from Engine.DataIO.JsonIO import ResultSchemaValidationError
 from Engine.DataIO.JsonIO import atomic_write_json
 from Engine.DataIO.JsonIO import load_json_file
+from Engine.DataIO.NpyXYLoader import NpyXYLoader
 from Engine.Evaluation.ExperimentProtocol import EVALUATION_PROTOCOL_CHOICES
 from Engine.Evaluation.ExperimentProtocol import is_canonical_protocol_selector
 from Engine.Evaluation.ExperimentProtocol import normalize_protocol_selector
 from Engine.Evaluation.ExperimentProtocol import normalize_results_keys
 from Engine.Evaluation.ExperimentProtocol import resolve_evaluation_protocol_plan
+from Engine.Evaluation.TrTrPipeline import build_tr_tr_classifier
+from Engine.Evaluation.TrTrPipeline import result_to_legacy_baseline_metrics
+from Engine.Evaluation.TrTrPipeline import run_tr_tr_pipeline
+from Engine.Evaluation.TrTrPipeline import tr_tr_config_from_namespace
 
 
 DEFAULT_VERBOSITY_LEVEL = logging.INFO
@@ -1191,6 +1198,30 @@ def effective_evaluation_mode(parsed_arguments) -> str:
 
 
 def normalize_classifier_arguments(parsed_arguments):
+    classifier = getattr(parsed_arguments, "classifier", None)
+    baseline_classifier = getattr(parsed_arguments, "baseline_classifier", None)
+    if classifier is not None:
+        if (
+                _argument_was_explicit(parsed_arguments, "classifier")
+                and _argument_was_explicit(parsed_arguments, "baseline_classifier")
+                and baseline_classifier is not None
+                and classifier != baseline_classifier
+        ):
+            raise ValueError(
+                "ConflictingClassifierArguments: --classifier and deprecated --baseline_classifier "
+                f"resolve to different values ({classifier!r} != {baseline_classifier!r})."
+            )
+        parsed_arguments.baseline_classifier = classifier
+    elif _argument_was_explicit(parsed_arguments, "baseline_classifier"):
+        warnings.warn(
+            "--baseline_classifier is deprecated for TR-TR; use --classifier.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        parsed_arguments.classifier = baseline_classifier
+    else:
+        parsed_arguments.classifier = baseline_classifier
+
     batch_classifier = getattr(parsed_arguments, "batch_classifier", None)
     eval_classifier = getattr(parsed_arguments, "eval_classifier", None)
     if batch_classifier:
@@ -1214,7 +1245,157 @@ def normalize_classifier_arguments(parsed_arguments):
     parsed_arguments.batch_classifier = parsed_arguments.eval_classifier
     parsed_arguments.requested_classifier = batch_classifier or parsed_arguments.eval_classifier
     parsed_arguments.effective_classifier = parsed_arguments.eval_classifier
+    if getattr(parsed_arguments, "pipeline_effective", None) == "tr_tr":
+        parsed_arguments.requested_classifier = parsed_arguments.classifier
+        parsed_arguments.effective_classifier = parsed_arguments.classifier
     return parsed_arguments
+
+
+def validate_tr_tr_cli_arguments(parsed_arguments):
+    if getattr(parsed_arguments, "pipeline_effective", None) != "tr_tr":
+        return
+    if getattr(parsed_arguments, "source_profile", None) == "appclassnet_top200":
+        if getattr(parsed_arguments, "data_format", None) != "npy_xy":
+            raise ValueError("TR-TR AppClassNet requires --data_format npy_xy.")
+        if getattr(parsed_arguments, "split_mode", None) != "provided":
+            raise ValueError("TR-TR AppClassNet requires --split_mode provided.")
+    classifier = getattr(parsed_arguments, "baseline_classifier", None)
+    if classifier not in {"decision_tree", "random_forest"}:
+        raise ValueError(
+            "TR-TR requires --classifier decision_tree or --classifier random_forest. "
+            f"Got {classifier!r}."
+        )
+    if int(getattr(parsed_arguments, "eval_batch_size", 0) or 0) <= 0:
+        raise ValueError("--eval_batch_size must be a positive integer for TR-TR.")
+    for field_name in ("train_sampling", "test_sampling"):
+        strategy = getattr(parsed_arguments, field_name, None)
+        samples_field = field_name.replace("_sampling", "_samples_per_class")
+        if strategy in {"balanced_per_class", "up_to_available"} and getattr(parsed_arguments, samples_field, None) is None:
+            raise ValueError(f"--{samples_field} is required when --{field_name} {strategy}.")
+    if getattr(parsed_arguments, "source_profile", None) == "appclassnet_top200":
+        if getattr(parsed_arguments, "feature_transform", None) != "preserve":
+            raise ValueError("TR-TR AppClassNet defaults to and requires --feature_transform preserve.")
+        if getattr(parsed_arguments, "classifier_transform", None) != "preserve":
+            raise ValueError("TR-TR AppClassNet defaults to and requires --classifier_transform preserve.")
+        if _argument_was_explicit(parsed_arguments, "pipeline") and getattr(parsed_arguments, "generator_transform", None) != "preserve":
+            raise ValueError("TR-TR AppClassNet requires --generator_transform preserve.")
+        if getattr(parsed_arguments, "evaluation_space", None) != "source":
+            raise ValueError("TR-TR AppClassNet requires --evaluation_space source.")
+
+
+def normalize_explicit_tr_tr_sampling(parsed_arguments):
+    if getattr(parsed_arguments, "pipeline_effective", None) != "tr_tr":
+        return parsed_arguments
+    if not _argument_was_explicit(parsed_arguments, "pipeline"):
+        return parsed_arguments
+    if not _argument_was_explicit(parsed_arguments, "train_sampling"):
+        parsed_arguments.train_sampling = "all"
+        if not _argument_was_explicit(parsed_arguments, "train_samples_per_class"):
+            parsed_arguments.train_samples_per_class = None
+    if not _argument_was_explicit(parsed_arguments, "test_sampling"):
+        parsed_arguments.test_sampling = "all"
+        if not _argument_was_explicit(parsed_arguments, "test_samples_per_class"):
+            parsed_arguments.test_samples_per_class = None
+    if not _argument_was_explicit(parsed_arguments, "generator_transform"):
+        parsed_arguments.generator_transform = "preserve"
+    return parsed_arguments
+
+
+def warn_deprecated_tr_tr_aliases(parsed_arguments):
+    if getattr(parsed_arguments, "pipeline_effective", None) != "tr_tr":
+        return
+    deprecated_aliases = {
+        "baseline_classifier": "--baseline_classifier is deprecated for TR-TR; use --classifier.",
+        "decision_tree_criterion": "--decision_tree_criterion is deprecated for TR-TR; use --dt_criterion.",
+        "decision_tree_splitter": "--decision_tree_splitter is deprecated for TR-TR; use --dt_splitter.",
+        "decision_tree_max_depth": "--decision_tree_max_depth is deprecated for TR-TR; use --dt_max_depth.",
+        "decision_tree_min_samples_split": "--decision_tree_min_samples_split is deprecated for TR-TR; use --dt_min_samples_split.",
+        "decision_tree_min_samples_leaf": "--decision_tree_min_samples_leaf is deprecated for TR-TR; use --dt_min_samples_leaf.",
+        "decision_tree_max_features": "--decision_tree_max_features is deprecated for TR-TR; use --dt_max_features.",
+        "decision_tree_class_weight": "--decision_tree_class_weight is deprecated for TR-TR; use --dt_class_weight.",
+        "random_forest_criterion": "--random_forest_criterion is deprecated for TR-TR; use --rf_criterion.",
+        "random_forest_max_depth": "--random_forest_max_depth is deprecated for TR-TR; use --rf_max_depth.",
+        "random_forest_min_samples_split": "--random_forest_min_samples_split is deprecated for TR-TR; use --rf_min_samples_split.",
+        "random_forest_min_samples_leaf": "--random_forest_min_samples_leaf is deprecated for TR-TR; use --rf_min_samples_leaf.",
+        "random_forest_max_features": "--random_forest_max_features is deprecated for TR-TR; use --rf_max_features.",
+        "random_forest_bootstrap": "--random_forest_bootstrap is deprecated for TR-TR; use --rf_bootstrap.",
+        "random_forest_class_weight": "--random_forest_class_weight is deprecated for TR-TR; use --rf_class_weight.",
+        "random_forest_n_jobs": "--random_forest_n_jobs is deprecated for TR-TR; use --rf_n_jobs.",
+    }
+    raw_args = set(getattr(parsed_arguments, "_raw_cli_options", set()))
+    for parameter, message in deprecated_aliases.items():
+        old_option = "--" + parameter
+        if old_option in raw_args:
+            warnings.warn(message, DeprecationWarning, stacklevel=2)
+
+
+def print_resolved_tr_tr_config(parsed_arguments, raw_root, output_dir):
+    if getattr(parsed_arguments, "pipeline_effective", None) != "tr_tr":
+        return
+    payload = {
+        "dataset": {
+            "source_profile": parsed_arguments.source_profile,
+            "data_format": parsed_arguments.data_format,
+            "raw_root": str(raw_root),
+        },
+        "protocol": "TR-TR",
+        "splits": {
+            "split_mode": parsed_arguments.split_mode,
+            "train": "train_x.npy/train_y.npy",
+            "valid": "valid_x.npy/valid_y.npy",
+            "test": "test_x.npy/test_y.npy",
+        },
+        "transformations": {
+            "feature_transform": parsed_arguments.feature_transform,
+            "classifier_transform": parsed_arguments.classifier_transform,
+            "generator_transform": parsed_arguments.generator_transform,
+            "evaluation_space": parsed_arguments.evaluation_space,
+        },
+        "model": {
+            "classifier": parsed_arguments.baseline_classifier,
+            "dt": {
+                "criterion": parsed_arguments.decision_tree_criterion,
+                "splitter": parsed_arguments.decision_tree_splitter,
+                "max_depth": parsed_arguments.decision_tree_max_depth,
+                "min_samples_split": parsed_arguments.decision_tree_min_samples_split,
+                "min_samples_leaf": parsed_arguments.decision_tree_min_samples_leaf,
+                "max_features": parsed_arguments.decision_tree_max_features,
+                "class_weight": parsed_arguments.decision_tree_class_weight,
+            },
+            "rf": {
+                "n_estimators": parsed_arguments.n_estimators,
+                "criterion": parsed_arguments.random_forest_criterion,
+                "max_depth": parsed_arguments.random_forest_max_depth,
+                "min_samples_split": parsed_arguments.random_forest_min_samples_split,
+                "min_samples_leaf": parsed_arguments.random_forest_min_samples_leaf,
+                "max_features": parsed_arguments.random_forest_max_features,
+                "bootstrap": parsed_arguments.random_forest_bootstrap,
+                "class_weight": parsed_arguments.random_forest_class_weight,
+                "n_jobs": parsed_arguments.random_forest_n_jobs,
+            },
+        },
+        "sampling": {
+            "train_sampling": parsed_arguments.train_sampling,
+            "train_samples_per_class": parsed_arguments.train_samples_per_class,
+            "test_sampling": parsed_arguments.test_sampling,
+            "test_samples_per_class": parsed_arguments.test_samples_per_class,
+            "real_class_count_policy": parsed_arguments.real_class_count_policy,
+        },
+        "seed": parsed_arguments.random_state,
+        "mmap": {
+            "use_mmap": parsed_arguments.use_mmap,
+            "mmap_npy": getattr(parsed_arguments, "mmap_npy", False),
+        },
+        "batch_sizes": {
+            "batch_size": parsed_arguments.batch_size,
+            "eval_batch_size": parsed_arguments.eval_batch_size,
+        },
+        "output_dir": str(output_dir),
+    }
+    text = json.dumps(payload, indent=2, sort_keys=True)
+    print("Resolved TR-TR configuration:")
+    print(text)
+    logging.info("Resolved TR-TR configuration: %s", json.dumps(payload, sort_keys=True))
 
 
 def normalize_preprocessing_arguments(parsed_arguments, campaigns_chosen):
@@ -1373,15 +1554,26 @@ def select_stratified_indices(
     samples_per_class = _validate_samples_per_class(samples_per_class, f"{split_name}_samples_per_class")
     policy = validate_real_class_count_policy(real_class_count_policy)
     scope = validate_samples_per_class_scope(samples_per_class_scope)
-    selected_indices, report, short_classes = select_stratified_indices_from_labels(
+    strategy = "all" if samples_per_class is None else (
+        "up_to_available" if policy == "available_cap" else "balanced_per_class"
+    )
+    plan = build_split_sample_plan(
         labels,
         samples_per_class,
         num_classes,
         seed,
         split_name,
-        policy,
+        strategy=strategy,
+        insufficient_policy=policy,
+        replacement=False,
         require_all_classes=True,
     )
+    selected_indices = plan.selected_indices
+    report = plan.metadata
+    short_classes = {
+        int(key): int(value)
+        for key, value in report.get("classes_below_requested", {}).items()
+    }
     logging.info(
         "Real class count policy: real_%s_split=%s requested_samples_per_class=%s "
         "minimum_available_per_class=%s effective_samples_per_class=%s "
@@ -1394,10 +1586,26 @@ def select_stratified_indices(
         policy,
         scope,
     )
+    if selected_indices is not None:
+        split_size = int(numpy.asarray(labels).reshape(-1).shape[0])
+        if selected_indices.size and int(selected_indices.max()) >= split_size:
+            raise IndexError(
+                f"{split_name} sample plan produced index {int(selected_indices.max())} "
+                f"for split size {split_size} before row materialization."
+            )
     return selected_indices, report["selected_counts_by_class"], short_classes
 
 
 def load_selected_rows(numpy, x_values, y_values, indices, seed):
+    if indices is None:
+        return x_values, y_values
+    if indices.size:
+        max_index = int(indices.max())
+        if max_index >= int(x_values.shape[0]) or max_index >= int(y_values.shape[0]):
+            raise IndexError(
+                f"Selected index {max_index} is out of bounds for X rows={int(x_values.shape[0])} "
+                f"and y rows={int(y_values.shape[0])}."
+            )
     order = numpy.argsort(indices)
     sorted_indices = indices[order]
     x_selected = numpy.asarray(x_values[sorted_indices], dtype=numpy.float32)
@@ -1409,9 +1617,7 @@ def load_selected_rows(numpy, x_values, y_values, indices, seed):
 def build_baseline_classifier(parsed_arguments):
     try:
         from sklearn.ensemble import ExtraTreesClassifier
-        from sklearn.ensemble import RandomForestClassifier
         from sklearn.linear_model import SGDClassifier
-        from sklearn.tree import DecisionTreeClassifier
     except ImportError as error:
         raise RuntimeError("scikit-learn is required for --baseline_real_only.") from error
 
@@ -1421,19 +1627,11 @@ def build_baseline_classifier(parsed_arguments):
     if parsed_arguments.max_depth is not None and parsed_arguments.max_depth <= 0:
         raise ValueError("--max_depth must be a positive integer when provided.")
 
-    if classifier_name == "decision_tree":
-        return DecisionTreeClassifier(random_state=0)
+    if classifier_name in {"decision_tree", "random_forest", "random_forest_light"}:
+        return build_tr_tr_classifier(tr_tr_config_from_namespace(parsed_arguments))
     if classifier_name == "extra_trees":
         n_estimators = parsed_arguments.n_estimators or 50
         return ExtraTreesClassifier(n_estimators=n_estimators, random_state=0, n_jobs=-1)
-    if classifier_name == "random_forest_light":
-        n_estimators = parsed_arguments.n_estimators or 30
-        return RandomForestClassifier(
-            n_estimators=n_estimators,
-            max_depth=parsed_arguments.max_depth,
-            random_state=0,
-            n_jobs=-1,
-        )
     if classifier_name == "sgd":
         return SGDClassifier(random_state=0)
     raise ValueError(f"Unsupported baseline classifier: {classifier_name}")
@@ -1455,7 +1653,7 @@ def _feature_min_max(numpy, values, chunk_size):
 def _iter_x_batches(numpy, x_values, chunk_size):
     for start in range(0, x_values.shape[0], chunk_size):
         end = min(start + chunk_size, x_values.shape[0])
-        yield numpy.asarray(x_values[start:end], dtype=numpy.float32)
+        yield numpy.asanyarray(x_values[start:end])
 
 
 def _write_transformed_split(numpy, manager, x_values, y_values, output_x_path, output_y_path, chunk_size, split_name):
@@ -1523,9 +1721,122 @@ def preprocess_appclassnet_splits(parsed_arguments, raw_root, mode_name):
     manager = FeatureTransformManager(policy, stage="feature", output_space="transformed")
     manager.partial_fit_batches(_iter_x_batches(numpy, train_x_values, chunk_size), split_name="train")
     train_feature_min, train_feature_max = _feature_min_max(numpy, train_x_values, chunk_size)
+    train_source_min = float(numpy.nanmin(train_feature_min)) if train_feature_min is not None else None
+    train_source_max = float(numpy.nanmax(train_feature_max)) if train_feature_max is not None else None
 
     scaler_path = preprocessing_dir / "scaler.joblib"
     manager.save(scaler_path)
+
+    operation = manager.operation
+    transform_fitted = manager.scaler is not None
+    transform_parameters = {}
+    if manager.scaler is not None:
+        for attribute in ("data_min_", "data_max_", "mean_", "scale_", "var_"):
+            if hasattr(manager.scaler, attribute):
+                transform_parameters[attribute] = _json_list(getattr(manager.scaler, attribute))
+
+    if operation == "preserve":
+        preprocessing_report = {
+            "scaler": parsed_arguments.scaler,
+            "source_profile": policy.source_profile,
+            "feature_transform": policy.feature_transform,
+            "generator_transform": policy.generator_transform,
+            "classifier_transform": policy.classifier_transform,
+            "evaluation_space": policy.evaluation_space,
+            "source_min": train_source_min,
+            "source_max": train_source_max,
+            "transformed_min": train_source_min,
+            "transformed_max": train_source_max,
+            "transform_fitted": False,
+            "transform_parameters": {},
+            "transform_applied": False,
+            "transform_id": manager.transform_id,
+            "mode": mode_name,
+            "fit_split": "train",
+            "scaler_path": str(scaler_path),
+            "scaled_root": str(raw_root),
+            "splits": {
+                split_name: {
+                    "x_path": str(validate_raw_split(raw_root, split_name)[0]),
+                    "y_path": str(validate_raw_split(raw_root, split_name)[1]),
+                    "shape": list(numpy.load(
+                        validate_raw_split(raw_root, split_name)[0],
+                        mmap_mode=mmap_mode,
+                        allow_pickle=False,
+                    ).shape),
+                    "transform_applied": False,
+                }
+                for split_name in APPCLASSNET_SPLITS
+            },
+        }
+        preprocessing_report["feature_min_before_scaling"] = _json_list(train_feature_min)
+        preprocessing_report["feature_max_before_scaling"] = _json_list(train_feature_max)
+        preprocessing_report["feature_min_after_scaling"] = _json_list(train_feature_min)
+        preprocessing_report["feature_max_after_scaling"] = _json_list(train_feature_max)
+        report_path = preprocessing_dir / "preprocessing_stats.json"
+        atomic_write_json(preprocessing_report, report_path)
+
+        manifest = TransformManifest(
+            source_profile=policy.source_profile,
+            feature_transform=policy.feature_transform,
+            generator_transform=policy.generator_transform,
+            classifier_transform=policy.classifier_transform,
+            paths={
+                "raw_root": str(raw_root),
+                "preprocessed_root": str(raw_root),
+                "scaler_path": str(scaler_path),
+                "stats_path": str(report_path),
+            },
+            original_ranges={
+                "train": [_json_list(train_feature_min), _json_list(train_feature_max)],
+            },
+            current_ranges={
+                "train": [_json_list(train_feature_min), _json_list(train_feature_max)],
+            },
+            transformations=[],
+            transform_id=None,
+            source_min=train_source_min,
+            source_max=train_source_max,
+            transformed_min=train_source_min,
+            transformed_max=train_source_max,
+            transform_fitted=False,
+            transform_parameters={},
+            train_fit={
+                "fit_split": "train",
+                "operation": manager.operation,
+                "input_range": manager.input_range,
+                "output_range": manager.output_range,
+            },
+            split_usage={
+                split_name: {
+                    "x_path": preprocessing_report["splits"][split_name]["x_path"],
+                    "y_path": preprocessing_report["splits"][split_name]["y_path"],
+                    "used_scaler_fit_split": None,
+                    "transform_id": None,
+                    "transform_applied": False,
+                }
+                for split_name in APPCLASSNET_SPLITS
+            },
+            generator_input_space="source",
+            synthetic_output_space="source",
+            evaluation_space=policy.evaluation_space,
+            classifier_input_space="source" if policy.classifier_transform in {"preserve", "auto"} else "classifier",
+            inverse_transform_synthetic=policy.inverse_transform_synthetic,
+            warnings=[],
+            validations=[
+                {
+                    "name": "preserve_identity",
+                    "status": "passed",
+                    "detail": "feature_transform=preserve returned the original AppClassNet NPY root without scaled_npy materialization.",
+                }
+            ],
+        )
+        manifest_path = preprocessing_dir / "preprocessing_manifest.json"
+        manifest.save(manifest_path)
+        logging.info("AppClassNet preserve preprocessing uses source root without scaled_npy materialization: %s", raw_root)
+        logging.info("AppClassNet preprocessing stats saved to %s", report_path)
+        logging.info("AppClassNet preprocessing manifest saved to %s", manifest_path)
+        return raw_root, scaler_path, manifest_path
 
     preprocessing_report = {
         "scaler": parsed_arguments.scaler,
@@ -1534,6 +1845,13 @@ def preprocess_appclassnet_splits(parsed_arguments, raw_root, mode_name):
         "generator_transform": policy.generator_transform,
         "classifier_transform": policy.classifier_transform,
         "evaluation_space": policy.evaluation_space,
+        "source_min": train_source_min,
+        "source_max": train_source_max,
+        "transformed_min": None,
+        "transformed_max": None,
+        "transform_fitted": transform_fitted,
+        "transform_parameters": transform_parameters,
+        "transform_applied": operation != "preserve",
         "transform_id": manager.transform_id,
         "mode": mode_name,
         "fit_split": "train",
@@ -1575,6 +1893,8 @@ def preprocess_appclassnet_splits(parsed_arguments, raw_root, mode_name):
     preprocessing_report["feature_max_before_scaling"] = train_stats["feature_max_before_scaling"]
     preprocessing_report["feature_min_after_scaling"] = train_stats["feature_min_after_scaling"]
     preprocessing_report["feature_max_after_scaling"] = train_stats["feature_max_after_scaling"]
+    preprocessing_report["transformed_min"] = float(numpy.nanmin(numpy.asarray(train_stats["feature_min_after_scaling"], dtype=numpy.float64)))
+    preprocessing_report["transformed_max"] = float(numpy.nanmax(numpy.asarray(train_stats["feature_max_after_scaling"], dtype=numpy.float64)))
 
     report_path = preprocessing_dir / "preprocessing_stats.json"
     atomic_write_json(preprocessing_report, report_path)
@@ -1584,6 +1904,9 @@ def preprocess_appclassnet_splits(parsed_arguments, raw_root, mode_name):
 
     manifest = TransformManifest(
         source_profile=policy.source_profile,
+        feature_transform=policy.feature_transform,
+        generator_transform=policy.generator_transform,
+        classifier_transform=policy.classifier_transform,
         paths={
             "raw_root": str(raw_root),
             "preprocessed_root": str(scaled_root),
@@ -1602,6 +1925,12 @@ def preprocess_appclassnet_splits(parsed_arguments, raw_root, mode_name):
         },
         transformations=manager.transform_history,
         transform_id=manager.transform_id,
+        source_min=train_source_min,
+        source_max=train_source_max,
+        transformed_min=preprocessing_report["transformed_min"],
+        transformed_max=preprocessing_report["transformed_max"],
+        transform_fitted=transform_fitted,
+        transform_parameters=transform_parameters,
         train_fit={
             "fit_split": "train",
             "operation": manager.operation,
@@ -1646,136 +1975,51 @@ def preprocess_appclassnet_splits(parsed_arguments, raw_root, mode_name):
 def run_real_real_baseline(parsed_arguments, raw_root, output_dir):
     try:
         import numpy
-        from sklearn.metrics import accuracy_score
-        from sklearn.metrics import balanced_accuracy_score
-        from sklearn.metrics import f1_score
     except ImportError as error:
-        raise RuntimeError("NumPy and scikit-learn are required for --baseline_real_only.") from error
+        raise RuntimeError("NumPy is required for --baseline_real_only.") from error
 
-    time_start = datetime.datetime.now()
-    baseline_dir = output_dir / "baseline_real_only"
+    baseline_dir = REPO_ROOT / "results" / "appclassnet_top200" / "tr_tr"
     baseline_dir.mkdir(parents=True, exist_ok=True)
-    metrics_path = baseline_dir / "metrics.json"
 
     mmap_mode = "r" if parsed_arguments.use_mmap or parsed_arguments.execution_mode == "batches" else None
     train_x_path, train_y_path = validate_raw_split(raw_root, "train")
+    valid_x_path, valid_y_path = validate_raw_split(raw_root, "valid")
     test_x_path, test_y_path = validate_raw_split(raw_root, "test")
-    train_x_values = numpy.load(train_x_path, mmap_mode=mmap_mode, allow_pickle=False)
-    train_y_values = numpy.load(train_y_path, mmap_mode=mmap_mode, allow_pickle=False)
-    test_x_values = numpy.load(test_x_path, mmap_mode=mmap_mode, allow_pickle=False)
-    test_y_values = numpy.load(test_y_path, mmap_mode=mmap_mode, allow_pickle=False)
-
-    logging.info("Baseline real-real: selecting train samples per class=%s", parsed_arguments.train_samples_per_class)
-    train_indices, train_counts, train_short_classes = select_stratified_indices(
-        numpy,
-        train_y_values,
-        parsed_arguments.train_samples_per_class,
-        APPCLASSNET_NUM_CLASSES,
-        seed=0,
-        split_name="train",
-        real_class_count_policy=getattr(parsed_arguments, "real_class_count_policy", DEFAULT_REAL_CLASS_COUNT_POLICY),
-        samples_per_class_scope=getattr(parsed_arguments, "samples_per_class_scope", DEFAULT_SAMPLES_PER_CLASS_SCOPE),
+    loader = NpyXYLoader(
+        train_x_path,
+        train_y_path,
+        valid_x_path,
+        valid_y_path,
+        test_x_path,
+        test_y_path,
+        mmap_mode=mmap_mode,
+        source_profile=getattr(parsed_arguments, "source_profile", "appclassnet_top200"),
+        split_mode="provided",
+        expected_num_classes=APPCLASSNET_NUM_CLASSES if getattr(parsed_arguments, "source_profile", None) == "appclassnet_top200" else None,
+        expected_num_features=APPCLASSNET_NUM_FEATURES if getattr(parsed_arguments, "source_profile", None) == "appclassnet_top200" else None,
     )
-    logging.info("Baseline real-real: selecting test samples per class=%s", parsed_arguments.test_samples_per_class)
-    test_indices, test_counts, test_short_classes = select_stratified_indices(
-        numpy,
-        test_y_values,
-        parsed_arguments.test_samples_per_class,
-        APPCLASSNET_NUM_CLASSES,
-        seed=1,
-        split_name="test",
-        real_class_count_policy=getattr(parsed_arguments, "real_class_count_policy", DEFAULT_REAL_CLASS_COUNT_POLICY),
-        samples_per_class_scope=getattr(parsed_arguments, "samples_per_class_scope", DEFAULT_SAMPLES_PER_CLASS_SCOPE),
+    loading_start = time.perf_counter()
+    bundle = loader.load()
+    loading_time_seconds = time.perf_counter() - loading_start
+    config = tr_tr_config_from_namespace(parsed_arguments)
+    logging.info(
+        "TR-TR explicit pipeline: classifier=%s train_sampling=%s test_sampling=%s eval_batch_size=%s",
+        config.classifier,
+        config.train_sampling,
+        config.test_sampling,
+        config.eval_batch_size,
     )
-
-    train_x, train_y = load_selected_rows(numpy, train_x_values, train_y_values, train_indices, seed=2)
-    test_x, test_y = load_selected_rows(numpy, test_x_values, test_y_values, test_indices, seed=3)
-
-    policy = getattr(parsed_arguments, "_preprocessing_policy", None)
-    if policy is None:
-        policy = FeatureTransformPolicy.for_profile(parsed_arguments.source_profile)
-    classifier_policy = FeatureTransformPolicy.for_profile(
-        policy.source_profile,
-        feature_transform="preserve",
-        generator_transform="preserve",
-        classifier_transform=parsed_arguments.classifier_transform,
-        evaluation_space=policy.evaluation_space,
-        allow_refit=policy.allow_refit,
-        allow_double_transform=policy.allow_double_transform,
-        inverse_transform_synthetic=policy.inverse_transform_synthetic,
+    result = run_tr_tr_pipeline(
+        bundle,
+        config,
+        baseline_dir,
+        loading_time_seconds=loading_time_seconds,
+        resolved_arguments=vars(parsed_arguments),
+        repo_root=REPO_ROOT,
     )
-    classifier_manager = FeatureTransformManager(classifier_policy, stage="classifier", output_space="classifier")
-    classifier_manager.fit(train_x, split_name="train")
-    train_x = classifier_manager.transform(train_x, split_name="train", input_space="source", output_space="classifier")
-    test_x = classifier_manager.transform(test_x, split_name="test", input_space="source", output_space="classifier")
-
-    classifier = build_baseline_classifier(parsed_arguments)
-    logging.info("Baseline real-real: training %s on %s", classifier.__class__.__name__, train_x.shape)
-    classifier.fit(train_x, train_y)
-    logging.info("Baseline real-real: predicting %s", test_x.shape)
-    predictions = classifier.predict(test_x)
-
-    metrics = {
-        "mode": "baseline_real_only",
-        "classifier": parsed_arguments.baseline_classifier,
-        "classifier_params": classifier.get_params(),
-        "num_classes": APPCLASSNET_NUM_CLASSES,
-        "train_shape": list(train_x.shape),
-        "test_shape": list(test_x.shape),
-        "train_samples_per_class_requested": parsed_arguments.train_samples_per_class,
-        "test_samples_per_class_requested": parsed_arguments.test_samples_per_class,
-        "real_class_count_policy": getattr(parsed_arguments, "real_class_count_policy", DEFAULT_REAL_CLASS_COUNT_POLICY),
-        "samples_per_class_scope": getattr(parsed_arguments, "samples_per_class_scope", DEFAULT_SAMPLES_PER_CLASS_SCOPE),
-        "train_class_counts": train_counts,
-        "test_class_counts": test_counts,
-        "data_space": "source",
-        "feature_range": {
-            "train": summarize_feature_matrix(numpy, train_x),
-            "test": summarize_feature_matrix(numpy, test_x),
-        },
-        "train_short_classes": {str(key): value for key, value in train_short_classes.items()},
-        "test_short_classes": {str(key): value for key, value in test_short_classes.items()},
-        "scaler": {
-            "legacy_name": parsed_arguments.scaler,
-            "classifier_transform": parsed_arguments.classifier_transform,
-            "transform_id": classifier_manager.transform_id,
-            "feature_range": [0, 1] if parsed_arguments.classifier_transform == "minmax" else None,
-            "data_min": (
-                _json_list(classifier_manager.scaler.data_min_)
-                if hasattr(classifier_manager.scaler, "data_min_") else None
-            ),
-            "data_max": (
-                _json_list(classifier_manager.scaler.data_max_)
-                if hasattr(classifier_manager.scaler, "data_max_") else None
-            ),
-            "mean": (
-                _json_list(classifier_manager.scaler.mean_)
-                if hasattr(classifier_manager.scaler, "mean_") else None
-            ),
-            "scale": (
-                _json_list(classifier_manager.scaler.scale_)
-                if hasattr(classifier_manager.scaler, "scale_") else None
-            ),
-        },
-        "metrics": {
-            "Accuracy": float(accuracy_score(test_y, predictions)),
-            "MacroF1": float(f1_score(test_y, predictions, average="macro", zero_division=0)),
-            "WeightedF1": float(f1_score(test_y, predictions, average="weighted", zero_division=0)),
-            "BalancedAccuracy": float(balanced_accuracy_score(test_y, predictions)),
-        },
-        "paths": {
-            "train_x": str(train_x_path),
-            "train_y": str(train_y_path),
-            "test_x": str(test_x_path),
-            "test_y": str(test_y_path),
-            "metrics": str(metrics_path),
-        },
-        "duration_seconds": (datetime.datetime.now() - time_start).total_seconds(),
-    }
-
-    atomic_write_json(metrics, metrics_path)
-
-    logging.info("Baseline real-real metrics saved to %s", metrics_path)
+    metrics = result_to_legacy_baseline_metrics(result)
+    metrics_path = Path(result["artifacts"]["metrics"])
+    logging.info("TR-TR baseline metrics saved to %s", metrics_path)
     return metrics_path, metrics
 
 
@@ -2540,9 +2784,28 @@ def append_cli_value(command, parameter, value):
 
 def annotate_explicit_cli_arguments(parsed_arguments, raw_args):
     explicit = set()
+    raw_options = set()
     aliases = {
         "mode": "run_mode",
         "c": "campaign",
+        "mmap_npy": "use_mmap",
+        "dt_criterion": "decision_tree_criterion",
+        "dt_splitter": "decision_tree_splitter",
+        "dt_max_depth": "decision_tree_max_depth",
+        "dt_min_samples_split": "decision_tree_min_samples_split",
+        "dt_min_samples_leaf": "decision_tree_min_samples_leaf",
+        "dt_max_features": "decision_tree_max_features",
+        "dt_class_weight": "decision_tree_class_weight",
+        "rf_n_estimators": "n_estimators",
+        "rf_criterion": "random_forest_criterion",
+        "rf_max_depth": "random_forest_max_depth",
+        "rf_min_samples_split": "random_forest_min_samples_split",
+        "rf_min_samples_leaf": "random_forest_min_samples_leaf",
+        "rf_max_features": "random_forest_max_features",
+        "rf_bootstrap": "random_forest_bootstrap",
+        "rf_class_weight": "random_forest_class_weight",
+        "rf_n_jobs": "random_forest_n_jobs",
+        "synthetic_samples_per_class": "generated_samples_per_class",
     }
     for index, argument in enumerate(raw_args):
         if argument in {"-c"}:
@@ -2551,9 +2814,27 @@ def annotate_explicit_cli_arguments(parsed_arguments, raw_args):
         if not argument.startswith("--"):
             continue
         option = argument.split("=", 1)[0]
+        raw_options.add(option)
         normalized = option[2:].replace("-", "_")
         explicit.add(aliases.get(normalized, normalized))
     parsed_arguments._explicit_cli_options = explicit
+    parsed_arguments._raw_cli_options = raw_options
+    return parsed_arguments
+
+
+def normalize_mmap_arguments(parsed_arguments):
+    if getattr(parsed_arguments, "mmap_npy", False):
+        parsed_arguments.use_mmap = True
+        _record_effective_parameter(
+            parsed_arguments,
+            "use_mmap",
+            cli_value=True,
+            campaign_value=None,
+            profile_value=_profile_parameter_value(parsed_arguments, "use_mmap"),
+            global_default=GLOBAL_PARAMETER_DEFAULTS["use_mmap"],
+            effective_value=True,
+            origin="cli_alias_mmap_npy",
+        )
     return parsed_arguments
 
 
@@ -3488,6 +3769,7 @@ def build_plot_command(python_executable, dataset_path, output_dir_run, combinat
 
 
 def register_command_manifest(command, resolved_config, combination):
+    transform_config = asdict(resolved_config.transform)
     COMMAND_MANIFESTS[tuple(map(str, command))] = {
         "command": [str(token) for token in command],
         "canonical_command": shlex.join(map(str, command)),
@@ -3497,6 +3779,16 @@ def register_command_manifest(command, resolved_config, combination):
             if key not in K_FOLD_METADATA_PARAMETERS
         },
         "resolved_config": _resolved_config_payload(resolved_config),
+        "transforms": {
+            **transform_config,
+            "source_min": None,
+            "source_max": None,
+            "transformed_min": None,
+            "transformed_max": None,
+            "transform_fitted": False,
+            "transform_parameters": {},
+            "transform_applied": False,
+        },
     }
 
 
@@ -3692,6 +3984,10 @@ def configure_logging(output_dir, verbosity):
 
 
 def build_output_directory(parsed_arguments):
+    if getattr(parsed_arguments, "output_dir", None):
+        output_dir = resolve_project_path(parsed_arguments.output_dir)
+        parsed_arguments.run_id = output_dir.name
+        return output_dir
     run_id = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     suffix_parts = [run_id]
     if parsed_arguments.output_suffix:
@@ -3772,6 +4068,11 @@ def build_parser():
         choices=["tr_tr", "synthetic", "augmentation", "all"],
         default=None,
         help="pipeline selector: tr_tr, synthetic (TR-TS and TS-TR), augmentation (TR+TS-TR), or all",
+    )
+    parser.add_argument(
+        "--output_dir",
+        default=None,
+        help="explicit output directory for this AppClassNet runner execution",
     )
     parser.add_argument("--dryrun", "-d", help="show commands without running them", action="store_true")
     parser.add_argument("--pipenv", "-p", help="prefix subprocesses with pipenv run", action="store_true")
@@ -3855,6 +4156,12 @@ def build_parser():
         action=argparse.BooleanOptionalAction,
         default=None,
         help="use numpy mmap for .npy files; recommended with --execution_mode batches",
+    )
+    parser.add_argument(
+        "--mmap_npy",
+        action="store_true",
+        default=False,
+        help="alias for --use_mmap for direct NPY loading",
     )
     parser.add_argument("--max_train_samples", default=None, type=int, help="optional cap for training rows in batches mode")
     parser.add_argument(
@@ -3949,6 +4256,18 @@ def build_parser():
         help="preprocessing source profile; AppClassNet runner defaults to appclassnet_top200",
     )
     parser.add_argument(
+        "--data_format",
+        choices=["csv", "npy_xy"],
+        default="npy_xy",
+        help="input data format; TR-TR AppClassNet uses npy_xy with provided X/y files",
+    )
+    parser.add_argument(
+        "--split_mode",
+        choices=["cross_validation", "provided"],
+        default="provided",
+        help="split strategy; AppClassNet TR-TR requires provided",
+    )
+    parser.add_argument(
         "--feature_transform",
         choices=["preserve", "auto", "minmax", "standard"],
         default="preserve",
@@ -3996,9 +4315,27 @@ def build_parser():
     )
     parser.add_argument(
         "--baseline_classifier",
-        choices=["decision_tree", "extra_trees", "random_forest_light", "sgd"],
+        choices=["decision_tree", "random_forest", "extra_trees", "random_forest_light", "sgd"],
         default="decision_tree",
         help="real-real baseline classifier used by --baseline_real_only",
+    )
+    parser.add_argument(
+        "--classifier",
+        choices=["decision_tree", "random_forest"],
+        default=None,
+        help="TR-TR classifier; preferred alias replacing --baseline_classifier for AppClassNet baselines",
+    )
+    parser.add_argument(
+        "--train_sampling",
+        choices=["all", "balanced_per_class", "up_to_available"],
+        default=None,
+        help="TR-TR train real sampling strategy; omitted preserves *_samples_per_class legacy behavior",
+    )
+    parser.add_argument(
+        "--test_sampling",
+        choices=["all", "balanced_per_class", "up_to_available"],
+        default=None,
+        help="TR-TR test real sampling strategy; omitted preserves *_samples_per_class legacy behavior",
     )
     parser.add_argument(
         "--train_samples_per_class",
@@ -4026,6 +4363,8 @@ def build_parser():
     )
     parser.add_argument(
         "--generated_samples_per_class",
+        "--synthetic_samples_per_class",
+        dest="generated_samples_per_class",
         default=None,
         type=int,
         help="per-class synthetic rows generated before splitting synthetic train/test quotas",
@@ -4043,10 +4382,10 @@ def build_parser():
     )
     parser.add_argument(
         "--real_class_count_policy",
-        choices=["strict", "uniform_min", "available_cap"],
+        choices=["strict", "uniform_min", "available_cap", "cap_to_available"],
         default=None,
         help=("real split quota policy; default is strict for AppClassNet after campaign resolution. "
-              "strict requires the request, uniform_min uses a common cap, available_cap caps per class."),
+              "strict requires the request, uniform_min uses a common cap, available_cap/cap_to_available caps per class."),
     )
     parser.add_argument(
         "--samples_per_class_scope",
@@ -4077,6 +4416,133 @@ def build_parser():
         choices=["balanced", "balanced_subsample"],
         default=None,
         help="optional class_weight for tree ensemble eval classifiers",
+    )
+    parser.add_argument(
+        "--decision_tree_criterion",
+        "--dt_criterion",
+        dest="decision_tree_criterion",
+        choices=["gini", "entropy", "log_loss"],
+        default="gini",
+        help="TR-TR DecisionTreeClassifier criterion",
+    )
+    parser.add_argument(
+        "--decision_tree_splitter",
+        "--dt_splitter",
+        dest="decision_tree_splitter",
+        choices=["best", "random"],
+        default="best",
+        help="TR-TR DecisionTreeClassifier splitter",
+    )
+    parser.add_argument(
+        "--decision_tree_max_depth",
+        "--dt_max_depth",
+        dest="decision_tree_max_depth",
+        default=None,
+        type=int,
+        help="TR-TR DecisionTreeClassifier max_depth; omitted maps to sklearn None",
+    )
+    parser.add_argument(
+        "--decision_tree_min_samples_split",
+        "--dt_min_samples_split",
+        dest="decision_tree_min_samples_split",
+        default=2,
+        help="TR-TR DecisionTreeClassifier min_samples_split",
+    )
+    parser.add_argument(
+        "--decision_tree_min_samples_leaf",
+        "--dt_min_samples_leaf",
+        dest="decision_tree_min_samples_leaf",
+        default=1,
+        help="TR-TR DecisionTreeClassifier min_samples_leaf",
+    )
+    parser.add_argument(
+        "--decision_tree_max_features",
+        "--dt_max_features",
+        dest="decision_tree_max_features",
+        default=None,
+        help="TR-TR DecisionTreeClassifier max_features; use none for sklearn None",
+    )
+    parser.add_argument(
+        "--decision_tree_class_weight",
+        "--dt_class_weight",
+        dest="decision_tree_class_weight",
+        choices=["balanced"],
+        default=None,
+        help="TR-TR DecisionTreeClassifier class_weight",
+    )
+    parser.add_argument(
+        "--random_forest_n_estimators",
+        "--rf_n_estimators",
+        dest="n_estimators",
+        default=None,
+        type=int,
+        help="TR-TR RandomForestClassifier n_estimators",
+    )
+    parser.add_argument(
+        "--random_forest_criterion",
+        "--rf_criterion",
+        dest="random_forest_criterion",
+        choices=["gini", "entropy", "log_loss"],
+        default="gini",
+        help="TR-TR RandomForestClassifier criterion",
+    )
+    parser.add_argument(
+        "--random_forest_max_depth",
+        "--rf_max_depth",
+        dest="random_forest_max_depth",
+        default=None,
+        type=int,
+        help="TR-TR RandomForestClassifier max_depth; omitted maps to sklearn None",
+    )
+    parser.add_argument(
+        "--random_forest_min_samples_split",
+        "--rf_min_samples_split",
+        dest="random_forest_min_samples_split",
+        default=2,
+        help="TR-TR RandomForestClassifier min_samples_split",
+    )
+    parser.add_argument(
+        "--random_forest_min_samples_leaf",
+        "--rf_min_samples_leaf",
+        dest="random_forest_min_samples_leaf",
+        default=1,
+        help="TR-TR RandomForestClassifier min_samples_leaf",
+    )
+    parser.add_argument(
+        "--random_forest_max_features",
+        "--rf_max_features",
+        dest="random_forest_max_features",
+        default="sqrt",
+        help="TR-TR RandomForestClassifier max_features; default sqrt is explicit",
+    )
+    parser.add_argument(
+        "--random_forest_bootstrap",
+        "--rf_bootstrap",
+        action=argparse.BooleanOptionalAction,
+        dest="random_forest_bootstrap",
+        default=True,
+        help="TR-TR RandomForestClassifier bootstrap",
+    )
+    parser.add_argument(
+        "--random_forest_class_weight",
+        "--rf_class_weight",
+        dest="random_forest_class_weight",
+        choices=["balanced", "balanced_subsample"],
+        default=None,
+        help="TR-TR RandomForestClassifier class_weight",
+    )
+    parser.add_argument(
+        "--random_forest_n_jobs",
+        "--rf_n_jobs",
+        dest="random_forest_n_jobs",
+        default=1,
+        type=int,
+        help="TR-TR RandomForestClassifier n_jobs; default 1 avoids using all cores implicitly",
+    )
+    parser.add_argument(
+        "--save_tr_tr_model",
+        action="store_true",
+        help="save the final TR-TR classifier with joblib",
     )
     parser.add_argument(
         "--generation_strategy",
@@ -4131,7 +4597,9 @@ def main():
     annotate_explicit_cli_arguments(arguments, sys.argv[1:])
     apply_execution_profile(arguments)
     apply_experiment_budget_scenario(arguments)
+    normalize_mmap_arguments(arguments)
     normalize_classifier_arguments(arguments)
+    warn_deprecated_tr_tr_aliases(arguments)
 
     if arguments.list_campaigns:
         print("\n".join(sorted(campaigns_available)))
@@ -4182,6 +4650,8 @@ def main():
         baseline_real_count_arguments = resolve_effective_real_class_count_arguments(arguments, {})
         for parameter, value in baseline_real_count_arguments["values"].items():
             setattr(arguments, parameter, value)
+    normalize_explicit_tr_tr_sampling(arguments)
+    validate_tr_tr_cli_arguments(arguments)
     print_all_settings(arguments)
     warn_prepare_limit_if_needed(arguments, campaigns_chosen)
 
@@ -4190,6 +4660,17 @@ def main():
     effective_raw_root = raw_root
     effective_converted_root = converted_root
     log_full_run_summary(arguments, campaigns_chosen, raw_root, output_dir)
+    print_resolved_tr_tr_config(arguments, raw_root, output_dir)
+
+    if arguments.dryrun:
+        log_appclassnet_memory_plan(arguments, raw_root)
+        logging.info("Dry run completed before preprocessing, training, generation, or evaluation.")
+        return 0
+
+    if arguments.dry_run_memory:
+        log_appclassnet_memory_plan(arguments, raw_root)
+        logging.info("dry_run_memory enabled; stopping after memory estimate.")
+        return 0
 
     if arguments.diagnostic_only:
         diagnostics_path, diagnostics = run_input_diagnostics(arguments, raw_root, output_dir, campaigns_chosen)
@@ -4217,11 +4698,6 @@ def main():
             logging.info("Batches mode classes per generator group: %d", arguments.classes_per_group)
     if arguments.execution_mode == "batches" and arguments.materialize_synthetic:
         logging.warning("--materialize_synthetic in batches mode can use high memory.")
-
-    if arguments.dry_run_memory:
-        log_appclassnet_memory_plan(arguments, raw_root)
-        logging.info("dry_run_memory enabled; stopping after memory estimate.")
-        return 0
 
     if not arguments.dryrun:
         effective_raw_root, scaler_path, preprocessing_report_path = preprocess_appclassnet_splits(

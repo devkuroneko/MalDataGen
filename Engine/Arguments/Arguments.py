@@ -45,6 +45,7 @@ try:
     from Engine.DataIO.DirectoryManager import DirectoryManager
     from Engine.Arguments.ArgumentsSMOTE import add_argument_smote
 
+    from Engine.Arguments.ArgumentsFramework import CLASSIFIER_ALIASES
     from Engine.Arguments.ArgumentsFramework import add_argument_framework
     from Engine.Arguments.Classifiers.ArgumentsKNN import add_argument_knn
     from Engine.Arguments.ArgumentsDataLoader import add_argument_data_load
@@ -125,9 +126,79 @@ NORMAL_CLASSIFIER_NAME_MAP = {
 }
 
 
+def normalize_classifier_name(classifier_name):
+    """Normalize CLI classifier aliases in one place."""
+    if classifier_name is None:
+        return None
+    value = str(classifier_name).strip()
+    return CLASSIFIER_ALIASES.get(value, CLASSIFIER_ALIASES.get(value.lower(), value))
+
+
+def _tr_tr_classifier_name(classifier_name):
+    canonical = normalize_classifier_name(classifier_name)
+    mapping = {
+        "DecisionTree": "decision_tree",
+        "RandomForest": "random_forest",
+        "DecisionTreeSubset": "decision_tree_subset",
+        "RandomForestSubset": "random_forest_subset",
+        "RandomForestLight": "random_forest_light",
+    }
+    return mapping.get(canonical, canonical)
+
+
+def _configure_pipeline_arguments(parsed_arguments):
+    pipeline = getattr(parsed_arguments, "pipeline", None)
+    if getattr(parsed_arguments, "baseline_real_only", False):
+        if pipeline not in {None, "tr_tr"}:
+            raise ValueError("--baseline_real_only is an alias for --pipeline tr_tr and cannot be combined with "
+                             f"--pipeline {pipeline!r}.")
+        pipeline = "tr_tr"
+    if pipeline is None:
+        pipeline = "synthetic"
+    if pipeline == "synthetic_eval":
+        pipeline_effective = "synthetic"
+    else:
+        pipeline_effective = pipeline
+    parsed_arguments.pipeline_effective = pipeline_effective
+    parsed_arguments.protocol = "TR-TR" if pipeline_effective == "tr_tr" else pipeline_effective
+    if pipeline_effective == "tr_tr":
+        parsed_arguments.baseline_real_only = True
+        parsed_arguments.run_tr_tr = True
+        parsed_arguments.evaluation_protocol = "tr_tr"
+        parsed_arguments.evaluation_mode = "none"
+    return parsed_arguments
+
+
 def _configure_classifier_arguments(parsed_arguments):
     if int(getattr(parsed_arguments, "classes_per_group", 10)) <= 0:
         raise ValueError("--classes_per_group must be a positive integer.")
+
+    requested_classifiers = getattr(parsed_arguments, "classifier", None) or []
+    if isinstance(requested_classifiers, str):
+        requested_classifiers = [requested_classifiers]
+    normalized_classifiers = [normalize_classifier_name(item) for item in requested_classifiers]
+    parsed_arguments.classifier_requested = list(requested_classifiers)
+    parsed_arguments.classifier = normalized_classifiers
+
+    if getattr(parsed_arguments, "pipeline_effective", None) == "tr_tr":
+        selected = normalized_classifiers[0] if normalized_classifiers else "DecisionTree"
+        tr_tr_classifier = _tr_tr_classifier_name(selected)
+        if tr_tr_classifier == "random_forest_light":
+            tr_tr_classifier = "random_forest"
+        if tr_tr_classifier not in {"decision_tree", "random_forest"}:
+            raise ValueError(
+                "TR-TR supports only DecisionTree/decision_tree or RandomForest/random_forest. "
+                f"Got {selected!r}."
+            )
+        parsed_arguments.baseline_classifier = tr_tr_classifier
+        parsed_arguments.requested_classifier = selected
+        parsed_arguments.effective_classifier = tr_tr_classifier
+        parsed_arguments.classifier_canonical = selected
+        if parsed_arguments.train_sampling == "balanced_per_class" and parsed_arguments.train_samples_per_class is None:
+            raise ValueError("--train_sampling balanced_per_class requires --train_samples_per_class.")
+        if parsed_arguments.test_sampling == "balanced_per_class" and parsed_arguments.test_samples_per_class is None:
+            raise ValueError("--test_sampling balanced_per_class requires --test_samples_per_class.")
+        return parsed_arguments
 
     if getattr(parsed_arguments, "execution_mode", "normal") == "batches":
         if getattr(parsed_arguments, "batch_classifier", None):
@@ -290,6 +361,7 @@ class Arguments(DirectoryManager):
         self.arguments = self.arguments.parse_args()
         self.arguments = _apply_diagnostic_epoch_aliases(self.arguments)
         self.arguments = _normalize_preprocessing_arguments(self.arguments)
+        self.arguments = _configure_pipeline_arguments(self.arguments)
         self.arguments = _normalize_evaluation_protocol_arguments(self.arguments)
         self.arguments = _configure_classifier_arguments(self.arguments)
         self.arguments = validate_data_load_arguments(self.arguments)

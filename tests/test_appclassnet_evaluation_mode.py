@@ -87,6 +87,126 @@ class AppClassNetEvaluationModeTest(unittest.TestCase):
         self.assertEqual(plan["run_tr_ts"], "not_run")
         self.assertEqual(plan["run_ts_tr"], "not_run")
 
+    def test_parser_accepts_explicit_tr_tr_decision_tree_command(self):
+        args = _resolved_tr_tr_args([
+            "--pipeline", "tr_tr",
+            "--source_profile", "appclassnet_top200",
+            "--data_format", "npy_xy",
+            "--split_mode", "provided",
+            "--execution_mode", "batches",
+            "--mmap_npy",
+            "--feature_transform", "preserve",
+            "--classifier_transform", "preserve",
+            "--evaluation_space", "source",
+            "--classifier", "decision_tree",
+            "--train_sampling", "all",
+            "--test_sampling", "all",
+            "--eval_batch_size", "32",
+            "--random_state", "7",
+            "--dt_criterion", "entropy",
+            "--dt_splitter", "random",
+            "--dt_max_depth", "4",
+            "--dt_min_samples_split", "3",
+            "--dt_min_samples_leaf", "2",
+            "--dt_max_features", "sqrt",
+            "--dt_class_weight", "balanced",
+        ])
+
+        self.assertEqual(args.baseline_classifier, "decision_tree")
+        self.assertTrue(args.use_mmap)
+        self.assertEqual(args.train_sampling, "all")
+        self.assertEqual(args.test_sampling, "all")
+        self.assertEqual(args.decision_tree_criterion, "entropy")
+        self.assertEqual(args.decision_tree_max_depth, 4)
+
+    def test_parser_accepts_explicit_tr_tr_random_forest_command(self):
+        args = _resolved_tr_tr_args([
+            "--pipeline", "tr_tr",
+            "--execution_mode", "batches",
+            "--use_mmap",
+            "--classifier", "random_forest",
+            "--train_sampling", "all",
+            "--test_sampling", "all",
+            "--rf_n_estimators", "11",
+            "--rf_criterion", "entropy",
+            "--rf_max_depth", "6",
+            "--rf_min_samples_split", "3",
+            "--rf_min_samples_leaf", "2",
+            "--rf_max_features", "log2",
+            "--no-rf_bootstrap",
+            "--rf_class_weight", "balanced_subsample",
+            "--rf_n_jobs", "2",
+        ])
+
+        self.assertEqual(args.baseline_classifier, "random_forest")
+        self.assertEqual(args.n_estimators, 11)
+        self.assertEqual(args.random_forest_criterion, "entropy")
+        self.assertEqual(args.random_forest_max_depth, 6)
+        self.assertFalse(args.random_forest_bootstrap)
+        self.assertEqual(args.random_forest_class_weight, "balanced_subsample")
+        self.assertEqual(args.random_forest_n_jobs, 2)
+
+    def test_explicit_tr_tr_preserve_is_resolved_without_synthetic_arguments(self):
+        args = _resolved_tr_tr_args([
+            "--pipeline", "tr_tr",
+            "--execution_mode", "batches",
+            "--mmap_npy",
+            "--classifier", "decision_tree",
+        ])
+
+        self.assertEqual(args.feature_transform, "preserve")
+        self.assertEqual(args.generator_transform, "preserve")
+        self.assertEqual(args.classifier_transform, "preserve")
+        self.assertEqual(args.evaluation_space, "source")
+        self.assertEqual(args.train_sampling, "all")
+        self.assertEqual(args.test_sampling, "all")
+        self.assertIsNone(args.train_samples_per_class)
+        self.assertIsNone(args.test_samples_per_class)
+
+    def test_random_forest_cli_parameters_reach_model(self):
+        args = _resolved_tr_tr_args([
+            "--pipeline", "tr_tr",
+            "--classifier", "random_forest",
+            "--rf_n_estimators", "5",
+            "--rf_max_depth", "3",
+            "--rf_n_jobs", "1",
+            "--random_state", "19",
+        ])
+        from Engine.Evaluation.TrTrPipeline import tr_tr_config_from_namespace
+
+        model = runner.build_tr_tr_classifier(tr_tr_config_from_namespace(args))
+        params = model.get_params(deep=True)
+
+        self.assertEqual(params["n_estimators"], 5)
+        self.assertEqual(params["max_depth"], 3)
+        self.assertEqual(params["n_jobs"], 1)
+        self.assertEqual(params["random_state"], 19)
+
+    def test_invalid_tr_tr_configuration_fails_before_dataset_loading(self):
+        args = _resolved_tr_tr_args([
+            "--pipeline", "tr_tr",
+            "--classifier", "decision_tree",
+        ], validate=False)
+        args.eval_batch_size = 0
+
+        with mock.patch.object(runner, "validate_raw_split", side_effect=AssertionError("dataset should not load")):
+            with self.assertRaisesRegex(ValueError, "eval_batch_size"):
+                runner.validate_tr_tr_cli_arguments(args)
+
+    def test_old_csv_style_command_is_still_accepted(self):
+        args = _parsed_runner_args([
+            "--run_mode", "demo",
+            "--pipeline", "synthetic",
+            "--execution_mode", "normal",
+            "--data_format", "csv",
+            "--split_mode", "cross_validation",
+        ])
+
+        self.assertEqual(args.pipeline_effective, "synthetic")
+        self.assertEqual(args.execution_mode, "normal")
+        self.assertEqual(args.data_format, "csv")
+        self.assertEqual(args.split_mode, "cross_validation")
+
     def test_pipeline_synthetic_executes_tr_ts_and_ts_tr(self):
         args = _parsed_runner_args(["--run_mode", "demo", "--pipeline", "synthetic"])
         plan = runner.build_pipeline_plan(args.pipeline_effective)
@@ -666,7 +786,67 @@ class AppClassNetEvaluationModeTest(unittest.TestCase):
         self.assertTrue(manifest_path.is_file())
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         self.assertEqual(payload["resolved_config"]["classifier"]["effective_classifier"], "decision_tree_subset")
+        self.assertEqual(payload["transforms"]["feature_transform"], "preserve")
+        self.assertEqual(payload["transforms"]["classifier_transform"], "preserve")
+        self.assertEqual(payload["transforms"]["generator_transform"], "preserve")
+        self.assertEqual(payload["transforms"]["evaluation_space"], "source")
+        self.assertFalse(payload["transforms"]["transform_fitted"])
+        self.assertFalse(payload["transforms"]["transform_applied"])
         self.assertIn("canonical_command", payload)
+
+    def test_appclassnet_preserve_preprocessing_returns_source_root_and_train_only_range(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw_root = root / "raw"
+            raw_root.mkdir()
+            for split_name, offset in (("train", 0.0), ("valid", 10.0), ("test", 20.0)):
+                x_values = numpy.full((2, runner.APPCLASSNET_NUM_FEATURES), offset, dtype=numpy.float64)
+                x_values[0, 0] = -0.5 + offset
+                x_values[1, 1] = 0.5 + offset
+                y_values = numpy.array([0, 1], dtype=numpy.int64)
+                numpy.save(raw_root / f"{split_name}_x.npy", x_values)
+                numpy.save(raw_root / f"{split_name}_y.npy", y_values)
+
+            args = SimpleNamespace(
+                source_profile="appclassnet_top200",
+                feature_transform="preserve",
+                generator_transform="preserve",
+                classifier_transform="preserve",
+                evaluation_space="source",
+                allow_scaler_refit=False,
+                allow_double_transform=False,
+                inverse_transform_synthetic=True,
+                use_mmap=True,
+                execution_mode="batches",
+                prepare_chunk_size=1,
+                scaler="none",
+                _preprocessing_policy=None,
+            )
+
+            with mock.patch.object(runner, "RESULTS_ROOT", root / "results"):
+                effective_root, scaler_path, manifest_path = runner.preprocess_appclassnet_splits(
+                    args,
+                    raw_root,
+                    "batches",
+                )
+
+            manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+            report = json.loads((Path(manifest_path).parent / "preprocessing_stats.json").read_text(encoding="utf-8"))
+            scaler_exists = Path(scaler_path).is_file()
+            scaled_train_exists = (Path(manifest_path).parent / "scaled_npy" / "train_x.npy").exists()
+
+            self.assertEqual(effective_root, raw_root)
+        self.assertTrue(scaler_exists)
+        self.assertFalse(scaled_train_exists)
+        self.assertEqual(manifest["feature_transform"], "preserve")
+        self.assertEqual(manifest["evaluation_space"], "source")
+        self.assertFalse(manifest["transform_fitted"])
+        self.assertEqual(manifest["transform_parameters"], {})
+        self.assertEqual(manifest["source_min"], -0.5)
+        self.assertEqual(manifest["source_max"], 0.5)
+        self.assertEqual(manifest["transformed_min"], -0.5)
+        self.assertEqual(manifest["transformed_max"], 0.5)
+        self.assertFalse(report["transform_applied"])
 
     def test_dryrun_run_cmd_does_not_call_subprocess_or_write_manifest(self):
         args = _batch_args()
@@ -1190,7 +1370,25 @@ def _parsed_runner_args(raw_args):
     args = parser.parse_args(raw_args)
     runner.annotate_explicit_cli_arguments(args, raw_args)
     runner.apply_execution_profile(args)
+    runner.normalize_mmap_arguments(args)
     runner.normalize_classifier_arguments(args)
+    return args
+
+
+def _resolved_tr_tr_args(raw_args, validate=True):
+    args = _parsed_runner_args(raw_args)
+    campaigns = runner.choose_campaigns(args.campaign, full=args.run_mode_effective == "full")
+    runner.normalize_preprocessing_arguments(args, campaigns)
+    if args.baseline_real_only:
+        sample_arguments = runner.resolve_effective_sample_arguments(args, {})
+        for parameter, value in sample_arguments["values"].items():
+            setattr(args, parameter, value)
+        real_count_arguments = runner.resolve_effective_real_class_count_arguments(args, {})
+        for parameter, value in real_count_arguments["values"].items():
+            setattr(args, parameter, value)
+    runner.normalize_explicit_tr_tr_sampling(args)
+    if validate:
+        runner.validate_tr_tr_cli_arguments(args)
     return args
 
 

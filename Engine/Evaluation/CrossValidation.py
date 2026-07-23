@@ -598,6 +598,16 @@ def StratifiedData(function):
         preprocessing_timer.__enter__()
 
         if dataset_bundle is not None:
+            if getattr(self.arguments, 'pipeline_effective', None) == 'tr_tr':
+                owner._dataset_bundle = dataset_bundle
+                owner._target_type = dataset_bundle.schema.target_type
+                owner._data_type = dataset_bundle.schema.feature_type
+                owner._labels_are_discrete = dataset_bundle.schema.target_type in ('binary', 'multiclass')
+                owner.arguments.number_k_folds = 1
+                preprocessing_timer.__exit__(None, None, None)
+                if record_resource_usage is not None:
+                    record_resource_usage("preprocessing", preprocessing_timer.elapsed_seconds)
+                return function(self, *args, **kwargs)
             _apply_bundle_to_owner(self, dataset_bundle)
             if getattr(self.arguments, 'dry_run_memory', False):
                 logging.info("dry_run_memory enabled; skipping fold materialization and experiment execution.")

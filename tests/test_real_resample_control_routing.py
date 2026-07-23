@@ -103,11 +103,12 @@ class RealResampleControlRoutingTest(unittest.TestCase):
 
             self.assertEqual(reader.total_rows, 10000)
             self.assertEqual(reader.manifest["total_samples"], 10000)
+            self.assertEqual(len(reader.manifest["selection_table"]), NUM_CLASSES)
             for class_id in range(NUM_CLASSES):
                 indices = reader.manifest["source_indices"][str(class_id)]
-                self.assertEqual(len(indices), 50)
-                self.assertEqual(len(set(indices)), 50)
-                self.assertTrue(all(0 <= index < owner._dataset_bundle.train.X.shape[0] for index in indices))
+                self.assertEqual(indices["count"], 50)
+                self.assertGreaterEqual(indices["min"], 0)
+                self.assertLess(indices["max"], owner._dataset_bundle.train.X.shape[0])
 
     def test_selected_x_rows_remain_aligned_with_class_labels(self):
         with tempfile.TemporaryDirectory() as directory:

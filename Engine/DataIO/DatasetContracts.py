@@ -48,13 +48,19 @@ def _normalize_optional_labels(class_labels: Iterable[Any] | None) -> tuple[Any,
 def _schema_hash_payload(schema: "DatasetSchema") -> dict[str, Any]:
     return {
         "feature_names": list(schema.feature_names),
-        "num_features": len(schema.feature_names),
+        "num_features": schema.num_features,
         "feature_dtype": schema.feature_dtype,
+        "target_dtype": schema.target_dtype,
         "feature_type": schema.feature_type,
         "target_type": schema.target_type,
         "num_classes": schema.num_classes,
+        "classes": list(schema.classes) if schema.classes is not None else None,
         "class_labels": list(schema.class_labels) if schema.class_labels is not None else None,
         "source_format": schema.source_format,
+        "data_format": schema.data_format,
+        "split_mode": schema.split_mode,
+        "train_feature_min": schema.train_feature_min,
+        "train_feature_max": schema.train_feature_max,
         "source_profile": schema.source_profile,
         "data_space": schema.data_space,
         "transform_id": schema.transform_id,
@@ -105,8 +111,8 @@ def _source_indices_summary(source_indices):
 
 def validate_xy_alignment(x, y, dataset_name: str, *, split=None, fold=None, source_indices=None):
     """Validate that a feature matrix and label vector describe the same rows."""
-    x_array = numpy.asarray(x)
-    y_array = numpy.asarray(y).reshape(-1)
+    x_array = numpy.asanyarray(x)
+    y_array = numpy.asanyarray(y).reshape(-1)
     context = (
         f"{dataset_name} split={split} fold={fold} "
         f"X_id={_object_id(x)} y_id={_object_id(y)} "
@@ -161,20 +167,27 @@ class DatasetSchema:
     """
 
     feature_names: list[str]
+    num_features: int | None = None
     feature_type: str = "unknown"
     target_name: str | None = "label"
     target_type: str = "auto"
     num_classes: int | None = None
+    classes: Iterable[Any] | None = None
     class_labels: Iterable[Any] | None = None
     source_format: str = "unknown"
+    data_format: str | None = None
+    split_mode: str | None = None
     source_profile: str = "unknown"
     source_feature_range: tuple[float, float] | None = None
     current_feature_range: tuple[float, float] | None = None
+    train_feature_min: float | None = None
+    train_feature_max: float | None = None
     already_normalized: bool = False
     normalization_range: tuple[float, float] | None = None
     transform_history: list[dict[str, Any]] = field(default_factory=list)
     transform_id: str | None = None
     feature_dtype: str | None = None
+    target_dtype: str | None = None
     data_space: str = "unknown"
     schema_hash: str | None = None
 
@@ -188,15 +201,39 @@ class DatasetSchema:
         if not all(isinstance(name, str) and name for name in self.feature_names):
             raise ValueError("feature_names must contain only non-empty strings.")
 
+        if self.num_features is None:
+            self.num_features = len(self.feature_names)
+        elif int(self.num_features) != len(self.feature_names):
+            raise ValueError(
+                f"num_features={self.num_features} must match feature_names length={len(self.feature_names)}."
+            )
+        else:
+            self.num_features = int(self.num_features)
+
+        if self.data_format is None:
+            self.data_format = self.source_format
+        elif self.source_format == "unknown":
+            self.source_format = self.data_format
+        elif self.data_format != self.source_format:
+            raise ValueError(
+                f"data_format={self.data_format!r} must match source_format={self.source_format!r}."
+            )
+
         self.feature_type = _validate_choice(self.feature_type, FEATURE_TYPES, "feature_type")
         self.target_type = _validate_choice(self.target_type, TARGET_TYPES, "target_type")
         self.source_format = _validate_choice(self.source_format, SOURCE_FORMATS, "source_format")
+        self.data_format = _validate_choice(self.data_format, SOURCE_FORMATS, "data_format")
         self.source_profile = _validate_choice(self.source_profile, SOURCE_PROFILES, "source_profile")
         self.data_space = _validate_choice(self.data_space, DATA_SPACES, "data_space")
         self.class_labels = _normalize_optional_labels(self.class_labels)
+        self.classes = _normalize_optional_labels(self.classes)
+        if self.classes is None and self.class_labels is not None:
+            self.classes = tuple(self.class_labels)
         self.source_feature_range = self._normalize_range(self.source_feature_range, "source_feature_range")
         self.current_feature_range = self._normalize_range(self.current_feature_range, "current_feature_range")
         self.normalization_range = self._normalize_range(self.normalization_range, "normalization_range")
+        self.train_feature_min = None if self.train_feature_min is None else float(self.train_feature_min)
+        self.train_feature_max = None if self.train_feature_max is None else float(self.train_feature_max)
         self.transform_history = list(self.transform_history or [])
 
         if self.target_type == "none":
@@ -206,6 +243,11 @@ class DatasetSchema:
             if self.num_classes is not None:
                 if not isinstance(self.num_classes, int) or self.num_classes < 2:
                     raise ValueError("num_classes must be an integer >= 2 for target_type='multiclass'.")
+            if self.classes is not None:
+                if len(self.classes) < 2:
+                    raise ValueError("classes must contain at least two labels for multiclass targets.")
+                if self.num_classes is not None and len(self.classes) > self.num_classes:
+                    raise ValueError("classes length cannot exceed num_classes when both are provided.")
             if self.class_labels is not None:
                 if len(self.class_labels) < 2:
                     raise ValueError("class_labels must contain at least two labels for multiclass targets.")
@@ -347,7 +389,7 @@ class SplitData:
                 raise ValueError("SplitData requires X or reader.")
             self.X = self.reader
 
-        self.X = numpy.asarray(self.X)
+        self.X = numpy.asanyarray(self.X)
         if self.X.ndim != 2:
             raise ValueError(f"SplitData.X for split {self.name!r} must be 2D. Got shape {self.X.shape}.")
 
@@ -376,7 +418,7 @@ class SplitData:
 
     @staticmethod
     def _normalize_y(y: Any) -> numpy.ndarray:
-        y_array = numpy.asarray(y)
+        y_array = numpy.asanyarray(y)
         if y_array.ndim == 0:
             raise ValueError("SplitData.y must be 1D or safely convertible to 1D.")
         if y_array.ndim == 1:
@@ -404,7 +446,7 @@ class SplitData:
             self.class_counts = {}
             self.minimum_class_count = None
             return
-        labels = numpy.asarray(self.y).reshape(-1)
+        labels = numpy.asanyarray(self.y).reshape(-1)
         if labels.size == 0:
             self.class_counts = {}
             self.minimum_class_count = 0
@@ -431,6 +473,13 @@ class SamplePlan:
     class_counts: dict[Any, int] | None = None
     samples_per_class: int | None = None
     number_classes: int | None = None
+    split_name: str | None = None
+    split_size: int | None = None
+    random_state: int | None = None
+    insufficient_policy: str | None = None
+    replacement: bool = False
+    selected_indices: Any | None = None
+    selection_table: list[dict[str, Any]] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -440,6 +489,8 @@ class SamplePlan:
             "total_rows",
             "match_train_distribution",
             "balanced_per_class",
+            "all",
+            "up_to_available",
         }
         if self.mode not in allowed_modes:
             raise ValueError(f"SamplePlan.mode must be one of: {', '.join(sorted(allowed_modes))}.")
@@ -456,6 +507,10 @@ class SamplePlan:
             if not isinstance(self.number_classes, int) or self.number_classes < 1:
                 raise ValueError("number_classes must be a positive integer when provided.")
 
+        if self.split_size is not None:
+            if not isinstance(self.split_size, int) or self.split_size < 0:
+                raise ValueError("split_size must be a non-negative integer when provided.")
+
         if self.class_counts is not None:
             if not isinstance(self.class_counts, dict):
                 raise ValueError("class_counts must be a dictionary when provided.")
@@ -468,6 +523,9 @@ class SamplePlan:
 
         if self.total_rows is None and self.class_counts is not None:
             self.total_rows = sum(self.class_counts.values())
+
+        if self.selection_table is None:
+            self.selection_table = []
 
 
 @dataclass(slots=True)
@@ -513,7 +571,7 @@ class DatasetBundle:
             raise ValueError(f"Split {split.name!r} must include y for target_type={self.schema.target_type!r}.")
 
         if self.schema.target_type == "multiclass" and self.schema.num_classes is not None:
-            labels = numpy.asarray(split.y)
+            labels = numpy.asanyarray(split.y)
             if labels.size == 0:
                 return
 
@@ -605,10 +663,10 @@ def _validate_split_paths(split: SplitData) -> None:
     if not y_path.is_file():
         raise FileNotFoundError(f"Split {split.name!r} y_path does not exist: {y_path}")
     y_shape, _ = _path_shape(y_path)
-    declared_y_shape = tuple(numpy.asarray(split.y).shape)
+    declared_y_shape = tuple(numpy.asanyarray(split.y).shape)
     if tuple(y_shape) != declared_y_shape:
         loaded_y = numpy.load(y_path, mmap_mode="r", allow_pickle=False)
-        if tuple(numpy.asarray(loaded_y).reshape(-1).shape) != declared_y_shape:
+        if tuple(numpy.asanyarray(loaded_y).reshape(-1).shape) != declared_y_shape:
             raise ValueError(
                 f"Split {split.name!r} y_path shape mismatch: path has {tuple(y_shape)}, "
                 f"in-memory y has {declared_y_shape}."
@@ -618,7 +676,7 @@ def _validate_split_paths(split: SplitData) -> None:
 def _validate_integer_label_range(split: SplitData, schema: DatasetSchema) -> None:
     if split.y is None or schema.target_type != "multiclass":
         return
-    labels = numpy.asarray(split.y)
+    labels = numpy.asanyarray(split.y)
     if labels.size == 0:
         raise ValueError(f"Split {split.name!r} has no labels.")
     if schema.class_labels is not None:
@@ -652,9 +710,9 @@ def validate_dataset_bundle_integrity(bundle: DatasetBundle) -> None:
         if bundle.schema.target_type == "none":
             if split.X.ndim != 2:
                 raise ValueError(f"Split {split.name!r} X must be 2D.")
-        elif bundle.schema.class_labels is not None and not numpy.issubdtype(numpy.asarray(split.y).dtype, numpy.number):
-            split.X = numpy.asarray(split.X)
-            split.y = numpy.asarray(split.y).reshape(-1)
+        elif bundle.schema.class_labels is not None and not numpy.issubdtype(numpy.asanyarray(split.y).dtype, numpy.number):
+            split.X = numpy.asanyarray(split.X)
+            split.y = numpy.asanyarray(split.y).reshape(-1)
             if split.X.ndim != 2:
                 raise ValueError(f"Split {split.name!r} X must be 2D.")
             if split.X.shape[0] != split.y.shape[0]:
@@ -663,7 +721,7 @@ def validate_dataset_bundle_integrity(bundle: DatasetBundle) -> None:
                     f"y has {split.y.shape[0]} rows."
                 )
         else:
-            split.X, split.y = validate_xy_alignment(
+            validate_xy_alignment(
                 split.X,
                 split.y,
                 "DatasetBundle integrity",
@@ -677,11 +735,11 @@ def validate_dataset_bundle_integrity(bundle: DatasetBundle) -> None:
             )
         if (
                 bundle.schema.source_profile == "appclassnet_top200"
-                and (split.validate_paths or (split.x_path is not None and Path(split.x_path).is_file()))
-                and split.num_features != APPCLASSNET_FEATURE_COUNT):
+                and bundle.metadata.get("expected_num_features") is not None
+                and split.num_features != int(bundle.metadata["expected_num_features"])):
             raise ValueError(
-                f"Split {split.name!r} must have {APPCLASSNET_FEATURE_COUNT} AppClassNet features. "
-                f"Got {split.num_features}."
+                f"Split {split.name!r} must have {int(bundle.metadata['expected_num_features'])} "
+                f"AppClassNet features. Got {split.num_features}."
             )
         _validate_choice(split.data_space, DATA_SPACES, "data_space")
         if split.schema_hash is None:
@@ -693,7 +751,7 @@ def validate_dataset_bundle_integrity(bundle: DatasetBundle) -> None:
             )
         _validate_integer_label_range(split, bundle.schema)
         _validate_split_paths(split)
-        if split.source_indices is None:
+        if split.source_indices is None and split.x_path is None:
             split.source_indices = numpy.arange(split.num_rows, dtype=numpy.int64)
         if split.source_indices is not None:
             indices = numpy.asarray(split.source_indices, dtype=numpy.int64).reshape(-1)

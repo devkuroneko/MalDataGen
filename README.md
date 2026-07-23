@@ -79,11 +79,11 @@ It supports GPU acceleration, CSV/XLS ingestion, custom CLI scripts, and integra
 
 ### Optional AppClassNet npy_xy Support
 
-The default input mode remains the original single-CSV workflow. For AppClassNet top-200 and other datasets stored as separate NumPy `X/y` arrays, MalDataGen also supports an explicit `npy_xy` mode. See [docs/APPCLASSNET_NPY_XY.md](docs/APPCLASSNET_NPY_XY.md) for file layout, smoke tests, `split_mode=provided`, multiclass settings, sample plans, and known limitations.
+The default input mode remains the original single-CSV workflow. For AppClassNet top-200 and other datasets stored as separate NumPy `X/y` arrays, MalDataGen also supports an explicit `npy_xy` mode. See [docs/APPCLASSNET_NPY_XY.md](docs/to_delete/APPCLASSNET_NPY_XY.md) for file layout, smoke tests, `split_mode=provided`, multiclass settings, sample plans, and known limitations.
 
 ### AppClassNet batch-friendly classifiers
 
-For copy-ready normal, batches, full-run and comparison commands, see [docs/APPCLASSNET_BATCH_EXECUTION.md](docs/APPCLASSNET_BATCH_EXECUTION.md).
+For copy-ready normal, batches, full-run and comparison commands, see [docs/APPCLASSNET_BATCH_EXECUTION.md](docs/to_delete/APPCLASSNET_BATCH_EXECUTION.md).
 
 `run_appclassnet_top200.py -c sf` keeps the normal-mode classifier set used by the legacy scenario:
 `RandomForest`, `SupportVectorMachine`, `KNN`, `DecisionTree`, `NaiveBayes`, `GradientBoosting` and `StochasticGradientDescent`.
@@ -128,6 +128,17 @@ python3 run_appclassnet_top200.py --full -c sf  # deprecated alias for --run_mod
 ```
 
 Parameter precedence is `CLI > campaign > execution profile > global default`. The effective values and their origins are recorded in `RunResults.json`, alongside the selected mode, pipeline, evaluation summaries and artifact paths.
+
+### AppClassNet Top200 TR-TR Baseline
+
+AppClassNet Top200 TR-TR uses the provided NPY splits directly: real `train`
+data trains the classifier and real `test` data is the only test set. Synthetic
+data, generators, and synthetic quotas are not part of the TR-TR result.
+
+See [docs/audits/APPCLASSNET_TOP200_TR_TR_BASELINE.md](docs/audits/APPCLASSNET_TOP200_TR_TR_BASELINE.md)
+for the validated diagnostic command, Decision Tree subset/integral commands,
+Random Forest subset command, artifact layout, metric definitions, sampling
+semantics, reproduction notes, and current Random Forest integral limitation.
 ---
 ### Model architecure overivew
 WWe provide a visual overview of the internal architecture of each model's building blocks through five detailed figures, highlighting the main structural changes across the models. These diagrams are documented and explained in the Overview.md [Overview.md ] file.(https://github.com/SBSeg25/MalDataGen/blob/2dd9eaad74da7726c130e50dbc35f95a463cbd00/Docs/Overview.md)

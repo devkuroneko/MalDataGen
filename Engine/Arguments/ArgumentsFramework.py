@@ -68,6 +68,18 @@ DEFAULT_OUTPUT_PATH_TRAINING_CURVE = "training_curve"
 DEFAULT_CLASSIFIER_LIST = ["RandomForest", "KNN", "DecisionTree"]
 DEFAULT_EVALUATION_METHOD = ["TrAs", "TsAr"]
 DEFAULT_SAMPLE_PLAN = "legacy"
+CLASSIFIER_ALIASES = {
+    "decisiontree": "DecisionTree",
+    "decision_tree": "DecisionTree",
+    "randomforest": "RandomForest",
+    "random_forest": "RandomForest",
+    "decisiontreesubset": "DecisionTreeSubset",
+    "decision_tree_subset": "DecisionTreeSubset",
+    "randomforestsubset": "RandomForestSubset",
+    "random_forest_subset": "RandomForestSubset",
+    "randomforestlight": "RandomForestLight",
+    "random_forest_light": "RandomForestLight",
+}
 BATCH_CLASSIFIER_CHOICES = [
     "sgd",
     "passive_aggressive",
@@ -147,9 +159,17 @@ def add_argument_framework():
                         help='Total synthetic rows for --sample_plan total_rows or match_train_distribution.')
 
     parser.add_argument('-c', '--classifier', type=str, default=DEFAULT_CLASSIFIER_LIST, nargs="+",
-                        choices=Classifiers.dictionary_classifiers_name,
+                        choices=sorted(set(Classifiers.dictionary_classifiers_name) | set(CLASSIFIER_ALIASES)),
                         help="Classifier (or list of classifiers separated by empty space) default: {} availabe: {}.".format(
-                            DEFAULT_CLASSIFIER_LIST, Classifiers.dictionary_classifiers_name))
+                            DEFAULT_CLASSIFIER_LIST,
+                            sorted(set(Classifiers.dictionary_classifiers_name) | set(CLASSIFIER_ALIASES))))
+
+    parser.add_argument('--pipeline', type=str, default=None,
+                        choices=['tr_tr', 'synthetic', 'synthetic_eval', 'augmentation', 'all'],
+                        help='Pipeline selector. tr_tr executes real train -> real test; synthetic keeps legacy generation/evaluation.')
+
+    parser.add_argument('--baseline_real_only', action='store_true', default=False,
+                        help='Legacy alias for --pipeline tr_tr.')
 
     parser.add_argument('--batch_classifier', type=str, default=None,
                         choices=BATCH_CLASSIFIER_CHOICES,
@@ -184,6 +204,14 @@ def add_argument_framework():
     parser.add_argument('--test_samples_per_class', type=int, default=None,
                         help='Per-class evaluation cap used by batch evaluators when applicable.')
 
+    parser.add_argument('--train_sampling', type=str, default=None,
+                        choices=['all', 'balanced_per_class', 'up_to_available'],
+                        help='TR-TR train sampling strategy. all uses the full provided train split.')
+
+    parser.add_argument('--test_sampling', type=str, default=None,
+                        choices=['all', 'balanced_per_class', 'up_to_available'],
+                        help='TR-TR test sampling strategy. all evaluates the full provided test split.')
+
     parser.add_argument('--synthetic_train_samples_per_class', type=int, default=None,
                         help='Explicit per-class synthetic quota used to train TS-TR classifiers.')
 
@@ -192,6 +220,36 @@ def add_argument_framework():
 
     parser.add_argument('--n_estimators', type=int, default=None,
                         help='Estimator count for extra_trees_subset and random_forest_light.')
+
+    parser.add_argument('--rf_n_estimators', dest='random_forest_n_estimators', type=int, default=100,
+                        help='TR-TR RandomForestClassifier n_estimators.')
+
+    parser.add_argument('--rf_n_jobs', dest='random_forest_n_jobs', type=int, default=1,
+                        help='TR-TR RandomForestClassifier n_jobs.')
+
+    parser.add_argument('--rf_criterion', dest='random_forest_criterion', type=str, default='gini',
+                        choices=['gini', 'entropy', 'log_loss'],
+                        help='TR-TR RandomForestClassifier criterion.')
+
+    parser.add_argument('--rf_max_depth', dest='random_forest_max_depth', type=int, default=None,
+                        help='TR-TR RandomForestClassifier max_depth.')
+
+    parser.add_argument('--rf_min_samples_split', dest='random_forest_min_samples_split', default=2,
+                        help='TR-TR RandomForestClassifier min_samples_split.')
+
+    parser.add_argument('--rf_min_samples_leaf', dest='random_forest_min_samples_leaf', default=1,
+                        help='TR-TR RandomForestClassifier min_samples_leaf.')
+
+    parser.add_argument('--rf_max_features', dest='random_forest_max_features', default='sqrt',
+                        help='TR-TR RandomForestClassifier max_features.')
+
+    parser.add_argument('--rf_bootstrap', dest='random_forest_bootstrap', action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help='TR-TR RandomForestClassifier bootstrap.')
+
+    parser.add_argument('--rf_class_weight', dest='random_forest_class_weight', default=None,
+                        choices=[None, 'balanced', 'balanced_subsample'],
+                        help='TR-TR RandomForestClassifier class_weight.')
 
     parser.add_argument('--max_depth', type=int, default=None,
                         help='Tree max_depth for subset eval classifiers.')

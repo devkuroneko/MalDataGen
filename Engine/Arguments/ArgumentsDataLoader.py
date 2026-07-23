@@ -59,6 +59,7 @@ DEFAULT_MIN_SAMPLES_PER_CLASS_REQUIRED = 1
 DEFAULT_LEGACY_NUMBER_SAMPLES_PER_CLASS = "1:256,2:256"
 DEFAULT_REAL_CLASS_COUNT_POLICY = "strict"
 DEFAULT_SAMPLES_PER_CLASS_SCOPE = "split"
+DEFAULT_APPCLASSNET_TOP200_ROOT = 'Datasets/raw/AppClassNet/top200'
 MODEL_CLASS_COUNT_ARGUMENTS = (
     'autoencoder_number_classes',
     'variational_autoencoder_number_classes',
@@ -69,6 +70,29 @@ MODEL_CLASS_COUNT_ARGUMENTS = (
 
 
 def validate_data_load_arguments(arguments):
+    arguments.use_mmap = bool(getattr(arguments, 'mmap_npy', False))
+    if (
+        getattr(arguments, 'pipeline_effective', None) == 'tr_tr'
+        and getattr(arguments, 'source_profile', None) == 'appclassnet_top200'
+    ):
+        arguments.data_format = 'npy_xy'
+        arguments.split_mode = 'provided'
+        if not getattr(arguments, 'train_x_path', None):
+            arguments.train_x_path = f"{DEFAULT_APPCLASSNET_TOP200_ROOT}/train_x.npy"
+        if not getattr(arguments, 'train_y_path', None):
+            arguments.train_y_path = f"{DEFAULT_APPCLASSNET_TOP200_ROOT}/train_y.npy"
+        if not getattr(arguments, 'valid_x_path', None):
+            arguments.valid_x_path = f"{DEFAULT_APPCLASSNET_TOP200_ROOT}/valid_x.npy"
+        if not getattr(arguments, 'valid_y_path', None):
+            arguments.valid_y_path = f"{DEFAULT_APPCLASSNET_TOP200_ROOT}/valid_y.npy"
+        if not getattr(arguments, 'test_x_path', None):
+            arguments.test_x_path = f"{DEFAULT_APPCLASSNET_TOP200_ROOT}/test_x.npy"
+        if not getattr(arguments, 'test_y_path', None):
+            arguments.test_y_path = f"{DEFAULT_APPCLASSNET_TOP200_ROOT}/test_y.npy"
+        if getattr(arguments, 'target_type', 'auto') == 'auto':
+            arguments.target_type = 'multiclass'
+        if getattr(arguments, 'feature_type', 'auto') == 'auto':
+            arguments.feature_type = 'continuous'
     arguments._legacy_number_samples_per_class_explicit = bool(
         getattr(arguments, '_legacy_number_samples_per_class_explicit', False)
     )
@@ -78,8 +102,9 @@ def validate_data_load_arguments(arguments):
         'strict',
         'uniform_min',
         'available_cap',
+        'cap_to_available',
     }:
-        raise ValueError("--real_class_count_policy must be one of: strict, uniform_min, available_cap.")
+        raise ValueError("--real_class_count_policy must be one of: strict, uniform_min, available_cap, cap_to_available.")
     if getattr(arguments, 'samples_per_class_scope', DEFAULT_SAMPLES_PER_CLASS_SCOPE) not in {'split', 'fold'}:
         raise ValueError("--samples_per_class_scope must be one of: split, fold.")
 
@@ -137,6 +162,9 @@ def validate_data_load_arguments(arguments):
 
     sample_plan = getattr(arguments, 'sample_plan', 'legacy')
     has_explicit_legacy_counts = getattr(arguments, '_legacy_number_samples_per_class_explicit', False)
+    if getattr(arguments, 'pipeline_effective', None) == 'tr_tr':
+        return arguments
+
     if sample_plan == 'legacy' and not has_explicit_legacy_counts:
         raise ValueError(
             "data_format=npy_xy requires an explicit sampling plan. Use --sample_plan balanced_per_class "
@@ -228,7 +256,7 @@ def add_argument_data_load(parser):
     parser.add_argument('--scaler', type=str, default=DEFAULT_SCALER,
                         choices=['none', 'minmax', 'standard'],
                         help=("Feature scaler. Default 'none' preserves the legacy CSV behavior; AppClassNet "
-                              "runner defaults to minmax and passes preprocessed arrays to the pipeline."))
+                              "runner defaults to preserve/source and only scales when explicitly requested."))
 
     parser.add_argument('--source_profile', type=str, default=DEFAULT_SOURCE_PROFILE,
                         choices=['legacy_csv', 'appclassnet_top200', 'custom'],
@@ -284,6 +312,9 @@ def add_argument_data_load(parser):
                         help=("Use numpy memory mapping for npy_xy files. Default is False at CLI level to keep "
                               "new behavior opt-in; CSV mode ignores this flag."))
 
+    parser.add_argument('--use_mmap', action='store_true', dest='mmap_npy',
+                        help='Alias for --mmap_npy.')
+
     parser.add_argument('--execution_mode', type=str, default=DEFAULT_EXECUTION_MODE,
                         choices=['normal', 'batches'],
                         help=("Execution mode. Default 'normal' preserves the current full-matrix flow. "
@@ -314,10 +345,10 @@ def add_argument_data_load(parser):
 
     parser.add_argument('--real_class_count_policy', type=str,
                         default=DEFAULT_REAL_CLASS_COUNT_POLICY,
-                        choices=['strict', 'uniform_min', 'available_cap'],
+                        choices=['strict', 'uniform_min', 'available_cap', 'cap_to_available'],
                         help=('Policy applied after selecting the real split for per-class real evaluation quotas. '
                               'strict requires the requested count; uniform_min uses a common capped count; '
-                              'available_cap caps each class independently.'))
+                              'available_cap/cap_to_available caps each class independently.'))
 
     parser.add_argument('--samples_per_class_scope', type=str,
                         default=DEFAULT_SAMPLES_PER_CLASS_SCOPE,

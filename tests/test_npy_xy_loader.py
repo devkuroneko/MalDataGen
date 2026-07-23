@@ -41,7 +41,7 @@ class NpyXYLoaderTest(unittest.TestCase):
     def test_loads_train_valid_test(self):
         with tempfile.TemporaryDirectory() as directory:
             train_x, train_y = self._save_split(directory, "train", numpy.zeros((3, 4)), [0, 1, 2])
-            valid_x, valid_y = self._save_split(directory, "valid", numpy.ones((2, 4)), [[1], [2]])
+            valid_x, valid_y = self._save_split(directory, "valid", numpy.ones((2, 4)), [1, 2])
             test_x, test_y = self._save_split(directory, "test", numpy.full((1, 4), 2.0), [0])
 
             bundle = NpyXYLoader(
@@ -59,6 +59,13 @@ class NpyXYLoaderTest(unittest.TestCase):
             self.assertEqual(bundle.test.X.shape, (1, 4))
             self.assertEqual(set(bundle.splits.keys()), {"train", "valid", "test"})
             self.assertEqual(bundle.schema.num_classes, 3)
+            self.assertEqual(bundle.schema.num_features, 4)
+            self.assertEqual(bundle.schema.classes, (0, 1, 2))
+            self.assertEqual(bundle.schema.data_format, "npy_xy")
+            self.assertEqual(bundle.schema.split_mode, "provided")
+            self.assertEqual(bundle.schema.target_dtype, str(bundle.train.y.dtype))
+            self.assertEqual(bundle.schema.train_feature_min, 0.0)
+            self.assertEqual(bundle.schema.train_feature_max, 0.0)
 
     def test_raises_when_x_y_rows_are_incompatible(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -66,6 +73,14 @@ class NpyXYLoaderTest(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "row mismatch"):
                 NpyXYLoader(train_x, train_y).load()
+
+    def test_raises_when_split_feature_widths_differ(self):
+        with tempfile.TemporaryDirectory() as directory:
+            train_x, train_y = self._save_split(directory, "train", numpy.zeros((3, 2)), [0, 1, 2])
+            valid_x, valid_y = self._save_split(directory, "valid", numpy.zeros((3, 3)), [0, 1, 2])
+
+            with self.assertRaisesRegex(ValueError, "expected 2"):
+                NpyXYLoader(train_x, train_y, valid_x_path=valid_x, valid_y_path=valid_y).load()
 
     def test_infers_twenty_feature_names(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -92,6 +107,47 @@ class NpyXYLoaderTest(unittest.TestCase):
             train_x, train_y = self._save_split(directory, "train", numpy.zeros((2, 2)), [0.0, 1.5])
 
             with self.assertRaisesRegex(ValueError, "integer labels"):
+                NpyXYLoader(train_x, train_y).load()
+
+    def test_rejects_negative_labels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            train_x, train_y = self._save_split(directory, "train", numpy.zeros((2, 2)), [0, -1])
+
+            with self.assertRaisesRegex(ValueError, "negative labels"):
+                NpyXYLoader(train_x, train_y).load()
+
+    def test_preserves_memmap_and_values_when_mmap_enabled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            values = numpy.array([[0.25, -0.25], [0.5, -0.5]], dtype=numpy.float64)
+            train_x, train_y = self._save_split(directory, "train", values, [0, 1])
+
+            bundle = NpyXYLoader(train_x, train_y, mmap_mode="r").load()
+
+            self.assertIsInstance(bundle.train.X, numpy.memmap)
+            self.assertIsInstance(bundle.train.y, numpy.memmap)
+            numpy.testing.assert_array_equal(bundle.train.X, values)
+
+    def test_accepts_appclassnet_zero_to_199_labels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            labels = numpy.arange(200, dtype=numpy.int16)
+            train_x, train_y = self._save_split(directory, "train", numpy.zeros((200, 3)), labels)
+
+            bundle = NpyXYLoader(
+                train_x,
+                train_y,
+                source_profile="appclassnet_top200",
+                expected_num_features=3,
+            ).load()
+
+            self.assertEqual(bundle.schema.num_classes, 200)
+            self.assertEqual(bundle.schema.classes[0], 0)
+            self.assertEqual(bundle.schema.classes[-1], 199)
+
+    def test_rejects_npy_y_with_more_than_one_dimension(self):
+        with tempfile.TemporaryDirectory() as directory:
+            train_x, train_y = self._save_split(directory, "train", numpy.zeros((2, 2)), [[0], [1]])
+
+            with self.assertRaisesRegex(ValueError, "must be 1D"):
                 NpyXYLoader(train_x, train_y).load()
 
     def test_warns_for_one_based_labels_without_remapping(self):

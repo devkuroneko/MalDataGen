@@ -52,6 +52,7 @@ try:
     from Engine.DataIO.CSVLoader import autoload
     from Engine.DataIO.SamplePlanner import build_sample_plan_from_args
     from Engine.DataIO.SamplePlanner import sample_plan_to_legacy_metadata
+    from Engine.DataIO.RealClassCountPolicy import build_split_sample_plan
 
     from Engine.Arguments.Arguments import Arguments
     from Engine.Arguments.Arguments import arguments
@@ -83,6 +84,9 @@ try:
     from Engine.Preprocessing.FeatureTransformManager import FeatureTransformPolicy
     from Engine.Preprocessing.FeatureTransformManager import ModelInputAdapter
     from Engine.Preprocessing.FeatureTransformManager import ScaleGuard
+    from Engine.Pipelines.Interfaces import partition_generation_classes
+    from Engine.Evaluation.TrTrPipeline import run_tr_tr_pipeline
+    from Engine.Evaluation.TrTrPipeline import tr_tr_config_from_namespace
 
     from Engine.Classifiers.Classifiers import Classifiers
 
@@ -741,6 +745,76 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
         logging.info("Consolidated protocol summary saved to %s", summary_path)
         return protocol_path, summary_path
 
+    def _run_explicit_tr_tr_pipeline(self):
+        bundle = getattr(self, "_dataset_bundle", None)
+        if bundle is None:
+            raise ValueError(
+                "pipeline=tr_tr requires data_format=npy_xy with a loaded DatasetBundle. "
+                "Provide train_x/train_y and test_x/test_y paths."
+            )
+        if getattr(bundle, "test", None) is None:
+            raise ValueError("pipeline=tr_tr requires a provided test split.")
+
+        config = tr_tr_config_from_namespace(self.arguments)
+        output_base = Path(self.current_subdir) / "tr_tr"
+        model_params = {
+            "classifier": config.classifier,
+            "random_state": config.random_state,
+            "decision_tree": {
+                "criterion": config.decision_tree_criterion,
+                "splitter": config.decision_tree_splitter,
+                "max_depth": config.decision_tree_max_depth,
+                "min_samples_split": config.decision_tree_min_samples_split,
+                "min_samples_leaf": config.decision_tree_min_samples_leaf,
+                "max_features": config.decision_tree_max_features,
+                "class_weight": config.decision_tree_class_weight,
+            },
+            "random_forest": {
+                "n_estimators": config.n_estimators or 100,
+                "criterion": config.random_forest_criterion,
+                "max_depth": config.random_forest_max_depth,
+                "min_samples_split": config.random_forest_min_samples_split,
+                "min_samples_leaf": config.random_forest_min_samples_leaf,
+                "max_features": config.random_forest_max_features,
+                "bootstrap": config.random_forest_bootstrap,
+                "class_weight": config.random_forest_class_weight,
+                "n_jobs": config.random_forest_n_jobs,
+            },
+        }
+        resolved_config = {
+            "pipeline": "tr_tr",
+            "protocol": "TR-TR",
+            "classifier_requested": getattr(self.arguments, "classifier_requested", None),
+            "classifier_canonical": getattr(self.arguments, "classifier_canonical", None),
+            "train_split": getattr(bundle.train, "name", None),
+            "test_split": getattr(bundle.test, "name", None),
+            "train_sampling": config.train_sampling,
+            "test_sampling": config.test_sampling,
+            "train_samples_effective": int(bundle.train.num_rows) if config.train_sampling == "all" else None,
+            "test_samples_effective": int(bundle.test.num_rows) if config.test_sampling == "all" else None,
+            "mmap": bool(getattr(self.arguments, "use_mmap", False) or getattr(self.arguments, "mmap_npy", False)),
+            "feature_transform": getattr(self.arguments, "feature_transform", None),
+            "classifier_transform": getattr(self.arguments, "classifier_transform", None),
+            "evaluation_space": getattr(self.arguments, "evaluation_space", None),
+            "random_state": config.random_state,
+            "model_parameters": model_params,
+        }
+        logging.info("Resolved main.py TR-TR configuration: %s", json.dumps(_json_ready(resolved_config), sort_keys=True))
+        result = run_tr_tr_pipeline(
+            bundle,
+            config,
+            output_base,
+            resolved_arguments=vars(self.arguments),
+            repo_root=Path.cwd(),
+        )
+        resolved_config["train_samples_effective"] = result.get("samples", {}).get("train_total_effective")
+        resolved_config["test_samples_effective"] = result.get("samples", {}).get("test_total_effective")
+        logging.info("Completed main.py TR-TR configuration: %s", json.dumps(_json_ready(resolved_config), sort_keys=True))
+        self._dictionary_metrics["TR-TR"] = result
+        self._dictionary_metrics["RunConfig"] = resolved_config
+        self.save_dictionary_to_json(self.get_evaluation_results_path() + "/Results.json")
+        return result
+
     @import_metrics
     @import_classifiers
     @StratifiedData
@@ -764,6 +838,9 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
         Args:
             :None
         """
+
+        if getattr(self.arguments, "pipeline_effective", None) == "tr_tr":
+            return self._run_explicit_tr_tr_pipeline()
 
         logging.info("Starting experiment runs across %d folds.", len(self.list_folds))
 
@@ -806,10 +883,18 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                     dictionary_data['x_training_real'],
                     split_name="train",
                 )
-                x_evaluation_for_generator = self._model_input_adapter.transform_generator_input(
-                    dictionary_data['x_evaluation_real'],
-                    split_name=dictionary_data.get("evaluation_split_name", "evaluation"),
-                )
+                if (
+                        getattr(self.arguments, "split_mode", "cross_validation") == "provided"
+                        and dictionary_data.get("evaluation_split_name") == "test"
+                ):
+                    x_evaluation_for_generator = x_training_for_generator
+                    y_evaluation_for_generation = dictionary_data['y_training_real']
+                else:
+                    x_evaluation_for_generator = self._model_input_adapter.transform_generator_input(
+                        dictionary_data['x_evaluation_real'],
+                        split_name=dictionary_data.get("evaluation_split_name", "evaluation"),
+                    )
+                    y_evaluation_for_generation = dictionary_data['y_evaluation_real']
                 self._current_real_source_metadata = ScaleGuard.describe(
                     dictionary_data['x_evaluation_real'],
                     data_space="source",
@@ -871,7 +956,7 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                     with self.resource_timer("generation"):
                         evaluation_synthetic = self.synthesize_data(
                                                       x_evaluation_for_generator,
-                                                      dictionary_data['y_evaluation_real'],
+                                                      y_evaluation_for_generation,
                                                       x_training_for_generator,
                                                       dictionary_data['y_training_real'],
                                                       monitor_path,
@@ -1276,6 +1361,16 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
             "transform_id": None,
             "transform_history": [],
         }
+        ScaleGuard.validate_evaluation_space_contract(
+            self._current_real_source_metadata,
+            getattr(self.arguments, "evaluation_space", "source"),
+            context="real evaluation input",
+        )
+        ScaleGuard.validate_evaluation_space_contract(
+            synthetic_metadata,
+            getattr(self.arguments, "evaluation_space", "source"),
+            context="synthetic evaluation input",
+        )
         ScaleGuard.validate_before_evaluation(
             dictionary_data['x_evaluation_real'],
             synthetic_values,
@@ -1309,18 +1404,10 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
         raise NotImplementedError(reason)
 
     def _partition_generation_units(self, class_counts):
-        classes = sorted(int(class_id) for class_id, count in class_counts.items() if int(count) > 0)
         strategy = getattr(self.arguments, "generation_strategy", "single_conditional")
         if strategy == "per_class":
-            return [{"unit_type": "class", "classes": [class_id]} for class_id in classes]
-
-        classes_per_group = int(getattr(self.arguments, "classes_per_group", 10))
-        if classes_per_group <= 0:
-            raise ValueError("--classes_per_group must be a positive integer.")
-        return [
-            {"unit_type": "group", "classes": classes[start:start + classes_per_group]}
-            for start in range(0, len(classes), classes_per_group)
-        ]
+            return partition_generation_classes(class_counts, "per_class", int(getattr(self.arguments, "classes_per_group", 10)))
+        return partition_generation_classes(class_counts, "grouped_classes", int(getattr(self.arguments, "classes_per_group", 10)))
 
     @staticmethod
     def _subset_by_classes(x_values, y_values, classes):
@@ -1616,8 +1703,8 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                         )
                         test_reader = self._synthesize_data_incremental(
                             test_plan,
-                            x_real_samples,
-                            y_real_samples,
+                            x_training_real,
+                            y_training_real,
                             split_name="test",
                             seed=43,
                         )
@@ -2277,6 +2364,20 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
             output_format = getattr(self.arguments, "save_synthetic_format", "npy_batches")
             if output_format == "legacy":
                 output_format = "npy_batches"
+            real_count_policy = getattr(self.arguments, "real_class_count_policy", "strict")
+            strategy = "up_to_available" if real_count_policy in {"available_cap", "cap_to_available"} else "balanced_per_class"
+            sample_plan = build_split_sample_plan(
+                source_y,
+                samples_per_class,
+                number_classes,
+                random_state,
+                split_name,
+                strategy=strategy,
+                insufficient_policy=real_count_policy,
+                replacement=False,
+                require_all_classes=True,
+            )
+            effective_total_samples = int(sample_plan.total_rows)
             writer = SyntheticBatchWriter(
                 root_dir=self.directory_output_data,
                 num_classes=number_classes,
@@ -2292,7 +2393,7 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                 fold_number=self.fold_number + 1,
                 **self._schema_metadata_for_synthetic_manifest(),
                 **self._synthetic_manifest_audit_metadata({
-                    "classes": {class_id: samples_per_class for class_id in range(number_classes)},
+                    "classes": sample_plan.class_counts,
                     "number_classes": number_classes,
                     "generation_batch_size": samples_per_class,
                     "sample_plan": "synthetic_control",
@@ -2305,7 +2406,8 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                 "source_y_path": source_data.y_path,
                 "source_dataset_id": source_data.dataset_id,
                 "samples_per_class": samples_per_class,
-                "total_samples": int(samples_per_class * number_classes),
+                "total_samples_requested": int(samples_per_class * number_classes),
+                "total_samples": effective_total_samples,
                 "num_classes": number_classes,
                 "feature_count": int(source_x.shape[1]),
                 "data_space": "source",
@@ -2313,37 +2415,44 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                 "random_state": int(random_state),
                 "source_class_counts": {str(key): int(value) for key, value in class_counts.items()},
                 "source_indices": {},
+                "sample_plan_strategy": sample_plan.mode,
+                "selection_table": sample_plan.selection_table,
+                "selected_counts_by_class": sample_plan.metadata["selected_counts_by_class"],
             })
             if output_format == "single_npy":
-                writer.initialize_single_npy(samples_per_class * number_classes)
+                writer.initialize_single_npy(effective_total_samples)
 
             rng = numpy.random.default_rng(random_state)
             selected_x = []
             selected_y = []
             class_indices_by_label = {}
+            selected_plan_indices = (
+                None
+                if sample_plan.selected_indices is None
+                else numpy.asarray(sample_plan.selected_indices, dtype=numpy.int64)
+            )
             for label_class in range(number_classes):
-                class_indices = numpy.flatnonzero(source_y == label_class)
-                if class_indices.shape[0] < samples_per_class:
-                    raise ValueError(
-                        f"synthetic_control={control} split={split_name} class={label_class} "
-                        f"requires {samples_per_class} real rows but only {class_indices.shape[0]} are available."
-                    )
-                chosen = rng.choice(class_indices, size=samples_per_class, replace=False)
+                if selected_plan_indices is None:
+                    chosen = numpy.flatnonzero(source_y == label_class)
+                else:
+                    chosen = selected_plan_indices[source_y[selected_plan_indices] == label_class]
                 class_indices_by_label[label_class] = chosen
                 selected_x.append(numpy.asarray(source_x[chosen], dtype=numpy.float32))
-                selected_y.append(numpy.full(samples_per_class, label_class, dtype=numpy.int64))
+                selected_y.append(numpy.full(chosen.shape[0], label_class, dtype=numpy.int64))
 
             if control == "real_resample":
                 for label_class in sorted(class_indices_by_label):
                     selected_indices = class_indices_by_label[label_class]
                     x_class = numpy.asarray(source_x[selected_indices], dtype=numpy.float32)
                     writer.write_batch(label_class, 0, x_class)
-                    writer.manifest["source_indices"][str(label_class)] = [
-                        int(index) for index in selected_indices.tolist()
-                    ]
-                    writer.manifest["batches_by_class"][str(label_class)][-1]["source_indices"] = [
-                        int(index) for index in selected_indices.tolist()
-                    ]
+                    writer.manifest["source_indices"][str(label_class)] = {
+                        "count": int(selected_indices.shape[0]),
+                        "min": int(selected_indices.min()) if selected_indices.size else None,
+                        "max": int(selected_indices.max()) if selected_indices.size else None,
+                    }
+                    writer.manifest["batches_by_class"][str(label_class)][-1]["source_indices"] = (
+                        writer.manifest["source_indices"][str(label_class)]
+                    )
                     self.record_batch_processed(x_class.shape[0])
             else:
                 all_x = numpy.vstack(selected_x) if selected_x else numpy.empty((0, self.get_number_columns()), dtype=numpy.float32)
@@ -2352,10 +2461,12 @@ class SynDataGen(Arguments, CSVDataProcessor, Metrics, GenerativeModels, Classif
                 for label_class in range(number_classes):
                     x_class = all_x[permuted_y == label_class]
                     writer.write_batch(label_class, 0, x_class)
-                    writer.manifest["source_indices"][str(label_class)] = [
-                        int(index)
-                        for index in class_indices_by_label.get(label_class, numpy.asarray([], dtype=numpy.int64)).tolist()
-                    ]
+                    source_indices = class_indices_by_label.get(label_class, numpy.asarray([], dtype=numpy.int64))
+                    writer.manifest["source_indices"][str(label_class)] = {
+                        "count": int(source_indices.shape[0]),
+                        "min": int(source_indices.min()) if source_indices.size else None,
+                        "max": int(source_indices.max()) if source_indices.size else None,
+                    }
                     self.record_batch_processed(x_class.shape[0])
 
             reader = writer.close()

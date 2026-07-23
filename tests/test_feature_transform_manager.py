@@ -23,16 +23,32 @@ class FeatureTransformManagerTest(unittest.TestCase):
         return FeatureTransformPolicy.for_profile("appclassnet_top200", **overrides)
 
     def test_appclassnet_preserve_keeps_values_and_records_no_transform(self):
-        values = numpy.array([[-0.5, 0.0, 0.5], [-0.25, 0.25, 0.4]], dtype=numpy.float32)
+        values = numpy.array([[-0.5, 0.0, 0.5], [-0.25, 0.25, 0.4]], dtype=numpy.float64)
         manager = FeatureTransformManager(self._app_policy(), stage="feature")
 
         manager.fit(values, split_name="train")
         transformed, metadata = manager.transform(values, return_metadata=True)
 
+        self.assertIs(transformed, values)
         numpy.testing.assert_array_equal(transformed, values)
+        self.assertEqual(transformed.dtype, values.dtype)
+        self.assertFalse(manager.transform_applied)
+        self.assertIsNone(manager.scaler)
         self.assertIsNone(manager.transform_id)
+        self.assertFalse(metadata["transform_applied"])
         self.assertEqual(metadata["transform_history"], [])
         self.assertEqual(metadata["data_space"], "source")
+
+    def test_appclassnet_preserve_inverse_transform_keeps_values_and_dtype(self):
+        values = numpy.array([[-0.5, 0.0], [0.5, 0.25]], dtype=numpy.float64)
+        manager = FeatureTransformManager(self._app_policy(), stage="feature")
+
+        manager.fit(values, split_name="train")
+        inverse = manager.inverse_transform(values)
+
+        self.assertIs(inverse, values)
+        numpy.testing.assert_array_equal(inverse, values)
+        self.assertEqual(inverse.dtype, values.dtype)
 
     def test_appclassnet_generator_minmax_inverse_returns_source_scale(self):
         source = numpy.array([[-0.5, 0.0], [0.5, 0.25], [0.0, 0.5]], dtype=numpy.float32)
@@ -91,6 +107,14 @@ class FeatureTransformManagerTest(unittest.TestCase):
                 transform_history=metadata["transform_history"],
             )
 
+    def test_preserve_rejects_loaded_scaler_parameters(self):
+        values = numpy.array([[-0.5, 0.0], [0.5, 0.25]], dtype=numpy.float32)
+        manager = FeatureTransformManager(self._app_policy(), stage="feature")
+        manager.scaler = object()
+
+        with self.assertRaisesRegex(ValueError, "preserve.*scaler"):
+            manager.transform(values)
+
     def test_real_synthetic_space_mismatch_blocks_evaluation(self):
         real = numpy.array([[-0.5, 0.0], [0.5, 0.25]], dtype=numpy.float32)
         synthetic = numpy.array([[0.0, 1.0], [0.5, 0.75]], dtype=numpy.float32)
@@ -104,6 +128,22 @@ class FeatureTransformManagerTest(unittest.TestCase):
                 real_metadata,
                 synthetic_metadata,
                 context="TS-TR",
+            )
+
+    def test_evaluation_space_source_rejects_transformed_history(self):
+        metadata = {
+            "data_space": "classifier",
+            "transform_id": "abc",
+            "transform_history": [
+                {"operation": "minmax", "output_space": "classifier", "transform_id": "abc"},
+            ],
+        }
+
+        with self.assertRaises(PreprocessingSpaceMismatchError):
+            ScaleGuard.validate_evaluation_space_contract(
+                metadata,
+                "source",
+                context="TR-TR",
             )
 
     def test_tree_classifier_policy_preserves_appclassnet_scale(self):
@@ -181,6 +221,38 @@ class FeatureTransformManagerTest(unittest.TestCase):
         self.assertEqual(manifest["transform_id"], manager.transform_id)
         self.assertEqual(manifest["transformations"][0]["operation"], "minmax")
         self.assertEqual(manifest["transformations"][0]["fit_split"], "train")
+
+    def test_manifest_records_explicit_preserve_policy(self):
+        values = numpy.array([[-0.5, 0.0], [0.5, 0.25]], dtype=numpy.float32)
+        manager = FeatureTransformManager(self._app_policy(), stage="feature")
+        manager.fit(values, split_name="train")
+
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_path = Path(directory) / "preprocessing_manifest.json"
+            TransformManifest(
+                source_profile="appclassnet_top200",
+                feature_transform="preserve",
+                classifier_transform="preserve",
+                generator_transform="preserve",
+                evaluation_space="source",
+                source_min=-0.5,
+                source_max=0.5,
+                transformed_min=-0.5,
+                transformed_max=0.5,
+                transform_fitted=False,
+                transform_parameters={},
+                transformations=manager.transform_history,
+            ).save(manifest_path)
+            manifest = json.loads(manifest_path.read_text())
+
+        self.assertEqual(manifest["feature_transform"], "preserve")
+        self.assertEqual(manifest["classifier_transform"], "preserve")
+        self.assertEqual(manifest["generator_transform"], "preserve")
+        self.assertEqual(manifest["evaluation_space"], "source")
+        self.assertFalse(manifest["transform_fitted"])
+        self.assertEqual(manifest["transform_parameters"], {})
+        self.assertEqual(manifest["source_min"], -0.5)
+        self.assertEqual(manifest["transformed_max"], 0.5)
 
 
 if __name__ == "__main__":

@@ -3,13 +3,27 @@ from types import SimpleNamespace
 
 from Engine.Arguments.ArgumentsDataLoader import add_argument_data_load
 from Engine.Arguments.ArgumentsDataLoader import validate_data_load_arguments
+from Engine.Arguments.Arguments import _configure_classifier_arguments
+from Engine.Arguments.Arguments import _configure_pipeline_arguments
+from Engine.Arguments.Arguments import _normalize_evaluation_protocol_arguments
 from Engine.Arguments.ArgumentsFramework import add_argument_framework
 from Engine.Arguments.Arguments import _normalize_preprocessing_arguments
+from Engine.Evaluation.TrTrPipeline import build_tr_tr_classifier
+from Engine.Evaluation.TrTrPipeline import tr_tr_config_from_namespace
 
 
 def build_parser():
     parser = add_argument_framework()
     return add_argument_data_load(parser)
+
+
+def parse_main_cli(raw_args):
+    parsed = build_parser().parse_args(raw_args)
+    parsed = _normalize_preprocessing_arguments(parsed)
+    parsed = _configure_pipeline_arguments(parsed)
+    parsed = _normalize_evaluation_protocol_arguments(parsed)
+    parsed = _configure_classifier_arguments(parsed)
+    return validate_data_load_arguments(parsed)
 
 
 class DataLoaderArgumentsTest(unittest.TestCase):
@@ -163,6 +177,118 @@ class DataLoaderArgumentsTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "valid_x_path"):
             validate_data_load_arguments(parsed)
+
+    def test_main_parser_accepts_camel_decision_tree_for_tr_tr(self):
+        parsed = parse_main_cli([
+            "--pipeline", "tr_tr",
+            "-c", "DecisionTree",
+            "--source_profile", "appclassnet_top200",
+            "--train_sampling", "all",
+            "--test_sampling", "all",
+        ])
+
+        self.assertEqual(parsed.pipeline_effective, "tr_tr")
+        self.assertEqual(parsed.baseline_classifier, "decision_tree")
+        self.assertEqual(parsed.classifier_canonical, "DecisionTree")
+
+    def test_main_parser_accepts_camel_random_forest_for_tr_tr(self):
+        parsed = parse_main_cli([
+            "--pipeline", "tr_tr",
+            "-c", "RandomForest",
+            "--source_profile", "appclassnet_top200",
+            "--train_sampling", "all",
+            "--test_sampling", "all",
+        ])
+
+        self.assertEqual(parsed.baseline_classifier, "random_forest")
+        self.assertEqual(parsed.classifier_canonical, "RandomForest")
+
+    def test_main_parser_accepts_snake_case_classifier_aliases(self):
+        decision_tree = parse_main_cli([
+            "--pipeline", "tr_tr",
+            "-c", "decision_tree",
+            "--source_profile", "appclassnet_top200",
+            "--train_sampling", "all",
+            "--test_sampling", "all",
+        ])
+        random_forest = parse_main_cli([
+            "--pipeline", "tr_tr",
+            "-c", "random_forest",
+            "--source_profile", "appclassnet_top200",
+            "--train_sampling", "all",
+            "--test_sampling", "all",
+        ])
+
+        self.assertEqual(decision_tree.classifier_canonical, "DecisionTree")
+        self.assertEqual(decision_tree.baseline_classifier, "decision_tree")
+        self.assertEqual(random_forest.classifier_canonical, "RandomForest")
+        self.assertEqual(random_forest.baseline_classifier, "random_forest")
+
+    def test_use_mmap_and_mmap_npy_resolve_to_same_configuration(self):
+        base = [
+            "--pipeline", "tr_tr",
+            "-c", "DecisionTree",
+            "--source_profile", "appclassnet_top200",
+            "--train_sampling", "all",
+            "--test_sampling", "all",
+        ]
+
+        use_mmap = parse_main_cli([*base, "--use_mmap"])
+        mmap_npy = parse_main_cli([*base, "--mmap_npy"])
+
+        self.assertTrue(use_mmap.mmap_npy)
+        self.assertTrue(use_mmap.use_mmap)
+        self.assertTrue(mmap_npy.mmap_npy)
+        self.assertTrue(mmap_npy.use_mmap)
+
+    def test_pipeline_tr_tr_does_not_require_synthetic_arguments_or_sample_plan(self):
+        parsed = parse_main_cli([
+            "--pipeline", "tr_tr",
+            "-c", "DecisionTree",
+            "--source_profile", "appclassnet_top200",
+            "--train_sampling", "all",
+            "--test_sampling", "all",
+        ])
+
+        self.assertTrue(parsed.baseline_real_only)
+        self.assertEqual(parsed.evaluation_protocol, "tr_tr")
+        self.assertEqual(parsed.data_format, "npy_xy")
+        self.assertEqual(parsed.split_mode, "provided")
+        self.assertTrue(parsed.train_x_path.endswith("train_x.npy"))
+        self.assertTrue(parsed.test_y_path.endswith("test_y.npy"))
+
+    def test_balanced_per_class_requires_matching_quota(self):
+        with self.assertRaisesRegex(ValueError, "train_samples_per_class"):
+            parse_main_cli([
+                "--pipeline", "tr_tr",
+                "-c", "DecisionTree",
+                "--source_profile", "appclassnet_top200",
+                "--train_sampling", "balanced_per_class",
+                "--test_sampling", "all",
+            ])
+
+    def test_rf_parameters_reach_random_forest_classifier(self):
+        parsed = parse_main_cli([
+            "--pipeline", "tr_tr",
+            "-c", "RandomForest",
+            "--source_profile", "appclassnet_top200",
+            "--train_sampling", "all",
+            "--test_sampling", "all",
+            "--rf_n_estimators", "17",
+            "--rf_n_jobs", "3",
+        ])
+
+        model = build_tr_tr_classifier(tr_tr_config_from_namespace(parsed))
+
+        self.assertEqual(model.get_params(deep=True)["n_estimators"], 17)
+        self.assertEqual(model.get_params(deep=True)["n_jobs"], 3)
+
+    def test_csv_legacy_still_parses_without_pipeline(self):
+        parsed = parse_main_cli([])
+
+        self.assertEqual(parsed.data_format, "csv")
+        self.assertEqual(parsed.pipeline_effective, "synthetic")
+        self.assertFalse(parsed.baseline_real_only)
 
 
 if __name__ == "__main__":

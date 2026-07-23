@@ -72,7 +72,7 @@ def _now_iso() -> str:
 
 
 def _array_stats(values, chunk_size: int | None = None) -> dict[str, Any]:
-    values = numpy.asarray(values)
+    values = numpy.asanyarray(values)
     if values.ndim != 2:
         raise ValueError(f"Expected a 2D feature matrix. Got shape {values.shape}.")
 
@@ -228,11 +228,20 @@ class FeatureTransformPolicy:
 @dataclass(slots=True)
 class TransformManifest:
     source_profile: str
+    feature_transform: str = "preserve"
+    classifier_transform: str = "preserve"
+    generator_transform: str = "preserve"
     paths: dict[str, Any] = field(default_factory=dict)
     original_ranges: dict[str, Any] = field(default_factory=dict)
     current_ranges: dict[str, Any] = field(default_factory=dict)
     transformations: list[dict[str, Any]] = field(default_factory=list)
     transform_id: str | None = None
+    source_min: float | None = None
+    source_max: float | None = None
+    transformed_min: float | None = None
+    transformed_max: float | None = None
+    transform_fitted: bool = False
+    transform_parameters: dict[str, Any] = field(default_factory=dict)
     train_fit: dict[str, Any] = field(default_factory=dict)
     split_usage: dict[str, Any] = field(default_factory=dict)
     generator_input_space: str = "source"
@@ -270,6 +279,7 @@ class FeatureTransformManager:
         self.output_range = None
         self.transform_history: list[dict[str, Any]] = []
         self.fit_stats = None
+        self.transform_applied = False
 
     @property
     def is_identity(self) -> bool:
@@ -301,6 +311,11 @@ class FeatureTransformManager:
         return hashlib.sha256(encoded).hexdigest()[:16]
 
     def _check_can_fit(self) -> None:
+        if self.operation == "preserve" and self.scaler is not None:
+            raise FeatureTransformError(
+                f"{self.stage} transform is preserve but scaler parameters are loaded; "
+                "refusing an incoherent identity/scaler configuration."
+            )
         if self.scaler is not None and not self.policy.allow_refit:
             raise ScalerRefitError(
                 f"{self.stage} scaler is already fitted on {self.fit_split}; allow_refit=false prevents refit."
@@ -342,6 +357,7 @@ class FeatureTransformManager:
             self.scaler = None
             self.output_range = self.input_range
             self.transform_id = None
+            self.transform_applied = False
             return self
 
         self.scaler = self._make_scaler()
@@ -357,14 +373,11 @@ class FeatureTransformManager:
         self._check_can_fit()
         self.fit_split = split_name
         if self.operation == "preserve":
-            first_batch = None
             feature_min = None
             feature_max = None
             for batch in train_batches:
                 x_batch = batch[0] if isinstance(batch, tuple) else batch
-                x_batch = numpy.asarray(x_batch, dtype=numpy.float32)
-                if first_batch is None:
-                    first_batch = x_batch
+                x_batch = numpy.asanyarray(x_batch)
                 batch_min = numpy.nanmin(x_batch, axis=0)
                 batch_max = numpy.nanmax(x_batch, axis=0)
                 feature_min = batch_min if feature_min is None else numpy.minimum(feature_min, batch_min)
@@ -375,6 +388,7 @@ class FeatureTransformManager:
             ]
             self.output_range = self.input_range
             self.transform_id = None
+            self.transform_applied = False
             return self
 
         self.scaler = self._make_scaler()
@@ -409,16 +423,29 @@ class FeatureTransformManager:
             output_space: str | None = None,
             transform_history: list[dict[str, Any]] | None = None,
             return_metadata: bool = False):
-        values = numpy.asarray(values, dtype=numpy.float32)
+        values = numpy.asanyarray(values)
         output_space = output_space or self.output_space
         transform_history = list(transform_history or [])
 
         if self.operation == "preserve":
+            if self.scaler is not None:
+                raise FeatureTransformError(
+                    f"{self.stage} transform is preserve but scaler parameters are loaded; "
+                    "refusing to apply scaler parameters in preserve mode."
+                )
+            if transform_history and not self.policy.allow_double_transform:
+                for entry in transform_history:
+                    if entry.get("operation") in {"minmax", "standard"}:
+                        raise DoubleTransformError(
+                            "Refusing preserve transform on values whose transform_history already records "
+                            f"{entry.get('operation')} output; inverse_transform before evaluation_space=source."
+                        )
             metadata = {
                 "data_space": input_space,
                 "transform_id": None,
                 "transform_history": transform_history,
                 "stats": _array_stats(values),
+                "transform_applied": False,
             }
             return (values, metadata) if return_metadata else values
 
@@ -434,11 +461,13 @@ class FeatureTransformManager:
         output_stats = _array_stats(transformed)
         entry = self._record_transform(input_space, output_space, input_stats, output_stats)
         self.transform_history.append(entry)
+        self.transform_applied = True
         metadata = {
             "data_space": output_space,
             "transform_id": self.transform_id,
             "transform_history": [*transform_history, entry],
             "stats": output_stats,
+            "transform_applied": True,
         }
         return (transformed, metadata) if return_metadata else transformed
 
@@ -447,7 +476,7 @@ class FeatureTransformManager:
         return self.transform(train_x, split_name="train", input_space=input_space, output_space=output_space)
 
     def inverse_transform(self, values):
-        values = numpy.asarray(values, dtype=numpy.float32)
+        values = numpy.asanyarray(values)
         if self.operation == "preserve" or self.scaler is None:
             return values
         return self.scaler.inverse_transform(values).astype(numpy.float32, copy=False)
@@ -473,6 +502,7 @@ class FeatureTransformManager:
                 "input_range": self.input_range,
                 "output_range": self.output_range,
                 "transform_history": self.transform_history,
+                "transform_applied": self.transform_applied,
             },
             path,
         )
@@ -493,6 +523,12 @@ class FeatureTransformManager:
         manager.input_range = state["input_range"]
         manager.output_range = state["output_range"]
         manager.transform_history = state.get("transform_history", [])
+        manager.transform_applied = bool(state.get("transform_applied", bool(manager.transform_history)))
+        if manager.operation == "preserve" and manager.scaler is not None:
+            raise FeatureTransformError(
+                f"Loaded {path} with operation=preserve and scaler parameters. "
+                "Preserve transforms must not load MinMaxScaler or StandardScaler state."
+            )
         return manager
 
 
@@ -539,6 +575,28 @@ class ScaleGuard:
                 "PreprocessingSpaceMismatchError: transformed real and synthetic data use different "
                 f"transform_id values before {context}: real={real_transform_id}, synthetic={synthetic_transform_id}."
             )
+
+    @staticmethod
+    def validate_evaluation_space_contract(metadata, requested_space: str, context: str = "evaluation") -> None:
+        _validate_choice(requested_space, EVALUATION_SPACES, "evaluation_space")
+        metadata = metadata or {}
+        data_space = metadata.get("data_space", "unknown")
+        history = metadata.get("transform_history") or []
+        if requested_space == "source" and data_space != "source":
+            raise PreprocessingSpaceMismatchError(
+                f"evaluation_space=source requires source data before {context}; got data_space={data_space}. "
+                "Call inverse_transform before evaluation."
+            )
+        if requested_space == "source":
+            transformed_entries = [
+                entry for entry in history
+                if entry.get("operation") in {"minmax", "standard"}
+            ]
+            if transformed_entries:
+                raise PreprocessingSpaceMismatchError(
+                    f"evaluation_space=source received transform_history with scaler entries before {context}; "
+                    "inverse_transform before evaluation."
+                )
 
     @staticmethod
     def validate_before_evaluation(real_values, synthetic_values, real_metadata, synthetic_metadata, context: str):

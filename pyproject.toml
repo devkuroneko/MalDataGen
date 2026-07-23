@@ -84,6 +84,9 @@ dependencies = [
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+markers = [
+    "heavy: marks tests that are intentionally heavier than the default smoke suite",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
